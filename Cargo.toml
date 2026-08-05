@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/git2-core",
+    "crates/git2-cli",
+]
+
+[workspace.dependencies]
+git2-core = { path = "crates/git2-core" }
+anyhow = "1.0.102"
+bstr = "1.12.1"
+clap = { version = "4.6.1", features = ["derive"] }
+flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
+fs2 = "0.4.3"
+gix = { version = "0.84.0", default-features = false, features = ["attributes", "basic", "sha1", "status", "worktree-mutation"] }
+sha1 = "0.10.6"
+sha2 = "0.10.9"
+thiserror = "2.0.18"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.96"
+version = "0.1.0-alpha.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

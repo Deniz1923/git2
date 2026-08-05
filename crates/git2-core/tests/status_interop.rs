@@ -1,0 +1,61 @@
+#![cfg(unix)]
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+use git2_core::repository::LocalRepository;
+
+fn git(directory: &Path, arguments: &[&str]) -> Output {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(directory)
+        .output()
+        .expect("Git must be installed for status tests");
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[test]
+fn two_column_status_matches_git_for_core_change_types() {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "--quiet"]);
+    std::fs::write(directory.path().join("both.txt"), b"base\n").unwrap();
+    std::fs::write(directory.path().join("deleted.txt"), b"base\n").unwrap();
+    git(directory.path(), &["add", "both.txt", "deleted.txt"]);
+    git(
+        directory.path(),
+        &[
+            "-c",
+            "user.name=git2 test",
+            "-c",
+            "user.email=git2@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ],
+    );
+
+    std::fs::write(directory.path().join("both.txt"), b"staged\n").unwrap();
+    git(directory.path(), &["add", "both.txt"]);
+    std::fs::write(directory.path().join("both.txt"), b"unstaged too\n").unwrap();
+    std::fs::remove_file(directory.path().join("deleted.txt")).unwrap();
+    std::fs::write(directory.path().join("new-staged.txt"), b"new\n").unwrap();
+    git(directory.path(), &["add", "new-staged.txt"]);
+    std::fs::write(directory.path().join("untracked.txt"), b"new\n").unwrap();
+
+    let expected = git(
+        directory.path(),
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    let actual = LocalRepository::discover(directory.path())
+        .unwrap()
+        .status()
+        .unwrap()
+        .porcelain_v1(false);
+    assert_eq!(actual, expected.stdout);
+}
