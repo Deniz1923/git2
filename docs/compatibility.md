@@ -22,9 +22,15 @@ The repository and status modules intentionally use Unix byte-path and permissio
 | Bare repository | Refused | No worktree recovery semantics |
 | Single worktree | Supported | v0.1 target |
 | Linked worktrees | Refused | Shared refs/common-dir transaction design required |
-| Sparse index/checkout | Refused | Complete-view semantics not proven |
-| Partial/promisor clone | Refused when promisor packs are detected | Missing objects violate complete local capture assumptions |
+| Separate Git directory or metadata outside `.git` | Refused | Git metadata must live in the worktree's own real `.git` directory |
+| Alternate object databases | Refused | Borrowed objects cannot be vouched for locally |
+| Shallow clones | Refused | `shallow` file detected; borrowed history breaks complete capture |
+| Reftable reference storage | Refused | Only file-backed loose and packed refs are captured |
+| Split index | Refused at discovery and again at capture | The raw top-level index is not self-contained; the `link` extension is refused |
+| Sparse index/checkout | Refused at discovery and again at capture | Sparse markers, `SKIP_WORKTREE` flags, or `core.sparseCheckout` config detected |
+| Partial/promisor clone | Refused when promisor packs, `remote.*.promisor`, or `extensions.partialClone` config are detected | Missing objects violate complete local capture assumptions |
 | Submodules/gitlinks | Refused at repository level | Nested repository state not captured |
+| Nested repository under the worktree | Refused at capture | Not a capturable file tree, including bare nested repositories |
 | Unresolved index conflicts | Refused | Multi-stage index restoration not implemented |
 | In-progress merge | Refused | `MERGE_HEAD` detected |
 | In-progress rebase | Refused | `rebase-apply`/`rebase-merge` detected |
@@ -54,16 +60,28 @@ Detection is conservative but not yet exhaustive. Unknown extensions or concurre
 | Raw HEAD | Yes | No |
 | Loose refs under `refs/` | Yes | No |
 | Raw `packed-refs` | Yes | No |
-| Raw index | Yes | No |
-| Present tracked regular files | Yes | No |
-| Present tracked executable files | Yes | No |
-| Present tracked symlinks | Yes | No |
-| Non-ignored untracked files | Yes | No |
+| Raw index | Yes, checksum-verified with a size-bounded decode and semantic validation at capture too | No |
+| Present tracked regular files | Yes, with the on-disk mode | No |
+| Present tracked executable files | Yes, with the on-disk mode even when the index disagrees | No |
+| Present tracked symlinks | Yes, as the raw target without dereference | No |
+| Non-ignored untracked files | Yes, through a checked walk that never applies filters | No |
 | Ignored files | No | No |
 | Deleted tracked path absence | Represented by omission plus captured index | No |
 | Empty directories | No | No |
 | Git config/hooks/reflogs | No | No |
 | File ownership/ACL/xattrs/timestamps | No | No |
+
+Captured file kinds follow the worktree, never the index: a staged executable whose
+execute bit is cleared on disk is captured as a regular file. Reads are descriptor-relative
+from one open worktree root: on Linux, parent directories are opened `O_PATH` for
+traversal only, so searchable-but-unreadable directories remain usable; parent components
+are opened without following symlinks (a symlinked parent is refused, and a regular
+ancestor is deliberately kept an access error rather than being recast as an absent
+path), symlink leaves are read with `readlinkat` and never opened, and only regular files
+are ever opened, non-blocking, with reads bounded by the configured limit at read time and
+re-checked for size drift so a file that changes size mid-read fails instead of being
+persisted as a truncated prefix. Refusals happen before the recovery sidecar is created,
+and the index semantics validated at discovery are validated again on the bytes captured.
 
 ## Size and storage limits
 
@@ -71,6 +89,7 @@ Detection is conservative but not yet exhaustive. Unknown extensions or concurre
 - `git2 adopt --max-file-mib N` changes that adoption limit.
 - A baseline containing at least 5 GiB produces a warning.
 - A non-default adoption limit is not persisted; later automatic imports use 100 MiB again.
+- Index capture verifies the raw checksum and bounds every decode allocation by four times the index's own size.
 - Recovery fields are bounded to 16 MiB when decoding.
 - Record counts are bounded to 10,000,000 when decoding.
 - There is no automatic garbage collection or pruning.
@@ -82,11 +101,15 @@ The configurable file limit is a safety valve, not a claim of efficient large-fi
 
 Unix paths and Git path data are treated as bytes. `git2 status -z` is the safe interface for names containing newlines or invalid UTF-8. The newline-delimited form writes raw path bytes and is intended for human inspection only.
 
-Captured filesystem entries may be regular, executable, or symlink. Directories and special files such as devices, sockets, and FIFOs are rejected when encountered as eligible entries.
+Captured filesystem entries may be regular, executable, or symlink. Directories and special files such as devices, sockets, and FIFOs are rejected when encountered as eligible entries, and a symlinked parent directory is rejected rather than followed.
 
 ## Filters, attributes, and ignores
 
-Current status and eligible-untracked enumeration use `gix` plumbing and repository ignore rules. Ignored files are deliberately excluded from the v0.1 guarantee.
+Eligible-untracked enumeration uses a checked `gix` directory walk that applies repository
+ignore rules and classifies nested repositories and special entries, but never runs
+tracked-file content conversion or configured executable filters. Ignored files are
+deliberately excluded from the v0.1 guarantee; ignored nested repositories and special
+entries stay outside it too.
 
 Future staging must apply Git clean filters, attributes, line-ending rules, executable semantics, and ignore/pathspec behavior consistently with Git. Staging is not complete until differential fixtures cover these cases.
 

@@ -1,13 +1,16 @@
 //! Repository validation and first-time recovery adoption.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::time::SystemTime;
 
-use bstr::BString;
+use bstr::{BStr, BString, ByteSlice};
+use sha1::{Digest, Sha1};
 
+use crate::paths::CheckedRoot;
 use crate::recovery::{
     ContentId, FileKind, FileRecord, Operation, OperationKind, RecoveryStore, View,
 };
@@ -83,6 +86,13 @@ impl LocalRepository {
                 "linked worktrees are not supported".to_owned(),
             ));
         }
+        if !fs::symlink_metadata(workdir.join(".git"))
+            .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
+            return Err(Error::UnsupportedRepository(
+                "Git metadata must live in the worktree's own `.git` directory".to_owned(),
+            ));
+        }
 
         let git_dir = inner.git_dir().to_path_buf();
         for state in [
@@ -105,31 +115,46 @@ impl LocalRepository {
                 "repositories with linked worktrees are not supported".to_owned(),
             ));
         }
-        if has_promisor_pack(&git_dir)? {
+        if git_dir.join("reftable").exists() {
+            return Err(Error::UnsupportedRepository(
+                "only file-backed references are supported".to_owned(),
+            ));
+        }
+        if git_dir
+            .join("objects")
+            .join("info")
+            .join("alternates")
+            .exists()
+        {
+            return Err(Error::UnsupportedRepository(
+                "alternate object databases are not supported".to_owned(),
+            ));
+        }
+        if git_dir.join("shallow").exists() {
+            return Err(Error::UnsupportedRepository(
+                "shallow clones are not supported".to_owned(),
+            ));
+        }
+        let config = inner.config_snapshot();
+        if config.boolean("core.sparseCheckout") == Some(true) {
+            return Err(Error::UnsupportedRepository(
+                "sparse indexes and sparse checkouts are not supported".to_owned(),
+            ));
+        }
+        if has_promisor_pack(&git_dir)?
+            || has_promisor_remote(&config, &inner)
+            || config.string("extensions.partialClone").is_some()
+        {
             return Err(Error::UnsupportedRepository(
                 "partial clones are not supported".to_owned(),
             ));
         }
 
-        let index = inner
-            .index_or_empty()
-            .map_err(|error| Error::Gix(error.to_string()))?;
-        if index.is_sparse() {
-            return Err(Error::UnsupportedRepository(
-                "sparse indexes and sparse checkouts are not supported".to_owned(),
-            ));
-        }
-        for entry in index.entries() {
-            if entry.stage_raw() != 0 {
-                return Err(Error::UnsupportedRepository(
-                    "an index with unresolved conflicts is not supported".to_owned(),
-                ));
-            }
-            if entry.mode == gix::index::entry::Mode::COMMIT {
-                return Err(Error::UnsupportedRepository(
-                    "submodules are not supported".to_owned(),
-                ));
-            }
+        let index_path = inner.index_path();
+        if index_path.is_file() {
+            let index_bytes = fs::read(index_path)?;
+            let index = decode_index(&index_bytes)?;
+            validate_index(&index)?;
         }
 
         Ok(Self {
@@ -229,95 +254,119 @@ impl LocalRepository {
         let head = BString::from(fs::read(self.git_dir.join("HEAD"))?);
         let refs = capture_refs(&self.git_dir)?;
         let index_path = self.inner.index_path();
-        let index = index_path
+        let index_bytes = index_path
             .is_file()
             .then(|| fs::read(index_path))
             .transpose()?;
-
-        let parsed_index = self
-            .inner
-            .index_or_empty()
-            .map_err(|error| Error::Gix(error.to_string()))?;
-        let mut paths = BTreeMap::<Vec<u8>, FileKind>::new();
-        for entry in parsed_index.entries() {
-            let kind = match entry.mode {
-                mode if mode == gix::index::entry::Mode::FILE => FileKind::Regular,
-                mode if mode == gix::index::entry::Mode::FILE_EXECUTABLE => FileKind::Executable,
-                mode if mode == gix::index::entry::Mode::SYMLINK => FileKind::Symlink,
-                _ => {
-                    return Err(Error::UnsupportedRepository(format!(
-                        "unsupported index mode {:?}",
-                        entry.mode
-                    )));
-                }
-            };
-            paths.insert(entry.path(&parsed_index).to_vec(), kind);
+        let index = index_bytes.as_deref().map(decode_index).transpose()?;
+        // Validate the same semantics that discovery checked, so the raw bytes about to
+        // be persisted can only carry modeled index states even if Git changed them
+        // after discovery.
+        if let Some(index) = &index {
+            validate_index(index)?;
         }
 
-        let statuses = self
-            .inner
-            .status(gix::progress::Discard)
-            .map_err(|error| Error::Gix(error.to_string()))?
-            .untracked_files(gix::status::UntrackedFiles::Files)
-            .index_worktree_submodules(None)
-            .into_index_worktree_iter(Vec::<BString>::new())
-            .map_err(|error| Error::Gix(error.to_string()))?;
-        for status in statuses {
-            let status = status.map_err(|error| Error::Gix(error.to_string()))?;
-            if status.summary() == Some(gix::status::index_worktree::iter::Summary::Added) {
-                let path = status.rela_path().to_vec();
-                let absolute = worktree_path(&self.workdir, &path)?;
-                let metadata = fs::symlink_metadata(&absolute)?;
-                let kind = kind_from_metadata(&metadata)?;
-                paths.entry(path).or_insert(kind);
+        let mut paths = BTreeSet::<Vec<u8>>::new();
+        if let Some(index) = &index {
+            for entry in index.entries() {
+                paths.insert(entry.path(index).to_vec());
             }
         }
+        for path in self.untracked_paths(index.as_ref())? {
+            paths.insert(path);
+        }
 
+        let root = CheckedRoot::open(&self.workdir)?;
         let mut files = Vec::with_capacity(paths.len());
-        for (path, expected_kind) in paths {
-            let absolute = worktree_path(&self.workdir, &path)?;
-            let metadata = match fs::symlink_metadata(&absolute) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let actual_kind = kind_from_metadata(&metadata)?;
-            let kind = if expected_kind == FileKind::Executable && actual_kind == FileKind::Regular
-            {
-                FileKind::Executable
-            } else {
-                actual_kind
-            };
-            let size = if kind == FileKind::Symlink {
-                0
-            } else {
-                metadata.len()
-            };
-            if size > options.max_file_bytes {
-                return Err(Error::UnsupportedRepository(format!(
-                    "eligible file {:?} is {size} bytes, over the {} byte safety limit",
-                    BString::from(path),
-                    options.max_file_bytes
-                )));
-            }
-            let bytes = if kind == FileKind::Symlink {
-                fs::read_link(&absolute)?.as_os_str().as_bytes().to_vec()
-            } else {
-                fs::read(&absolute)?
+        for path in &paths {
+            // Kinds and bytes come from the worktree itself: an executable bit cleared on
+            // disk must be captured as regular, and a leaf symlink as its raw target.
+            let Some(entry) = root.read_entry(path, options.max_file_bytes)? else {
+                continue;
             };
             files.push(FileDraft {
-                path: BString::from(path),
-                kind,
-                bytes,
+                path: BString::from(path.as_slice()),
+                kind: entry.kind,
+                bytes: entry.bytes,
             });
         }
 
         Ok(ViewDraft {
             head,
             refs,
-            index,
+            index: index_bytes,
             files,
         })
+    }
+
+    /// Enumerate non-ignored untracked worktree paths with a checked directory walk.
+    ///
+    /// The walk applies repository ignore rules but never runs content conversion or
+    /// configured executable filters. Nested repositories and special entries are
+    /// ineligible rather than silently skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the walk fails or an eligible untracked entry is a nested
+    /// repository or a special entry such as a FIFO, socket, or device.
+    fn untracked_paths(&self, index: Option<&gix::index::State>) -> Result<Vec<Vec<u8>>> {
+        let empty_index = gix::index::State::new(self.inner.object_hash());
+        let index = index.unwrap_or(&empty_index);
+        let should_interrupt = AtomicBool::new(false);
+        let mut collector = UntrackedDelegate::default();
+        let walk_options = self
+            .inner
+            .dirwalk_options()
+            .map_err(|error| Error::Gix(error.to_string()))?
+            .empty_patterns_match_prefix(false)
+            .emit_untracked(gix::dir::walk::EmissionMode::Matching)
+            .classify_untracked_bare_repositories(true);
+        self.inner
+            .dirwalk(
+                index,
+                std::iter::empty::<&BStr>(),
+                &should_interrupt,
+                walk_options,
+                &mut collector,
+            )
+            .map_err(|error| Error::Gix(error.to_string()))?;
+        if let Some((path, kind)) = collector.refused {
+            return Err(Error::UnsupportedRepository(format!(
+                "untracked entry {path:?} cannot be captured faithfully (disk kind {kind:?})"
+            )));
+        }
+        Ok(collector.untracked)
+    }
+}
+
+/// Collects eligible untracked entries and remembers the first unsupported one.
+#[derive(Default)]
+struct UntrackedDelegate {
+    untracked: Vec<Vec<u8>>,
+    refused: Option<(BString, Option<gix::dir::entry::Kind>)>,
+}
+
+impl gix::dir::walk::Delegate for UntrackedDelegate {
+    fn emit(
+        &mut self,
+        entry: gix::dir::EntryRef<'_>,
+        _collapsed_directory_status: Option<gix::dir::entry::Status>,
+    ) -> gix::dir::walk::Action {
+        if !matches!(entry.status, gix::dir::entry::Status::Untracked) {
+            return gix::dir::walk::Action::Continue(());
+        }
+        if !matches!(
+            entry.disk_kind,
+            Some(gix::dir::entry::Kind::File | gix::dir::entry::Kind::Symlink)
+        ) {
+            // An eligible untracked entry that is not a plain file or symlink - a
+            // nested repository, a special node, or a kind the walk left undetermined -
+            // cannot be captured faithfully.
+            self.refused = Some((entry.rela_path.clone().into_owned(), entry.disk_kind));
+            return gix::dir::walk::Action::Break(());
+        }
+        self.untracked.push(entry.rela_path.to_vec());
+        gix::dir::walk::Action::Continue(())
     }
 }
 
@@ -444,33 +493,96 @@ fn capture_ref_directory(
     Ok(())
 }
 
-fn worktree_path(workdir: &Path, relative: &[u8]) -> Result<PathBuf> {
-    if relative.is_empty()
-        || relative[0] == b'/'
-        || relative.split(|byte| *byte == b'/').any(|component| {
-            component.is_empty() || component == b"." || component == b".." || component == b".git"
-        })
-    {
-        return Err(Error::UnsupportedRepository(format!(
-            "unsafe worktree path {:?}",
-            BString::from(relative)
-        )));
+/// Decode the raw index once, with its checksum verified and allocations bounded.
+///
+/// Decoding from raw bytes keeps the split-index link extension observable, which
+/// [`gix::index::File::at`] dissolves silently, and bounds every decode allocation by the
+/// index's own size.
+///
+/// # Errors
+///
+/// Returns an error if the index bytes are shorter than a checksum, fail checksum
+/// verification, or cannot be decoded.
+fn decode_index(bytes: &[u8]) -> Result<gix::index::State> {
+    let checksum_bytes = gix::hash::Kind::Sha1.len_in_bytes();
+    if bytes.len() < checksum_bytes {
+        return Err(Error::Gix(
+            "the index is shorter than its checksum".to_owned(),
+        ));
     }
-    Ok(workdir.join(std::ffi::OsStr::from_bytes(relative)))
+    let (data, expected) = bytes.split_at(bytes.len() - checksum_bytes);
+    if !expected.iter().all(|byte| *byte == 0) {
+        let digest = Sha1::digest(data);
+        if digest.as_slice() != expected {
+            return Err(Error::Gix("index checksum mismatch".to_owned()));
+        }
+    }
+    let options = gix::index::decode::Options {
+        thread_limit: Some(1),
+        min_extension_block_in_bytes_for_threading: usize::MAX,
+        expected_checksum: None,
+        alloc_limit_bytes: Some(bytes.len().saturating_mul(4)),
+    };
+    let (index, _) = gix::index::State::from_bytes(
+        bytes,
+        SystemTime::UNIX_EPOCH.into(),
+        gix::hash::Kind::Sha1,
+        options,
+    )
+    .map_err(|error| Error::Gix(error.to_string()))?;
+    Ok(index)
 }
 
-fn kind_from_metadata(metadata: &fs::Metadata) -> Result<FileKind> {
-    if metadata.file_type().is_symlink() {
-        Ok(FileKind::Symlink)
-    } else if metadata.is_file() {
-        if metadata.permissions().mode() & 0o111 == 0 {
-            Ok(FileKind::Regular)
-        } else {
-            Ok(FileKind::Executable)
-        }
-    } else {
-        Err(Error::UnsupportedRepository(
-            "special files and directories cannot be captured as files".to_owned(),
-        ))
+/// Refuse index semantics that recovery cannot restore faithfully.
+///
+/// The same validation runs at discovery and again at capture, so the raw index bytes that
+/// are about to be persisted can only carry modeled semantics even if ordinary Git
+/// changed them in between.
+///
+/// # Errors
+///
+/// Returns an error if the index is split, sparse by marker or skip-worktree flag, has
+/// unresolved conflict stages, or contains gitlink modes.
+fn validate_index(index: &gix::index::State) -> Result<()> {
+    if index.link().is_some() {
+        return Err(Error::UnsupportedRepository(
+            "split indexes are not supported".to_owned(),
+        ));
     }
+    if index.is_sparse() {
+        return Err(Error::UnsupportedRepository(
+            "sparse indexes and sparse checkouts are not supported".to_owned(),
+        ));
+    }
+    for entry in index.entries() {
+        if entry
+            .flags
+            .contains(gix::index::entry::Flags::SKIP_WORKTREE)
+        {
+            return Err(Error::UnsupportedRepository(
+                "sparse indexes and sparse checkouts are not supported".to_owned(),
+            ));
+        }
+        if entry.stage_raw() != 0 {
+            return Err(Error::UnsupportedRepository(
+                "an index with unresolved conflicts is not supported".to_owned(),
+            ));
+        }
+        if entry.mode == gix::index::entry::Mode::COMMIT {
+            return Err(Error::UnsupportedRepository(
+                "submodules are not supported".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return true if any configured remote is marked as a promisor.
+fn has_promisor_remote(config: &gix::config::Snapshot<'_>, inner: &gix::Repository) -> bool {
+    inner.remote_names().into_iter().any(|name| {
+        let mut key = BString::from(b"remote.".to_vec());
+        key.extend_from_slice(name.as_bytes());
+        key.extend_from_slice(b".promisor");
+        config.boolean(key.as_bstr()) == Some(true)
+    })
 }

@@ -5,6 +5,8 @@
 //! captured and inspected, but restore and undo are not implemented yet.
 
 pub mod object;
+#[cfg(unix)]
+pub mod paths;
 pub mod recovery;
 #[cfg(unix)]
 pub mod repository;
