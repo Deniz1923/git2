@@ -20,6 +20,7 @@ All notable project changes are recorded here. The project has not made a suppor
 
 ### Changed
 
+- Pinned the workspace to Rust 1.98.0.
 - Reduced the original speculative multi-crate scaffold to one core and one CLI crate.
 - Replaced placeholder commands and ignored tests with implemented vertical slices.
 - Narrowed the declared target to Linux, SHA-1, non-bare, single-worktree repositories.

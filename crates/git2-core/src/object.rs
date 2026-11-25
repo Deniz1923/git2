@@ -42,7 +42,7 @@ impl GitOid {
         }
 
         let mut bytes = [0_u8; SHA1_LEN];
-        for (index, pair) in hex.chunks_exact(2).enumerate() {
+        for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
             bytes[index] = (decode_nibble(pair[0])? << 4) | decode_nibble(pair[1])?;
         }
         Ok(Self(bytes))

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.96.0 through `rustup`;
+- Rust 1.98.0 through `rustup`;
 - Git on `PATH`;
 - Linux for full repository/recovery development;
 - enough free disk space for `gix` and debug artifacts.

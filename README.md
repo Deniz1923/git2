@@ -45,7 +45,7 @@ Read the [compatibility matrix](docs/compatibility.md) before experimenting.
 
 Requirements:
 
-- Rust 1.96.0, installed automatically by `rustup` from `rust-toolchain.toml`;
+- Rust 1.98.0, installed automatically by `rustup` from `rust-toolchain.toml`;
 - Git on `PATH` for differential tests;
 - Linux for the currently supported repository and recovery commands.
 
