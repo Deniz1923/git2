@@ -48,7 +48,7 @@ Delivered:
 - removed private conversation transcripts and abandoned planning artifacts;
 - removed speculative backend/workflow crates and placeholder commands;
 - reduced the workspace to `git2-core` and `git2-cli`;
-- pinned Rust 1.96.0 and workspace lint policy;
+- pinned Rust (now 1.98.0) and workspace lint policy;
 - replaced ignored `todo!` tests with working vertical-slice tests;
 - added MIT licensing and truthful project documentation;
 - established formatting, clippy, tests, and warning-denied docs as gates.
@@ -99,7 +99,8 @@ Delivered:
 - advisory writer locking;
 - adoption baseline and atomic recovery HEAD;
 - external-change import without duplicate unchanged operations;
-- CLI operation log.
+- CLI operation log;
+- checked worktree capture, v2 bounded records, persisted limits, and owner-private storage.
 
 Exit criteria met:
 
@@ -112,9 +113,7 @@ Exit criteria met:
 Known debt carried forward:
 
 - capture consistency against concurrently running ordinary Git is not proven;
-- encoders do not preflight decoder limits and record files are read whole before decoding;
-- custom capture limits are not persisted for automatic imports;
-- directory `fsync` handling needs a documented release policy;
+- capture does not yet retain the Git objects that saved refs and index entries need;
 - no streaming capture or garbage collection;
 - no restore exists yet.
 
@@ -159,9 +158,7 @@ Deliverables:
 6. Detect or refuse concurrent ordinary-Git changes across capture/mutation boundaries.
 7. Add deterministic failpoints after every durable write and before/after each mutation boundary.
 8. Build process-kill tests that reopen the repository and prove an actionable state remains.
-9. Reject encoder inputs that exceed decoder limits and bound whole recovery-record reads.
-10. Persist repository recovery configuration, including the chosen file-size limit.
-11. Define and enforce sidecar permission expectations.
+9. Apply the existing bounded-record, persisted-limit, and private-storage rules to journal data.
 
 Exit criteria:
 

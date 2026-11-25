@@ -37,7 +37,7 @@ The current build proves steps of the storage and observation model. It does not
 
 The active target is an ordinary, non-bare, single-worktree SHA-1 repository on Linux. git2 refuses known states it cannot restore safely, including linked worktrees, sparse indexes, partial clones, submodules, unresolved conflicts, and in-progress merge/rebase-like operations.
 
-Ignored files and repository-local Git configuration are outside the recovery guarantee. The default maximum eligible file size is 100 MiB. A custom adoption limit is not persisted yet; later automatic imports currently return to the 100 MiB default.
+Ignored files and repository-local Git configuration are outside the recovery guarantee. The default eligible regular-file limit is 100 MiB; `adopt --max-file-mib` accepts up to 1024 MiB and persists the choice for future imports. New sidecars use format 2 with owner-private permissions. Format 1 stores are refused and left unchanged; see [recovery format](docs/recovery-format.md) before starting a new store.
 
 Read the [compatibility matrix](docs/compatibility.md) before experimenting.
 

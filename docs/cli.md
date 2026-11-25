@@ -32,11 +32,13 @@ Captured state:
 
 Options:
 
-- `--max-file-mib <MiB>`: per-file capture limit, default `100`.
+- `--max-file-mib <MiB>`: per-regular-file capture limit, default `100`, maximum `1024`.
 
 The command refuses an already adopted repository. It also refuses unsupported repository states and eligible files over the limit. On success it prints the captured file count, eligible worktree-content bytes before deduplication, and full recovery view ID. The byte count does not include the raw index or view/operation metadata.
 
-The selected size limit is not persisted in recovery configuration yet. Later automatic imports performed by `status` or `oplog` use the 100 MiB default, even if adoption used a larger value.
+The selected size limit is stored in `.git/git2/policy`. Later automatic imports performed by `status` or `oplog` use that same limit.
+
+Format 1 sidecars are refused, not upgraded or removed. To start a new format 2 store, first preserve the old directory separately; see the [format notes](recovery-format.md#status-and-compatibility).
 
 The command does not make restore available; adoption is currently useful for format and capture testing only.
 

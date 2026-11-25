@@ -7,6 +7,7 @@
 pub mod object;
 #[cfg(unix)]
 pub mod paths;
+#[cfg(unix)]
 pub mod recovery;
 #[cfg(unix)]
 pub mod repository;

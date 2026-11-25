@@ -123,9 +123,9 @@ fn run_adopt(max_file_mib: u64) -> anyhow::Result<()> {
 fn run_status(nul: bool) -> anyhow::Result<()> {
     let repository =
         LocalRepository::discover(".").context("could not open this supported Git repository")?;
-    if repository.git_dir().join("git2/format").is_file() {
+    if RecoveryStore::exists(repository.git_dir()).context("could not check for recovery data")? {
         repository
-            .import_external_changes(AdoptOptions::default())
+            .import_external_changes()
             .context("could not import changes made outside git2")?;
     }
     let status = repository.status().context("could not calculate status")?;
@@ -140,7 +140,7 @@ fn run_oplog() -> anyhow::Result<()> {
     let repository =
         LocalRepository::discover(".").context("could not open this supported Git repository")?;
     repository
-        .import_external_changes(AdoptOptions::default())
+        .import_external_changes()
         .context("could not import changes made outside git2")?;
     let store = RecoveryStore::open(repository.git_dir()).context("repository is not adopted")?;
     let mut id = Some(store.head().context("recovery history has no HEAD")?);

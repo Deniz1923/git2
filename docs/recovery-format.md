@@ -2,13 +2,18 @@
 
 ## Status and compatibility
 
-The recovery sidecar format is currently version 1 and is experimental. The reader refuses unknown top-level versions. Before 1.0, automatic migration is not promised; any incompatible change must increment the top-level version and update this document and fixtures.
+The recovery sidecar format is currently version 2 and is experimental. A format 1 store is refused in place; git2 does not migrate, delete, or overwrite it. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. Neither old snapshots nor current captures are a backup or restorable yet.
+
+The reader also refuses unknown top-level versions. Any incompatible change must increment that version and update this document and fixtures.
+
+If initialization or adoption is interrupted and the store has no format, policy, or HEAD, git2 reports the missing entry. Preserve the incomplete directory separately before trying adoption again; git2 does not automatically remove it.
 
 The format is private to one clone. It is stored below the Git directory and never creates refs:
 
 ```text
 .git/git2/
   format
+  policy
   HEAD
   lock
   cas/<2 hex>/<62 hex>
@@ -32,7 +37,7 @@ The format is private to one clone. It is stored below the Git directory and nev
 
 ## Non-goals
 
-Version 1 does not:
+Version 2 does not:
 
 - encrypt recovery content;
 - authenticate content against a secret key;
@@ -70,10 +75,14 @@ The first byte of hexadecimal output provides a 256-directory fanout. Git SHA-1 
 Exact bytes for the current format:
 
 ```text
-1\n
+2\n
 ```
 
-An existing different value is refused as an unsupported repository. Creating the store writes this file atomically.
+An existing different value is refused as an unsupported repository. Creating the store writes this file atomically. The marker is the only file read before checking for owner-private permissions so that older stores can be identified without modifying them.
+
+### `policy`
+
+Exact layout: the 13-byte magic `b"git2-policy\0\x01"` followed by the eligible regular-file limit as an unsigned 64-bit little-endian integer. The default is 104,857,600 bytes (100 MiB); the maximum is 1,073,741,824 bytes (1 GiB). Zero is allowed. The policy is immutable and applies to later automatic imports as well as adoption.
 
 ### `HEAD`
 
@@ -85,7 +94,7 @@ An existing different value is refused as an unsupported repository. Creating th
 
 It points to an entry in `operations/`, not directly to a view. The selected operation’s `after` field identifies the current recovery view.
 
-`set_head` refuses to select an operation whose immutable record does not exist.
+`set_head` verifies the selected operation, its immediate parent when present, and its before/after views before publishing the pointer. It does not walk the entire history or verify every referenced CAS payload.
 
 ### `lock`
 
@@ -111,7 +120,7 @@ Decoder limits:
 - counts and lengths must fit the current platform’s `usize`;
 - trailing bytes after the declared record are rejected.
 
-The parser applies these limits before allocating decoded field vectors, but the current store reads an entire view/operation file into memory before parsing. There is no total encoded-record file-size bound yet. Encoders also do not currently preflight their values against these decoder limits. Both gaps are release blockers: a sufficiently large ref value could be encoded into a view that the current decoder then refuses.
+Before allocation, decoders also verify that each record count is plausible for bytes remaining. Whole views are limited to 64 MiB and operations to 1 MiB; short control files have tighter limits. CAS payloads are capped at 1 GiB independent of the configured per-worktree-file limit. Readers check size before and during I/O and check digests after reading; encoders preflight field/count and total-size limits before building output. Capture still materializes file bytes in memory, and these checks do not make it a streaming backup tool.
 
 ## CAS records
 
@@ -137,11 +146,11 @@ A view describes one complete supported local state. It references large bytes t
 Every view starts with these 11 bytes:
 
 ```text
-67 69 74 32 2d 76 69 65 77 00 01
- g  i  t  2  -  v  i  e  w NUL v1
+67 69 74 32 2d 76 69 65 77 00 02
+ g  i  t  2  -  v  i  e  w NUL v2
 ```
 
-In source notation the magic is `b"git2-view\0\x01"`.
+In source notation the magic is `b"git2-view\0\x02"`.
 
 ### Layout
 
@@ -159,6 +168,10 @@ files[file_count]:
   path:                 bytes
   kind:                 u8
   content_id:           32 bytes
+retained_object_count:   u64
+retained_objects[retained_object_count]:
+  oid:                   20 bytes (raw Git SHA-1)
+  content_id:            32 bytes
 end of record
 ```
 
@@ -180,6 +193,8 @@ File kind codes:
 Ref records contain paths relative to the Git directory, such as `refs/heads/main`, plus exact file bytes. If `.git/packed-refs` exists, it is represented by the name `packed-refs` and its exact bytes. Ref records are sorted by byte name during capture.
 
 File records are generated from a path-sorted map. Paths use `/` separators in Git/index form and are interpreted as Unix bytes by the current repository implementation.
+
+The retained-object map is ordered by strictly increasing Git object ID, so duplicates are invalid. Current alpha captures write an empty map; retention of the saved refs/index object graph is a later milestone. A format 2 view does not yet prove restore is possible.
 
 ### Captured absence
 
@@ -237,20 +252,22 @@ An adoption operation has no parent and currently uses the same view ID for `bef
 
 ## Atomicity and durability
 
-Immutable and pointer writes follow this pattern:
+Sidecar directories are created with mode `0700` and files with `0600` (a stricter process umask can remove permissions). Git2 checks ownership against the effective user and rejects group/other access to v2 store entries. It checks file types and uses descriptor-relative opens that do not follow symlinks inside the store.
+
+Immutable records and mutable pointers follow this pattern:
 
 1. Create the parent directory.
 2. Create a unique temporary file with `create_new`.
 3. Write all bytes.
 4. `fsync` the file.
-5. Rename it to the destination.
-6. Attempt to `fsync` the parent directory.
+5. Publish an immutable record without replacing an existing entry, or rename a mutable pointer into place.
+6. `fsync` the parent directory. Sync parents of newly created directories as well.
 
 Temporary names contain the process ID and an in-process monotonic counter. If another writer wins an immutable-record race, the loser removes its temporary file and verifies the destination bytes.
 
 On Unix, rename replaces an existing mutable pointer such as `HEAD` atomically. The advisory lock prevents cooperating git2 writers from racing that update.
 
-Directory `fsync` errors are currently ignored after a successful file rename. Release hardening must decide and test the durability contract across supported filesystems.
+File and directory sync failures are reported as errors. A failure after publication can leave the new entry visible without a durability guarantee. This is not a mutation journal or proof of recovery after power loss.
 
 ## Reachability
 

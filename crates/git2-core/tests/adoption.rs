@@ -200,6 +200,20 @@ fn oversize_file_refuses_adoption_before_creating_sidecar() {
 }
 
 #[test]
+fn oversized_git_metadata_is_refused_before_creating_sidecar() {
+    let directory = repository();
+    let repository = LocalRepository::discover(directory.path()).unwrap();
+    std::fs::File::create(repository.git_dir().join("packed-refs"))
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
+
+    let error = repository.adopt(AdoptOptions::default()).unwrap_err();
+    assert!(matches!(error, Error::UnsupportedRepository(_)), "{error}");
+    assert!(!repository.git_dir().join("git2").exists());
+}
+
+#[test]
 fn in_progress_git_operation_is_refused() {
     let directory = repository();
     std::fs::write(
@@ -224,9 +238,7 @@ fn external_git_changes_append_one_operation() {
     std::fs::write(directory.path().join("tracked"), b"two\n").unwrap();
     std::fs::write(directory.path().join("new"), b"new\n").unwrap();
 
-    let imported = repository
-        .import_external_changes(AdoptOptions::default())
-        .unwrap();
+    let imported = repository.import_external_changes().unwrap();
     assert!(imported.changed);
     assert_ne!(imported.view_id, baseline.view_id);
     let store = RecoveryStore::open(repository.git_dir()).unwrap();
@@ -235,11 +247,49 @@ fn external_git_changes_append_one_operation() {
     assert_eq!(operation.before, baseline.view_id);
     assert_eq!(operation.after, imported.view_id);
 
-    let unchanged = repository
-        .import_external_changes(AdoptOptions::default())
-        .unwrap();
+    let unchanged = repository.import_external_changes().unwrap();
     assert!(!unchanged.changed);
     assert_eq!(unchanged.operation_id, imported.operation_id);
+}
+
+#[test]
+fn persisted_file_limit_controls_later_import() {
+    let directory = repository();
+    let repository = LocalRepository::discover(directory.path()).unwrap();
+    let baseline = repository
+        .adopt(AdoptOptions { max_file_bytes: 4 })
+        .unwrap();
+    let store = RecoveryStore::open(repository.git_dir()).unwrap();
+    assert_eq!(store.policy().unwrap().max_file_bytes, 4);
+
+    let worktree_file = directory.path().join("work.txt");
+    std::fs::write(&worktree_file, b"12345").unwrap();
+    assert!(matches!(
+        repository.import_external_changes(),
+        Err(Error::UnsupportedRepository(_))
+    ));
+    assert_eq!(store.head().unwrap(), baseline.operation_id);
+
+    std::fs::write(worktree_file, b"1234").unwrap();
+    assert!(repository.import_external_changes().unwrap().changed);
+}
+
+#[test]
+fn adopts_files_in_plain_untracked_directories() {
+    let directory = repository();
+    let subdir = directory.path().join("plain");
+    std::fs::create_dir(&subdir).unwrap();
+    std::fs::write(subdir.join("file.txt"), b"untracked child").unwrap();
+    let repository = LocalRepository::discover(directory.path()).unwrap();
+    let adoption = repository.adopt(AdoptOptions::default()).unwrap();
+    assert_eq!(adoption.file_count, 1);
+    let store = RecoveryStore::open(repository.git_dir()).unwrap();
+    let view = store.read_view(adoption.view_id).unwrap();
+    let file = view_file(&view, b"plain/file.txt");
+    assert_eq!(
+        store.read_content(file.content).unwrap(),
+        b"untracked child"
+    );
 }
 
 #[test]

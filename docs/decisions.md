@@ -20,6 +20,7 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 | D012 | Refuse unsupported states rather than degrade silently | Accepted |
 | D013 | Defer networking and initially delegate it to Git | Accepted |
 | D014 | Do not silently prune recovery data | Accepted |
+| D015 | Refuse legacy recovery stores and enforce private v2 storage | Accepted |
 
 ## D001 — ordinary Git remains the repository format
 
@@ -133,6 +134,14 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 
 **Consequences:** Sidecars can grow. A future `git2 gc` must show policy and preserve everything reachable from operation history.
 
+## D015 — owner-private recovery format 2
+
+**Context:** The alpha sidecar did not persist capture limits, could encode data its own reader would reject, and depended on umask alone for privacy.
+
+**Decision:** Use format 2 with an immutable capture policy, symmetric encoder/decoder limits, owner-private access, and strict sync errors. Reserve a versioned map for retained Git objects. Refuse v1 without rewriting it.
+
+**Consequences:** Users of v1 must preserve their old store separately before adopting again. The format 2 capture alpha is still not a restore or backup tool; the object map is empty until retention is implemented.
+
 ## Open decisions
 
 These must be resolved by their roadmap milestones:
@@ -144,6 +153,6 @@ These must be resolved by their roadmap milestones:
 - operation abbreviation and ambiguity rules;
 - divergence policy for undoing an older/non-selected operation;
 - redo user interface;
-- directory `fsync` failure policy;
+- machine/power-loss reliability testing under the strict sidecar sync policy;
 - explicit recovery garbage-collection UX;
 - whether macOS joins v0.1 or remains a v0.2 target after native testing.

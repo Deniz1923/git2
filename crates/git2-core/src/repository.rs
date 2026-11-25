@@ -12,26 +12,13 @@ use sha1::{Digest, Sha1};
 
 use crate::paths::CheckedRoot;
 use crate::recovery::{
-    ContentId, FileKind, FileRecord, Operation, OperationKind, RecoveryStore, View,
+    CapturePolicy, ContentId, FileKind, FileRecord, MAX_CAS_BYTES, MAX_FIELD_BYTES, Operation,
+    OperationKind, RecoveryStore, View, check_view_size,
 };
 use crate::{Error, Result};
 
-/// Default maximum size of one eligible worktree file: 100 MiB.
-pub const DEFAULT_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
-
-/// Safety limits used while adopting an existing repository.
-#[derive(Debug, Clone, Copy)]
-pub struct AdoptOptions {
-    pub max_file_bytes: u64,
-}
-
-impl Default for AdoptOptions {
-    fn default() -> Self {
-        Self {
-            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
-        }
-    }
-}
+/// Safety limits persisted when adopting an existing repository.
+pub type AdoptOptions = CapturePolicy;
 
 /// Summary of a newly persisted baseline view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,9 +137,8 @@ impl LocalRepository {
             ));
         }
 
-        let index_path = inner.index_path();
-        if index_path.is_file() {
-            let index_bytes = fs::read(index_path)?;
+        let metadata = CheckedRoot::open(&git_dir)?;
+        if let Some(index_bytes) = read_metadata(&metadata, b"index", MAX_CAS_BYTES)? {
             let index = decode_index(&index_bytes)?;
             validate_index(&index)?;
         }
@@ -184,13 +170,17 @@ impl LocalRepository {
     /// exceeds the configured per-file limit. I/O or concurrent repository changes can also fail
     /// the capture.
     pub fn adopt(&self, options: AdoptOptions) -> Result<Adoption> {
-        if self.git_dir.join("git2").exists() {
+        if RecoveryStore::exists(&self.git_dir)? {
+            // Surface failures such as legacy format or unsafe permissions, rather
+            // than asking the user to start over without knowing what exists.
+            RecoveryStore::open(&self.git_dir)?.head()?;
             return Err(Error::UnsupportedRepository(
                 "this repository already has a git2 recovery store".to_owned(),
             ));
         }
+        let options = options.validate()?;
         let draft = self.capture_draft(options)?;
-        let store = RecoveryStore::initialize(&self.git_dir)?;
+        let store = RecoveryStore::initialize(&self.git_dir, options)?;
         let _lock = store.try_lock()?;
         let persisted = persist_draft(&store, draft)?;
         let operation = Operation {
@@ -216,12 +206,12 @@ impl LocalRepository {
     ///
     /// Returns an error if the repository has not been adopted, another writer holds the recovery
     /// lock, or the new state cannot be captured and persisted safely.
-    pub fn import_external_changes(&self, options: AdoptOptions) -> Result<ExternalImport> {
+    pub fn import_external_changes(&self) -> Result<ExternalImport> {
         let store = RecoveryStore::open(&self.git_dir)?;
         let _lock = store.try_lock()?;
         let parent = store.head()?;
         let before = store.current_view()?;
-        let draft = self.capture_draft(options)?;
+        let draft = self.capture_draft(store.policy()?)?;
         let persisted = persist_draft(&store, draft)?;
         if persisted.view_id == before {
             return Ok(ExternalImport {
@@ -251,13 +241,11 @@ impl LocalRepository {
     }
 
     fn capture_draft(&self, options: AdoptOptions) -> Result<ViewDraft> {
-        let head = BString::from(fs::read(self.git_dir.join("HEAD"))?);
-        let refs = capture_refs(&self.git_dir)?;
-        let index_path = self.inner.index_path();
-        let index_bytes = index_path
-            .is_file()
-            .then(|| fs::read(index_path))
-            .transpose()?;
+        let metadata = CheckedRoot::open(&self.git_dir)?;
+        let head = read_metadata(&metadata, b"HEAD", MAX_FIELD_BYTES)?
+            .ok_or_else(|| Error::UnsupportedRepository("Git HEAD is missing".to_owned()))?;
+        let refs = capture_refs(&self.git_dir, &metadata)?;
+        let index_bytes = read_metadata(&metadata, b"index", MAX_CAS_BYTES)?;
         let index = index_bytes.as_deref().map(decode_index).transpose()?;
         // Validate the same semantics that discovery checked, so the raw bytes about to
         // be persisted can only carry modeled index states even if Git changed them
@@ -291,8 +279,15 @@ impl LocalRepository {
             });
         }
 
+        check_view_size(
+            head.len(),
+            &refs,
+            index_bytes.is_some(),
+            files.iter().map(|file| file.path.len()),
+            0,
+        )?;
         Ok(ViewDraft {
-            head,
+            head: head.into(),
             refs,
             index: index_bytes,
             files,
@@ -411,6 +406,7 @@ fn persist_draft(store: &RecoveryStore, draft: ViewDraft) -> Result<PersistedDra
         refs: draft.refs,
         index,
         files,
+        retained_objects: Vec::new(),
     };
     Ok(PersistedDraft {
         view_id: store.put_view(&view)?,
@@ -446,17 +442,38 @@ fn has_promisor_pack(git_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn capture_refs(git_dir: &Path) -> Result<Vec<(BString, BString)>> {
+fn read_metadata(root: &CheckedRoot, path: &[u8], limit: usize) -> Result<Option<Vec<u8>>> {
+    let Some(entry) = root.read_entry(path, limit as u64)? else {
+        return Ok(None);
+    };
+    if entry.kind == FileKind::Symlink {
+        return Err(Error::UnsupportedRepository(format!(
+            "Git metadata {:?} must not be a symlink",
+            BString::from(path)
+        )));
+    }
+    Ok(Some(entry.bytes))
+}
+
+fn capture_refs(git_dir: &Path, root: &CheckedRoot) -> Result<Vec<(BString, BString)>> {
     let mut refs = Vec::new();
     let refs_root = git_dir.join("refs");
-    if refs_root.is_dir() {
-        capture_ref_directory(git_dir, &refs_root, &mut refs)?;
+    match fs::symlink_metadata(&refs_root) {
+        Ok(metadata) if metadata.is_dir() => {
+            capture_ref_directory(git_dir, &refs_root, root, &mut refs)?;
+        }
+        Ok(_) => {
+            return Err(Error::UnsupportedRepository(
+                "Git metadata refs must be a real directory".to_owned(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    let packed = git_dir.join("packed-refs");
-    if packed.is_file() {
+    if let Some(packed) = read_metadata(root, b"packed-refs", MAX_FIELD_BYTES)? {
         refs.push((
             BString::from(b"packed-refs".to_vec()),
-            BString::from(fs::read(packed)?),
+            BString::from(packed),
         ));
     }
     refs.sort_by(|left, right| left.0.cmp(&right.0));
@@ -466,28 +483,33 @@ fn capture_refs(git_dir: &Path) -> Result<Vec<(BString, BString)>> {
 fn capture_ref_directory(
     git_dir: &Path,
     directory: &Path,
+    root: &CheckedRoot,
     output: &mut Vec<(BString, BString)>,
 ) -> Result<()> {
-    let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            capture_ref_directory(git_dir, &entry.path(), output)?;
-        } else if file_type.is_file()
-            && entry.path().extension().is_none_or(|value| value != "lock")
-        {
-            let relative = entry
-                .path()
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|value| value == "lock") {
+                continue;
+            }
+            let relative = path
                 .strip_prefix(git_dir)
                 .map_err(|_| Error::CorruptRecovery("reference escaped Git directory".to_owned()))?
                 .as_os_str()
-                .as_bytes()
-                .to_vec();
-            output.push((
-                BString::from(relative),
-                BString::from(fs::read(entry.path())?),
-            ));
+                .as_bytes();
+            let value = read_metadata(root, relative, MAX_FIELD_BYTES)?.ok_or_else(|| {
+                Error::UnsupportedRepository(format!(
+                    "Git ref {:?} disappeared during capture",
+                    BString::from(relative)
+                ))
+            })?;
+            output.push((BString::from(relative), BString::from(value)));
         }
     }
     Ok(())

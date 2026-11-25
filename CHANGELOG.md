@@ -16,6 +16,8 @@ All notable project changes are recorded here. The project has not made a suppor
 - External Git change import and immutable operation log.
 - Two-column status with NUL-delimited byte-safe mode.
 - Differential object/status tests and recovery refusal tests.
+- Descriptor-relative capture of worktree bytes and executable mode, without running configured content filters during adoption.
+- Format 2 recovery storage with persisted capture limits, owner-private access, and bounded record encoding and reads.
 - Product, architecture, compatibility, CLI, format, roadmap, testing, development, contribution, and security documentation.
 
 ### Changed
@@ -24,6 +26,8 @@ All notable project changes are recorded here. The project has not made a suppor
 - Reduced the original speculative multi-crate scaffold to one core and one CLI crate.
 - Replaced placeholder commands and ignored tests with implemented vertical slices.
 - Narrowed the declared target to Linux, SHA-1, non-bare, single-worktree repositories.
+- Refuse shallow, split-index, alternate-object, reftable, separate metadata, and other unsupported repository layouts before recording recovery data.
+- Format 1 sidecars are refused and left untouched; there is no automatic migration.
 
 ### Removed
 

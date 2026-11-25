@@ -86,12 +86,13 @@ and the index semantics validated at discovery are validated again on the bytes 
 ## Size and storage limits
 
 - Default maximum eligible regular-file size: 100 MiB.
-- `git2 adopt --max-file-mib N` changes that adoption limit.
+- `git2 adopt --max-file-mib N` sets a persisted limit of up to 1024 MiB; automatic imports use the same limit.
 - A baseline containing at least 5 GiB produces a warning.
-- A non-default adoption limit is not persisted; later automatic imports use 100 MiB again.
-- Index capture verifies the raw checksum and bounds every decode allocation by four times the index's own size.
+- Index capture verifies nonzero raw checksums (Git can explicitly omit the checksum) and bounds decode allocations by four times the index's own size.
 - Recovery fields are bounded to 16 MiB when decoding.
 - Record counts are bounded to 10,000,000 when decoding.
+- Whole recovery views are bounded to 64 MiB, operations to 1 MiB, and CAS payloads to 1 GiB.
+- New format 2 sidecars are owner-private; format 1 sidecars are refused without migration.
 - There is no automatic garbage collection or pruning.
 - Capture currently reads each eligible file into memory before persisting it.
 
@@ -120,11 +121,10 @@ An advisory lock excludes a second cooperating git2 writer. Ordinary Git does no
 ## Known alpha risks
 
 - Restore has not been implemented, so captured views have not passed an end-to-end recovery proof.
-- Recovery record files and CAS payloads are read into memory before parsing/hash verification. Field/count limits do not impose a total file-size bound.
-- Encoders do not yet reject values over decoder field/count limits before writing. An unusually large ref value, such as a `packed-refs` file over 16 MiB, could produce a view that the current decoder refuses. This must be fixed before v0.1.
-- The recovery directory uses normal process umask/parent permissions; git2 does not enforce or audit a private permission mode yet.
+- Captures and bounded recovery reads still use memory. This is not a streaming or large-repository backup.
+- The sidecar does not yet retain Git objects referenced by snapshots, so ordinary Git pruning can remove required history.
 - Ordinary Git can race capture despite the git2 advisory lock.
-- Directory-sync failures after rename are currently ignored.
+- Recovery-store sync errors are reported, but process-crash reconciliation and machine/power-loss testing are not implemented.
 - Object-not-found classification in packed fallback relies partly on dependency error text and needs a typed error path.
 - Human newline status output does not implement Git’s quoting rules; `-z` is the only robust byte-path interface.
 

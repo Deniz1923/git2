@@ -189,8 +189,8 @@ The following invariants are already enforced:
 
 - Recovery IDs are recomputed and checked when records are read.
 - Existing immutable records are never silently overwritten with different bytes.
-- Writes use create-new temporary files, `fsync`, and rename.
-- A selected operation must exist before git2 HEAD can point to it.
+- Writes use create-new temporary files, file and directory sync, no-replacement publication for immutable data, and rename for the mutable pointer.
+- A selected operation and its referenced records must exist before git2 HEAD can point to it.
 - Only one git2 writer can hold the advisory lock.
 - Recovery metadata is below `.git/git2/`, never `refs/`.
 - Paths are byte-safe on Unix and repository-relative.
@@ -220,6 +220,6 @@ The default is refusal, not best effort. Unknown formats, corrupt content, unsup
 
 Snapshots are content-addressed, so unchanged file and index bytes deduplicate naturally. Views and operations are small immutable records. There is no garbage collector or silent pruning policy yet.
 
-The CLI warns when an adoption captures at least 5 GiB. The default limit is 100 MiB per eligible regular file and can be changed for adoption with `--max-file-mib`. Changing the limit expands risk and does not change the current lack of restore. The selected override is not persisted yet, so automatic imports return to the default.
+The CLI warns when an adoption captures at least 5 GiB. The default limit is 100 MiB per eligible regular file. `--max-file-mib` sets a persisted limit of up to 1024 MiB. Changing the limit does not change the current lack of restore.
 
 Future performance work should follow correctness evidence: streaming CAS writes, bounded memory, incremental scans, and explicit `git2 gc` reporting are later milestones.
