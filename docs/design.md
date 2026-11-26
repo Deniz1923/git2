@@ -154,9 +154,9 @@ External import is currently triggered by `git2 status` for adopted repositories
 
 Status uses `gix` to compare HEAD → index and index → worktree. git2 merges both sides into a deterministic path-sorted model and emits two-column porcelain. `-z` emits raw path bytes with NUL record delimiters.
 
-## Target mutation protocol
+## Implemented mutation protocol
 
-No user-facing Git mutation is implemented yet. Every future mutation must use a constrained 4-phase (`Prepared -> Applying -> Finalizing -> Committed`) state machine over a small fixed vocabulary of primitive checked actions:
+Implemented Git mutations (`restore`, `reset`, `undo`, `add`, and recovery via `recover`) run through a constrained 4-phase (`Prepared -> Applying -> Finalizing -> Committed`) state machine over a fixed vocabulary of primitive checked actions (while `commit` and `log` remain upcoming):
 
 1. Validate all repository and command preconditions.
 2. Acquire the git2 recovery lock.
@@ -167,9 +167,9 @@ No user-facing Git mutation is implemented yet. Every future mutation must use a
 7. Capture and verify the post-operation view (`Finalizing`), append the immutable git2 operation, and atomically update git2 HEAD (`Committed`).
 8. Remove the pending record and sync its directory.
 
-On startup, a pending record must be reconciled idempotently before another mutation: either prove nothing changed and discard it, or complete/verify rollback/finalization without duplicating history. A mutation must never be exposed merely because its happy-path implementation works.
+On startup, `git2 recover` reconciles a pending record idempotently before another mutation: aborting cleanly if `Prepared`, resuming and finalizing if `Applying`/`Finalizing`, or cleaning pending state without duplicating history if recovery `HEAD` already selected the deterministic operation ID. (`--rollback` can also revert un-selected `Prepared`/`Applying`/`Finalizing` states.)
 
-## Target undo semantics
+## Undo semantics
 
 Undo is a new operation, not history deletion:
 
@@ -178,9 +178,7 @@ operation N: before=A, after=B, kind=git2:reset
 operation N+1: before=B, after=A, kind=git2:undo
 ```
 
-Restoring a view must update HEAD/refs/index/worktree as a checked transaction. It must first snapshot the current state, avoid following unsafe paths or symlinks, remove eligible paths absent from the target view, restore exact captured bytes and supported modes, and append its own operation. `git2 undo` ignores stat-cache-only index refreshes (such as plain `git status`) while still requiring exact staged paths, stages, modes, OIDs, and flags, and still restoring exact captured raw index bytes. Redo can then undo the undo operation.
-
-These are design requirements, not current capabilities.
+Restoring a view updates HEAD/refs/index/worktree as a checked transaction. It first snapshots the current state, avoids following unsafe paths or symlinks, removes eligible paths absent from the target view, restores exact captured bytes and supported modes, and appends its own operation. `git2 undo` ignores stat-cache-only index refreshes (such as plain `git status`) while still requiring exact staged paths, stages, modes, OIDs, and flags, and still restoring exact captured raw index bytes. Redo can then undo the undo operation.
 
 ## Safety invariants
 
@@ -219,6 +217,6 @@ The default is refusal, not best effort. Unknown formats, corrupt content, unsup
 
 Snapshots are content-addressed, so unchanged file and index bytes deduplicate naturally. Views and operations are small immutable records. There is no garbage collector or silent pruning policy yet.
 
-The CLI warns when an adoption captures at least 5 GiB. The default limit is 100 MiB per eligible regular file. `--max-file-mib` sets a persisted limit of up to 1024 MiB. Changing the limit does not change the current lack of restore.
+The CLI warns when an adoption captures at least 5 GiB. The default limit is 100 MiB per eligible regular file. `--max-file-mib` sets a persisted limit of up to 1024 MiB. Keeping per-file bounds tight prevents unbounded memory use during in-memory captures and restores.
 
 Future performance work should follow correctness evidence: streaming CAS writes, bounded memory, incremental scans, and explicit `git2 gc` reporting are later milestones.

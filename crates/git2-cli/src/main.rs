@@ -217,6 +217,7 @@ fn run_adopt(max_file_mib: u64) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn run_checkpoint() -> anyhow::Result<()> {
+    ensure_no_pending()?;
     let repository =
         LocalRepository::discover(".").context("could not open this supported Git repository")?;
     let imported = repository
@@ -231,6 +232,7 @@ fn run_checkpoint() -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn run_status(nul: bool) -> anyhow::Result<()> {
+    ensure_no_pending()?;
     let repository =
         LocalRepository::discover(".").context("could not open this supported Git repository")?;
     if RecoveryStore::exists(repository.git_dir()).context("could not check for recovery data")? {

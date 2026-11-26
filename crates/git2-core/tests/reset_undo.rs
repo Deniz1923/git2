@@ -580,3 +580,94 @@ fn init_repo() -> tempfile::TempDir {
     git(dir.path(), &["commit", "-q", "-m", "initial"]);
     dir
 }
+
+#[test]
+fn reset_supports_symbolic_branch_ref_packed_branch_and_eol_checkout() {
+    // 1. Symbolic branch ref + packed-only target branch
+    let dir = init_repo();
+    let first = String::from_utf8(git(dir.path(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(dir.path(), &["branch", "packed-branch"]);
+    fs::write(dir.path().join("base.txt"), b"second\n").unwrap();
+    git(dir.path(), &["add", "base.txt"]);
+    git(dir.path(), &["commit", "-q", "-m", "second"]);
+    git(dir.path(), &["pack-refs", "--all", "--prune"]);
+    git(
+        dir.path(),
+        &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
+    );
+    git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/alias"]);
+
+    let repo = LocalRepository::discover(dir.path()).unwrap();
+    repo.adopt(AdoptOptions::default()).unwrap();
+
+    let out = reset::apply(&repo, ResetMode::Hard, "packed-branch").unwrap();
+    assert_eq!(out.target_commit.to_hex(), first);
+    assert_eq!(
+        String::from_utf8(git(dir.path(), &["rev-parse", "refs/heads/main"]))
+            .unwrap()
+            .trim(),
+        first
+    );
+    assert_eq!(
+        fs::read(dir.path().join(".git/HEAD")).unwrap(),
+        b"ref: refs/heads/alias\n"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(".git/refs/heads/alias")).unwrap(),
+        b"ref: refs/heads/main\n"
+    );
+    assert_eq!(fs::read(dir.path().join("base.txt")).unwrap(), b"base\n");
+
+    // 2. `reset --hard` matches `git reset --hard` for `eol=crlf` and `core.autocrlf=true`
+    let crlf_git = tempfile::tempdir().unwrap();
+    let crlf_git2 = tempfile::tempdir().unwrap();
+    for repo_dir in [crlf_git.path(), crlf_git2.path()] {
+        git(repo_dir, &["init", "--quiet", "-b", "main"]);
+        git(repo_dir, &["config", "core.autocrlf", "false"]);
+        fs::write(repo_dir.join(".gitattributes"), b"*.txt text eol=crlf\n").unwrap();
+        fs::write(repo_dir.join("line.txt"), b"one\r\ntwo\r\n").unwrap();
+        git(repo_dir, &["add", ".gitattributes", "line.txt"]);
+        git(repo_dir, &["commit", "-q", "-m", "crlf"]);
+        fs::write(repo_dir.join("line.txt"), b"dirty\r\n").unwrap();
+    }
+    let crlf_repo = LocalRepository::discover(crlf_git2.path()).unwrap();
+    crlf_repo.adopt(AdoptOptions::default()).unwrap();
+    git(crlf_git.path(), &["reset", "--hard", "HEAD"]);
+    reset::apply(&crlf_repo, ResetMode::Hard, "HEAD").unwrap();
+    assert_eq!(
+        fs::read(crlf_git2.path().join("line.txt")).unwrap(),
+        fs::read(crlf_git.path().join("line.txt")).unwrap()
+    );
+    assert_eq!(
+        fs::read(crlf_git2.path().join("line.txt")).unwrap(),
+        b"one\r\ntwo\r\n"
+    );
+
+    // 3. `reset --hard` refuses active external smudge filter without running it
+    let smudge_dir = tempfile::tempdir().unwrap();
+    git(smudge_dir.path(), &["init", "--quiet", "-b", "main"]);
+    fs::write(
+        smudge_dir.path().join(".gitattributes"),
+        b"*.filt filter=sm\n",
+    )
+    .unwrap();
+    fs::write(smudge_dir.path().join("a.filt"), b"data\n").unwrap();
+    git(smudge_dir.path(), &["add", ".gitattributes", "a.filt"]);
+    git(smudge_dir.path(), &["commit", "-q", "-m", "smudge"]);
+    let marker = smudge_dir.path().join("smudge_ran");
+    let cmd = format!("touch {}; cat", marker.display());
+    git(smudge_dir.path(), &["config", "filter.sm.smudge", &cmd]);
+
+    let smudge_repo = LocalRepository::discover(smudge_dir.path()).unwrap();
+    smudge_repo.adopt(AdoptOptions::default()).unwrap();
+    let err = reset::apply(&smudge_repo, ResetMode::Hard, "HEAD").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("external filters are not supported"),
+        "{err}"
+    );
+    assert!(!marker.exists(), "git2 must never execute smudge filters");
+}

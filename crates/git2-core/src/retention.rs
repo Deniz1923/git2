@@ -1,6 +1,6 @@
 //! Capture and verify the Git object closure of a recovery view.
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use bstr::{BStr, BString, ByteSlice};
 
@@ -43,15 +43,39 @@ pub(crate) fn retain_roots(
     walk_objects(objects, roots, None, |bytes| store.put_content(bytes))
 }
 
+pub(crate) fn retain_roots_with_known(
+    store: &RecoveryStore,
+    objects: &ObjectStore,
+    roots: impl IntoIterator<Item = Root>,
+    known_cas: &BTreeSet<ContentId>,
+) -> Result<Vec<RetainedObject>> {
+    walk_objects(objects, roots, None, |bytes| {
+        persist_cas_with_known(store, bytes, known_cas)
+    })
+}
+
 pub(crate) fn retain_roots_with_blobs(
     store: &RecoveryStore,
     objects: &ObjectStore,
     roots: impl IntoIterator<Item = Root>,
     staged_blobs: &BTreeMap<GitOid, ContentId>,
+    known_cas: &BTreeSet<ContentId>,
 ) -> Result<Vec<RetainedObject>> {
     walk_objects(objects, roots, Some(staged_blobs), |bytes| {
-        store.put_content(bytes)
+        persist_cas_with_known(store, bytes, known_cas)
     })
+}
+
+pub(crate) fn persist_cas_with_known(
+    store: &RecoveryStore,
+    bytes: &[u8],
+    known_cas: &BTreeSet<ContentId>,
+) -> Result<ContentId> {
+    let id = ContentId::for_bytes(bytes);
+    if known_cas.contains(&id) && store.has_content(id)? {
+        return Ok(id);
+    }
+    store.put_content(bytes)
 }
 
 pub(crate) fn compute_roots_readonly(

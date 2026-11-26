@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
@@ -10,10 +11,10 @@ use std::time::SystemTime;
 use bstr::{BStr, BString, ByteSlice};
 use sha1::{Digest, Sha1};
 
-use crate::paths::CheckedRoot;
+use crate::paths::{CheckedRoot, PathEntryKind};
 use crate::recovery::{
     CapturePolicy, ContentId, FileKind, FileRecord, MAX_CAS_BYTES, MAX_FIELD_BYTES, Operation,
-    OperationKind, RecoveryStore, View, check_view_size,
+    OperationKind, RecoveryLock, RecoveryStore, View, check_view_size,
 };
 use crate::retention::{self, Root};
 use crate::store::ObjectStore;
@@ -75,8 +76,20 @@ impl LocalRepository {
                 "linked worktrees are not supported".to_owned(),
             ));
         }
-        if !fs::symlink_metadata(workdir.join(".git"))
-            .is_ok_and(|metadata| metadata.file_type().is_dir())
+        let workdir_git_meta = fs::symlink_metadata(workdir.join(".git")).map_err(|_| {
+            Error::UnsupportedRepository(
+                "Git metadata must live in the worktree's own `.git` directory".to_owned(),
+            )
+        })?;
+        let actual_git_meta = fs::symlink_metadata(inner.git_dir()).map_err(|_| {
+            Error::UnsupportedRepository(
+                "Git metadata must live in the worktree's own `.git` directory".to_owned(),
+            )
+        })?;
+        if !workdir_git_meta.file_type().is_dir()
+            || !actual_git_meta.file_type().is_dir()
+            || (workdir_git_meta.dev(), workdir_git_meta.ino())
+                != (actual_git_meta.dev(), actual_git_meta.ino())
         {
             return Err(Error::UnsupportedRepository(
                 "Git metadata must live in the worktree's own `.git` directory".to_owned(),
@@ -184,7 +197,8 @@ impl LocalRepository {
         let draft = self.capture_draft(options)?;
         let store = RecoveryStore::initialize(&self.git_dir, options)?;
         let _lock = store.try_lock()?;
-        let persisted = self.persist_draft(&store, draft)?;
+        let empty_known = BTreeSet::new();
+        let persisted = self.persist_draft(&store, draft, &empty_known)?;
         let operation = Operation {
             parent: None,
             before: persisted.view_id,
@@ -209,7 +223,17 @@ impl LocalRepository {
     /// Returns an error if the repository has not been adopted, another writer holds the recovery
     /// lock, or the new state cannot be captured and persisted safely.
     pub fn import_external_changes(&self) -> Result<ExternalImport> {
-        self.record_view(OperationKind::ExternalGit)
+        let store = RecoveryStore::open(&self.git_dir)?;
+        let lock = store.try_lock()?;
+        self.record_view_locked(&store, &lock, OperationKind::ExternalGit)
+    }
+
+    pub(crate) fn import_external_changes_locked(
+        &self,
+        store: &RecoveryStore,
+        lock: &RecoveryLock,
+    ) -> Result<ExternalImport> {
+        self.record_view_locked(store, lock, OperationKind::ExternalGit)
     }
 
     /// Record an explicit checkpoint in an adopted repository.
@@ -224,12 +248,21 @@ impl LocalRepository {
                 "run `git2 adopt` before saving a checkpoint".to_owned(),
             ));
         }
-        self.record_view(OperationKind::Git2(BString::from("checkpoint")))
+        let store = RecoveryStore::open(&self.git_dir)?;
+        let lock = store.try_lock()?;
+        self.record_view_locked(
+            &store,
+            &lock,
+            OperationKind::Git2(BString::from("checkpoint")),
+        )
     }
 
-    fn record_view(&self, kind: OperationKind) -> Result<ExternalImport> {
-        let store = RecoveryStore::open(&self.git_dir)?;
-        let _lock = store.try_lock()?;
+    fn record_view_locked(
+        &self,
+        store: &RecoveryStore,
+        _lock: &RecoveryLock,
+        kind: OperationKind,
+    ) -> Result<ExternalImport> {
         if store.has_pending()? {
             return Err(Error::UnsupportedRepository(
                 "a pending transaction exists; recover it before recording new history".to_owned(),
@@ -237,17 +270,21 @@ impl LocalRepository {
         }
         let parent = store.head()?;
         let before = store.current_view()?;
+        let before_view = store.read_view(before)?;
         let draft = self.capture_draft(store.policy()?)?;
-        let persisted = self.persist_draft(&store, draft)?;
-        if persisted.view_id == before {
+        let (candidate_id, _, file_count, content_bytes) =
+            self.compute_draft_view_readonly(&draft)?;
+        if candidate_id == before {
             return Ok(ExternalImport {
                 changed: false,
                 operation_id: parent,
                 view_id: before,
-                file_count: persisted.file_count,
-                content_bytes: persisted.content_bytes,
+                file_count,
+                content_bytes,
             });
         }
+        let known = known_cas_for_view(&before_view);
+        let persisted = self.persist_draft(store, draft, &known)?;
         let operation = Operation {
             parent: Some(parent),
             before,
@@ -266,9 +303,28 @@ impl LocalRepository {
         })
     }
 
-    pub(crate) fn capture_and_persist_view(&self, store: &RecoveryStore) -> Result<ContentId> {
+    pub(crate) fn capture_and_persist_view_with_known(
+        &self,
+        store: &RecoveryStore,
+        known: &BTreeSet<ContentId>,
+    ) -> Result<ContentId> {
         let draft = self.capture_draft(store.policy()?)?;
-        Ok(self.persist_draft(store, draft)?.view_id)
+        if let Ok(current_id) = store.current_view() {
+            let (candidate_id, _, _, _) = self.compute_draft_view_readonly(&draft)?;
+            if candidate_id == current_id {
+                return Ok(current_id);
+            }
+        }
+        Ok(self.persist_draft(store, draft, known)?.view_id)
+    }
+
+    pub(crate) fn capture_and_persist_view(&self, store: &RecoveryStore) -> Result<ContentId> {
+        let known = store
+            .current_view()
+            .and_then(|id| store.read_view(id))
+            .map(|view| known_cas_for_view(&view))
+            .unwrap_or_default();
+        self.capture_and_persist_view_with_known(store, &known)
     }
 
     /// Compute the canonical [`ContentId`] of the current live repository view without
@@ -284,6 +340,14 @@ impl LocalRepository {
         policy: AdoptOptions,
     ) -> Result<(ContentId, View)> {
         let draft = self.capture_draft(policy)?;
+        let (id, view, _, _) = self.compute_draft_view_readonly(&draft)?;
+        Ok((id, view))
+    }
+
+    fn compute_draft_view_readonly(
+        &self,
+        draft: &ViewDraft,
+    ) -> Result<(ContentId, View, usize, u64)> {
         let objects = ObjectStore::from_repository(self.inner.clone())?;
         let retained = retention::compute_roots_readonly(&objects, draft.roots.iter().copied())?;
         check_view_size(
@@ -293,9 +357,9 @@ impl LocalRepository {
             draft.files.iter().map(|file| file.path.len()),
             retained.len(),
         )?;
-        let (view, _, _) = draft_to_view(draft, retained, |bytes| Ok(ContentId::for_bytes(bytes)))?;
+        let (view, file_count, content_bytes) = build_candidate_view(draft, retained);
         let id = ContentId::for_bytes(&view.encode()?);
-        Ok((id, view))
+        Ok((id, view, file_count, content_bytes))
     }
 
     pub(crate) fn global_excludes_file(&self) -> Result<Option<std::path::PathBuf>> {
@@ -343,12 +407,13 @@ impl LocalRepository {
         // after discovery.
         let roots = retention::roots(&head, &refs, index.as_ref())?;
 
-        let mut paths = BTreeSet::<Vec<u8>>::new();
+        let mut tracked_paths = BTreeSet::<Vec<u8>>::new();
         if let Some(index) = &index {
             for entry in index.entries() {
-                paths.insert(entry.path(index).to_vec());
+                tracked_paths.insert(entry.path(index).to_vec());
             }
         }
+        let mut paths = tracked_paths.clone();
         for path in self.untracked_paths(index.as_ref())? {
             paths.insert(path);
         }
@@ -358,8 +423,23 @@ impl LocalRepository {
         for path in &paths {
             // Kinds and bytes come from the worktree itself: an executable bit cleared on
             // disk must be captured as regular, and a leaf symlink as its raw target.
-            let Some(entry) = root.read_entry(path, options.max_file_bytes)? else {
-                continue;
+            let entry = match root.read_entry(path, options.max_file_bytes) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => continue,
+                Err(Error::Io(error))
+                    if tracked_paths.contains(path)
+                        && error.raw_os_error()
+                            == Some(rustix::io::Errno::NOTDIR.raw_os_error()) =>
+                {
+                    continue;
+                }
+                Err(Error::UnsupportedRepository(_))
+                    if tracked_paths.contains(path)
+                        && matches!(root.entry_kind(path)?, Some(PathEntryKind::Directory)) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             files.push(FileDraft {
                 path: BString::from(path.as_slice()),
@@ -384,9 +464,19 @@ impl LocalRepository {
         })
     }
 
-    fn persist_draft(&self, store: &RecoveryStore, draft: ViewDraft) -> Result<PersistedDraft> {
+    fn persist_draft(
+        &self,
+        store: &RecoveryStore,
+        draft: ViewDraft,
+        known_cas: &BTreeSet<ContentId>,
+    ) -> Result<PersistedDraft> {
         let objects = ObjectStore::from_repository(self.inner.clone())?;
-        let retained = retention::retain_roots(store, &objects, draft.roots.iter().copied())?;
+        let retained = retention::retain_roots_with_known(
+            store,
+            &objects,
+            draft.roots.iter().copied(),
+            known_cas,
+        )?;
         check_view_size(
             draft.head.len(),
             &draft.refs,
@@ -394,7 +484,7 @@ impl LocalRepository {
             draft.files.iter().map(|file| file.path.len()),
             retained.len(),
         )?;
-        persist_draft(store, draft, retained)
+        persist_draft(store, draft, retained, known_cas)
     }
 
     /// Enumerate non-ignored untracked worktree paths with a checked directory walk.
@@ -488,18 +578,60 @@ struct PersistedDraft {
     content_bytes: u64,
 }
 
+pub(crate) fn known_cas_for_view(view: &View) -> BTreeSet<ContentId> {
+    let mut known = BTreeSet::new();
+    if let Some(index) = view.index {
+        known.insert(index);
+    }
+    for file in &view.files {
+        known.insert(file.content);
+    }
+    for retained in &view.retained_objects {
+        known.insert(retained.content);
+    }
+    known
+}
+
 fn persist_draft(
     store: &RecoveryStore,
     draft: ViewDraft,
     retained_objects: Vec<crate::recovery::RetainedObject>,
+    known_cas: &BTreeSet<ContentId>,
 ) -> Result<PersistedDraft> {
-    let (view, file_count, content_bytes) =
-        draft_to_view(draft, retained_objects, |bytes| store.put_content(bytes))?;
+    let (view, file_count, content_bytes) = draft_to_view(draft, retained_objects, |bytes| {
+        retention::persist_cas_with_known(store, bytes, known_cas)
+    })?;
     Ok(PersistedDraft {
         view_id: store.put_view(&view)?,
         file_count,
         content_bytes,
     })
+}
+
+fn build_candidate_view(
+    draft: &ViewDraft,
+    retained_objects: Vec<crate::recovery::RetainedObject>,
+) -> (View, usize, u64) {
+    let index = draft.index.as_deref().map(ContentId::for_bytes);
+    let mut files = Vec::with_capacity(draft.files.len());
+    let mut content_bytes = 0_u64;
+    for file in &draft.files {
+        content_bytes = content_bytes.saturating_add(file.bytes.len() as u64);
+        files.push(FileRecord {
+            path: file.path.clone(),
+            kind: file.kind,
+            content: ContentId::for_bytes(&file.bytes),
+        });
+    }
+    let file_count = files.len();
+    let view = View {
+        head: draft.head.clone(),
+        refs: draft.refs.clone(),
+        index,
+        files,
+        retained_objects,
+    };
+    (view, file_count, content_bytes)
 }
 
 fn draft_to_view(

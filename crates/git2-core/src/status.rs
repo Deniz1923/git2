@@ -129,7 +129,19 @@ impl LocalRepository {
                     let code = match &change {
                         gix::diff::index::Change::Addition { .. } => StatusCode::Added,
                         gix::diff::index::Change::Deletion { .. } => StatusCode::Deleted,
-                        gix::diff::index::Change::Modification { .. } => StatusCode::Modified,
+                        gix::diff::index::Change::Modification {
+                            previous_entry_mode,
+                            entry_mode,
+                            ..
+                        } => {
+                            if (*previous_entry_mode == gix::index::entry::Mode::SYMLINK)
+                                == (*entry_mode == gix::index::entry::Mode::SYMLINK)
+                            {
+                                StatusCode::Modified
+                            } else {
+                                StatusCode::TypeChanged
+                            }
+                        }
                         gix::diff::index::Change::Rewrite { copy, .. } => {
                             if *copy {
                                 StatusCode::Copied

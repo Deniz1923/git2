@@ -3,6 +3,8 @@ name = "git2-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 publish = false
 description = "Local Git-compatible repository core and recovery engine for git2."
@@ -10,7 +12,6 @@ description = "Local Git-compatible repository core and recovery engine for git2
 [dependencies]
 bstr.workspace = true
 flate2.workspace = true
-fs2.workspace = true
 gix.workspace = true
 sha1.workspace = true
 sha2.workspace = true

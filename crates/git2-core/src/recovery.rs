@@ -191,9 +191,9 @@ pub struct RetainedObject {
     pub content: ContentId,
 }
 
-/// A captured supported local repository view intended for the future restore engine.
+/// A captured supported local repository view for inspection and recovery.
 ///
-/// Restore and undo are not implemented yet; persisting a `View` alone is not a backup proof.
+/// Experimental pre-release state: keep an external backup of valuable repositories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct View {
     /// Raw `.git/HEAD` bytes.
@@ -580,7 +580,7 @@ pub struct RecoveryLock {
 
 impl Drop for RecoveryLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
     }
 }
 
@@ -707,7 +707,13 @@ impl RecoveryStore {
     /// Returns an error immediately if another git2 process holds the lock.
     pub fn try_lock(&self) -> Result<RecoveryLock> {
         let file = self.directory.open_lock()?;
-        fs2::FileExt::try_lock_exclusive(&file)?;
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "recovery lock is held by another git2 process",
+            ),
+            std::fs::TryLockError::Error(cause) => cause,
+        })?;
         Ok(RecoveryLock { file })
     }
 
@@ -734,7 +740,6 @@ impl RecoveryStore {
                     "immutable record {name} has unexpected content"
                 )));
             }
-            dir.sync()?;
             return Ok(id);
         }
 
@@ -763,6 +768,20 @@ impl RecoveryStore {
     pub(crate) fn read_content_bounded(&self, id: ContentId, limit: usize) -> Result<Vec<u8>> {
         let dir = self.fanout_directory("cas", id, false)?;
         read_cas_entry(&dir, &record_name(id), id, limit)
+    }
+
+    /// Report whether a CAS record exists on disk without decompressing its payload.
+    pub(crate) fn has_content(&self, id: ContentId) -> Result<bool> {
+        let hex = id.to_hex();
+        let cas = self.directory.open_child("cas", true)?;
+        let dir = match cas.open_child(&hex[..2], true) {
+            Ok(dir) => dir,
+            Err(Error::Io(cause)) if cause.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        dir.exists(&hex[2..])
     }
 
     /// Persist an immutable view and return its identifier.

@@ -21,13 +21,13 @@ use crate::object::{GitOid, parse_canonical_object};
 use crate::paths::{CheckedRoot, PathEntryKind, checked_split};
 use crate::recovery::{
     CapturePolicy, ContentId, DIGEST_LEN, FileKind, MAX_CAS_BYTES, MAX_OPERATION_BYTES,
-    MAX_VIEW_BYTES, Operation, OperationKind, RecoveryStore, add_sizes, check_count, checked_field,
-    read_bytes, read_content_id, read_count, read_fixed, read_u64, take_byte, take_exact,
-    write_bytes, write_count,
+    MAX_VIEW_BYTES, Operation, OperationKind, RecoveryLock, RecoveryStore, add_sizes, check_count,
+    checked_field, read_bytes, read_content_id, read_count, read_fixed, read_u64, take_byte,
+    take_exact, write_bytes, write_count,
 };
-use crate::repository::{LocalRepository, current_timestamp_seconds};
+use crate::repository::{LocalRepository, current_timestamp_seconds, known_cas_for_view};
 use crate::retention::MAX_OBJECT_BYTES;
-use crate::store::ObjectStore;
+use crate::store::{BoundedReader, ObjectStore};
 use crate::{Error, Result};
 
 const PLAN_MAGIC: &[u8] = b"git2-plan\0\x01";
@@ -963,10 +963,20 @@ pub fn run(repo: &LocalRepository, plan: &MutationPlan) -> Result<ContentId> {
 pub fn run_with_hook(
     repo: &LocalRepository,
     plan: &MutationPlan,
-    mut hook: impl FnMut(Failpoint) -> Result<()>,
+    hook: impl FnMut(Failpoint) -> Result<()>,
 ) -> Result<ContentId> {
     let store = RecoveryStore::open(repo.git_dir())?;
-    let _lock = store.try_lock()?;
+    let lock = store.try_lock()?;
+    run_locked_with_hook(repo, &store, &lock, plan, hook)
+}
+
+pub(crate) fn run_locked_with_hook(
+    repo: &LocalRepository,
+    store: &RecoveryStore,
+    _lock: &RecoveryLock,
+    plan: &MutationPlan,
+    mut hook: impl FnMut(Failpoint) -> Result<()>,
+) -> Result<ContentId> {
     if store.has_pending()? {
         return Err(Error::UnsupportedRepository(
             "a pending transaction exists; reconcile it with `recover` first".to_owned(),
@@ -981,19 +991,22 @@ pub fn run_with_hook(
     }
 
     let policy = store.policy()?;
-    store.read_view(plan.target_view)?;
-    validate_plan_inputs(&store, &plan.actions, policy)?;
+    let target_view = store.read_view(plan.target_view)?;
+    let before_view = store.read_view(plan.before_view)?;
+    let mut known_cas = known_cas_for_view(&before_view);
+    known_cas.extend(known_cas_for_view(&target_view));
+    validate_plan_inputs(store, &plan.actions, policy)?;
     let plan_bytes = encode_plan(&plan.actions)?;
     let plan_id = ContentId::for_bytes(&plan_bytes);
 
-    let live_view = repo.capture_and_persist_view(&store)?;
+    let live_view = repo.capture_and_persist_view_with_known(store, &known_cas)?;
     if live_view != plan.before_view {
         return Err(Error::UnsupportedRepository(format!(
             "stale mutation plan: expected live view {}, found {live_view}",
             plan.before_view
         )));
     }
-    let parent = publish_external_if_needed(&store, observed_head, live_view)?;
+    let parent = publish_external_if_needed(store, observed_head, live_view)?;
     let timestamp_seconds = current_timestamp_seconds();
 
     let mut pending_input = Vec::new();
@@ -1006,7 +1019,7 @@ pub fn run_with_hook(
     let tx_id = ContentId::for_bytes(&pending_input);
 
     let pending_dir = store.pending_dir()?;
-    cleanup_orphan_pending(&store, &pending_dir)?;
+    cleanup_orphan_pending(store, &pending_dir)?;
     pending_dir.write_pointer(PLAN_RECORD, &plan_bytes)?;
 
     let mut record = PendingRecord {
@@ -1025,21 +1038,15 @@ pub fn run_with_hook(
     pending_dir.write_pointer(ACTIVE_RECORD, &record.encode()?)?;
     hook(Failpoint::AfterPrepare)?;
 
-    let context = TxContext {
-        git_dir: repo.git_dir(),
-        workdir: repo.workdir(),
-        store: &store,
-        policy,
-        tx_id,
-    };
-    apply_actions(&context, &mut record, &plan.actions, &mut hook)?;
+    let mut context = TxContext::new(repo.git_dir(), repo.workdir(), store, policy, tx_id)?;
+    apply_actions(&mut context, &mut record, &plan.actions, &mut hook)?;
 
     record.phase = PendingPhase::Finalizing;
     record.lock_owner = None;
     pending_dir.write_pointer(ACTIVE_RECORD, &record.encode()?)?;
     hook(Failpoint::BeforeFinalize)?;
 
-    let actual_after = repo.capture_and_persist_view(&store)?;
+    let actual_after = repo.capture_and_persist_view_with_known(store, &known_cas)?;
     if actual_after != plan.target_view {
         return Err(Error::CorruptRecovery(format!(
             "post-mutation state hashes to view {actual_after}, expected {}",
@@ -1084,13 +1091,7 @@ pub fn recover_with_hook(
 
     let (mut record, actions) = load_verified_pending(store)?;
     let policy = store.policy()?;
-    let context = TxContext {
-        git_dir: repo.git_dir(),
-        workdir: repo.workdir(),
-        store,
-        policy,
-        tx_id: record.tx_id,
-    };
+    let mut context = TxContext::new(repo.git_dir(), repo.workdir(), store, policy, record.tx_id)?;
     let expected_op_id = record.operation_id()?;
     let current_head = store.head()?;
 
@@ -1111,7 +1112,7 @@ pub fn recover_with_hook(
         )));
     }
     if let Some(owner) = &record.lock_owner {
-        verify_lock_if_present(repo.git_dir(), owner)?;
+        verify_lock_if_present(&context.git_meta, owner)?;
     }
 
     if record.phase == PendingPhase::Prepared {
@@ -1130,7 +1131,7 @@ pub fn recover_with_hook(
     }
 
     let mut noop = |_| Ok(());
-    apply_actions(&context, &mut record, &actions, &mut noop)?;
+    apply_actions(&mut context, &mut record, &actions, &mut noop)?;
 
     record.phase = PendingPhase::Finalizing;
     record.lock_owner = None;
@@ -1175,13 +1176,7 @@ pub fn rollback(repo: &RecoveryRepository) -> Result<RecoveryOutcome> {
 
     let (record, actions) = load_verified_pending(store)?;
     let policy = store.policy()?;
-    let context = TxContext {
-        git_dir: repo.git_dir(),
-        workdir: repo.workdir(),
-        store,
-        policy,
-        tx_id: record.tx_id,
-    };
+    let context = TxContext::new(repo.git_dir(), repo.workdir(), store, policy, record.tx_id)?;
     let expected_op_id = record.operation_id()?;
     let current_head = store.head()?;
     if current_head == expected_op_id {
@@ -1237,10 +1232,47 @@ pub fn rollback(repo: &RecoveryRepository) -> Result<RecoveryOutcome> {
 
 struct TxContext<'a> {
     git_dir: &'a Path,
-    workdir: &'a Path,
     store: &'a RecoveryStore,
     policy: CapturePolicy,
     tx_id: ContentId,
+    git_meta: CheckedRoot,
+    worktree: CheckedRoot,
+    objects: Option<ObjectStore>,
+    reader: Option<BoundedReader>,
+}
+
+impl<'a> TxContext<'a> {
+    fn new(
+        git_dir: &'a Path,
+        workdir: &Path,
+        store: &'a RecoveryStore,
+        policy: CapturePolicy,
+        tx_id: ContentId,
+    ) -> Result<Self> {
+        Ok(Self {
+            git_dir,
+            store,
+            policy,
+            tx_id,
+            git_meta: CheckedRoot::open(git_dir)?,
+            worktree: CheckedRoot::open(workdir)?,
+            objects: None,
+            reader: None,
+        })
+    }
+
+    fn object_store_and_reader(&mut self) -> Result<(&ObjectStore, &mut BoundedReader)> {
+        if self.objects.is_none() {
+            let objects = ObjectStore::open(self.git_dir)?;
+            let reader = objects.bounded_reader(MAX_OBJECT_BYTES)?;
+            self.objects = Some(objects);
+            self.reader = Some(reader);
+        }
+        Ok((
+            self.objects.as_ref().expect("initialized above"),
+            self.reader.as_mut().expect("initialized above"),
+        ))
+    }
 }
 
 fn publish_external_if_needed(
@@ -1378,7 +1410,7 @@ fn load_verified_pending(store: &RecoveryStore) -> Result<(PendingRecord, Vec<Ac
 }
 
 fn apply_actions(
-    ctx: &TxContext<'_>,
+    ctx: &mut TxContext<'_>,
     record: &mut PendingRecord,
     actions: &[Action],
     hook: &mut impl FnMut(Failpoint) -> Result<()>,
@@ -1509,7 +1541,7 @@ fn apply_locked_metadata(
     spec: &MetadataActionSpec,
     hook: &mut impl FnMut(Failpoint) -> Result<()>,
 ) -> Result<()> {
-    let git_meta = CheckedRoot::open(ctx.git_dir)?;
+    let git_meta = &ctx.git_meta;
     let actual = git_meta.read_file_raw(spec.rel_path.as_slice(), MAX_CAS_BYTES as u64)?;
     let resumed_owner = record
         .lock_owner
@@ -1542,7 +1574,7 @@ fn apply_locked_metadata(
             if actual != spec.expected_before {
                 return Err(divergence_error(spec.rel_path.as_slice()));
             }
-            commit_locked_metadata(ctx.git_dir, spec)?;
+            commit_locked_metadata(git_meta, spec)?;
             pending_dir.remove_if_exists(stage_name)?;
             return Ok(());
         }
@@ -1602,13 +1634,12 @@ fn apply_locked_metadata(
         return Err(divergence_error(spec.rel_path.as_slice()));
     }
 
-    commit_locked_metadata(ctx.git_dir, spec)?;
+    commit_locked_metadata(git_meta, spec)?;
     pending_dir.remove_if_exists(&stage_name)?;
     Ok(())
 }
 
-fn commit_locked_metadata(git_dir: &Path, spec: &MetadataActionSpec) -> Result<()> {
-    let git_meta = CheckedRoot::open(git_dir)?;
+fn commit_locked_metadata(git_meta: &CheckedRoot, spec: &MetadataActionSpec) -> Result<()> {
     let (parent, target_leaf) =
         git_meta.open_parent_dir(spec.rel_path.as_slice(), spec.create_parents)?;
     let (_, lock_leaf) = git_meta.open_parent_dir(spec.lock_rel_path.as_slice(), false)?;
@@ -1630,7 +1661,7 @@ fn commit_locked_metadata(git_dir: &Path, spec: &MetadataActionSpec) -> Result<(
         }
         fsync(parent.as_fd()).map_err(std::io::Error::from)?;
         if spec.rel_path.starts_with(b"refs/") {
-            prune_empty_ref_ancestors(&git_meta, spec.rel_path.as_slice())?;
+            prune_empty_ref_ancestors(git_meta, spec.rel_path.as_slice())?;
         }
     }
     Ok(())
@@ -1658,19 +1689,15 @@ fn prune_empty_ref_ancestors(git_meta: &CheckedRoot, ref_path: &[u8]) -> Result<
     Ok(())
 }
 
-fn apply_unlocked_action(ctx: &TxContext<'_>, idx: usize, action: &Action) -> Result<()> {
+fn apply_unlocked_action(ctx: &mut TxContext<'_>, idx: usize, action: &Action) -> Result<()> {
     match action {
         Action::RehydrateObject { oid, content } => {
-            let objects = ObjectStore::open(ctx.git_dir)?;
-            match objects.read(*oid) {
-                Ok(existing) if existing.id() == *oid => Ok(()),
-                Ok(_) => Err(Error::CorruptObject(format!(
-                    "existing Git object {oid} failed digest verification"
-                ))),
+            let store = ctx.store;
+            let (objects, reader) = ctx.object_store_and_reader()?;
+            match reader.read(*oid) {
+                Ok(_) => Ok(()),
                 Err(Error::ObjectNotFound(_)) => {
-                    let canonical = ctx
-                        .store
-                        .read_content_bounded(*content, MAX_OBJECT_BYTES + 32)?;
+                    let canonical = store.read_content_bounded(*content, MAX_OBJECT_BYTES + 32)?;
                     let object = parse_canonical_object(&canonical)?;
                     if object.id() != *oid {
                         return Err(Error::CorruptRecovery(format!(
@@ -1689,8 +1716,8 @@ fn apply_unlocked_action(ctx: &TxContext<'_>, idx: usize, action: &Action) -> Re
             expected_before,
             target,
         } => {
-            let root = CheckedRoot::open(ctx.workdir)?;
-            let actual = read_entry_state(&root, path.as_slice(), ctx.policy.max_file_bytes)?;
+            let actual =
+                read_entry_state(&ctx.worktree, path.as_slice(), ctx.policy.max_file_bytes)?;
             if actual == Some(*target) {
                 return Ok(());
             }
@@ -1702,38 +1729,33 @@ fn apply_unlocked_action(ctx: &TxContext<'_>, idx: usize, action: &Action) -> Re
                 usize::try_from(ctx.policy.max_file_bytes).unwrap_or(usize::MAX),
             )?;
             let temp_name = worktree_temp_name(ctx.tx_id, idx);
-            root.write_entry_atomic(path.as_slice(), target.kind, &bytes, &temp_name)
+            ctx.worktree
+                .write_entry_atomic(path.as_slice(), target.kind, &bytes, &temp_name)
         }
         Action::RemoveWorktreeEntry {
             path,
             expected_before,
         } => {
-            let root = CheckedRoot::open(ctx.workdir)?;
-            let actual = read_entry_state(&root, path.as_slice(), ctx.policy.max_file_bytes)?;
+            let actual =
+                read_entry_state(&ctx.worktree, path.as_slice(), ctx.policy.max_file_bytes)?;
             if actual.is_none() {
                 return Ok(());
             }
             if actual != Some(*expected_before) {
                 return Err(divergence_error(path.as_slice()));
             }
-            root.remove_entry(path.as_slice())
+            ctx.worktree.remove_entry(path.as_slice())
         }
-        Action::EnsureDir { path } => {
-            let root = CheckedRoot::open(ctx.workdir)?;
-            match root.entry_kind(path.as_slice())? {
-                Some(PathEntryKind::Directory) => Ok(()),
-                None => root.ensure_dir(path.as_slice()),
-                Some(_) => Err(divergence_error(path.as_slice())),
-            }
-        }
-        Action::RemoveEmptyDir { path } => {
-            let root = CheckedRoot::open(ctx.workdir)?;
-            match root.entry_kind(path.as_slice())? {
-                None => Ok(()),
-                Some(PathEntryKind::Directory) => root.remove_empty_dir(path.as_slice()),
-                Some(_) => Err(divergence_error(path.as_slice())),
-            }
-        }
+        Action::EnsureDir { path } => match ctx.worktree.entry_kind(path.as_slice())? {
+            Some(PathEntryKind::Directory) => Ok(()),
+            None => ctx.worktree.ensure_dir(path.as_slice()),
+            Some(_) => Err(divergence_error(path.as_slice())),
+        },
+        Action::RemoveEmptyDir { path } => match ctx.worktree.entry_kind(path.as_slice())? {
+            None => Ok(()),
+            Some(PathEntryKind::Directory) => ctx.worktree.remove_empty_dir(path.as_slice()),
+            Some(_) => Err(divergence_error(path.as_slice())),
+        },
         Action::WriteIndex { .. }
         | Action::RemoveIndex { .. }
         | Action::WriteRef { .. }
@@ -1751,8 +1773,8 @@ fn rollback_action(ctx: &TxContext<'_>, idx: usize, action: &Action) -> Result<(
             expected_before,
             target,
         } => {
-            let root = CheckedRoot::open(ctx.workdir)?;
-            let actual = read_entry_state(&root, path.as_slice(), ctx.policy.max_file_bytes)?;
+            let actual =
+                read_entry_state(&ctx.worktree, path.as_slice(), ctx.policy.max_file_bytes)?;
             if actual == *expected_before {
                 return Ok(());
             }
@@ -1766,17 +1788,22 @@ fn rollback_action(ctx: &TxContext<'_>, idx: usize, action: &Action) -> Result<(
                         usize::try_from(ctx.policy.max_file_bytes).unwrap_or(usize::MAX),
                     )?;
                     let temp_name = worktree_temp_name(ctx.tx_id, idx);
-                    root.write_entry_atomic(path.as_slice(), before.kind, &bytes, &temp_name)
+                    ctx.worktree.write_entry_atomic(
+                        path.as_slice(),
+                        before.kind,
+                        &bytes,
+                        &temp_name,
+                    )
                 }
-                None => root.remove_entry(path.as_slice()),
+                None => ctx.worktree.remove_entry(path.as_slice()),
             }
         }
         Action::RemoveWorktreeEntry {
             path,
             expected_before,
         } => {
-            let root = CheckedRoot::open(ctx.workdir)?;
-            let actual = read_entry_state(&root, path.as_slice(), ctx.policy.max_file_bytes)?;
+            let actual =
+                read_entry_state(&ctx.worktree, path.as_slice(), ctx.policy.max_file_bytes)?;
             if actual == Some(*expected_before) {
                 return Ok(());
             }
@@ -1788,24 +1815,23 @@ fn rollback_action(ctx: &TxContext<'_>, idx: usize, action: &Action) -> Result<(
                 usize::try_from(ctx.policy.max_file_bytes).unwrap_or(usize::MAX),
             )?;
             let temp_name = worktree_temp_name(ctx.tx_id, idx);
-            root.write_entry_atomic(path.as_slice(), expected_before.kind, &bytes, &temp_name)
+            ctx.worktree.write_entry_atomic(
+                path.as_slice(),
+                expected_before.kind,
+                &bytes,
+                &temp_name,
+            )
         }
-        Action::EnsureDir { path } => {
-            let root = CheckedRoot::open(ctx.workdir)?;
-            match root.entry_kind(path.as_slice())? {
-                None => Ok(()),
-                Some(PathEntryKind::Directory) => root.remove_empty_dir(path.as_slice()),
-                Some(_) => Err(divergence_error(path.as_slice())),
-            }
-        }
-        Action::RemoveEmptyDir { path } => {
-            let root = CheckedRoot::open(ctx.workdir)?;
-            match root.entry_kind(path.as_slice())? {
-                Some(PathEntryKind::Directory) => Ok(()),
-                None => root.ensure_dir(path.as_slice()),
-                Some(_) => Err(divergence_error(path.as_slice())),
-            }
-        }
+        Action::EnsureDir { path } => match ctx.worktree.entry_kind(path.as_slice())? {
+            None => Ok(()),
+            Some(PathEntryKind::Directory) => ctx.worktree.remove_empty_dir(path.as_slice()),
+            Some(_) => Err(divergence_error(path.as_slice())),
+        },
+        Action::RemoveEmptyDir { path } => match ctx.worktree.entry_kind(path.as_slice())? {
+            Some(PathEntryKind::Directory) => Ok(()),
+            None => ctx.worktree.ensure_dir(path.as_slice()),
+            Some(_) => Err(divergence_error(path.as_slice())),
+        },
         _ => {
             let mut spec = metadata_spec(ctx.store, action)?.expect("metadata variant");
             spec.create_parents = spec.create_parents
@@ -1827,7 +1853,7 @@ fn rollback_locked_metadata(
     idx: usize,
     spec: &MetadataActionSpec,
 ) -> Result<()> {
-    let git_meta = CheckedRoot::open(ctx.git_dir)?;
+    let git_meta = &ctx.git_meta;
     let actual = git_meta.read_file_raw(spec.rel_path.as_slice(), MAX_CAS_BYTES as u64)?;
     if actual == spec.target {
         return Ok(());
@@ -1850,7 +1876,7 @@ fn rollback_locked_metadata(
         }
     }
     fsync(parent.as_fd()).map_err(std::io::Error::from)?;
-    commit_locked_metadata(ctx.git_dir, spec)?;
+    commit_locked_metadata(git_meta, spec)?;
     pending_dir.remove_if_exists(&stage_name)?;
     Ok(())
 }
@@ -1862,8 +1888,7 @@ fn read_entry_state(root: &CheckedRoot, path: &[u8], limit: u64) -> Result<Optio
     }))
 }
 
-fn verify_lock_if_present(git_dir: &Path, owner: &LockOwner) -> Result<()> {
-    let git_meta = CheckedRoot::open(git_dir)?;
+fn verify_lock_if_present(git_meta: &CheckedRoot, owner: &LockOwner) -> Result<()> {
     if let Some((dev, ino)) = git_meta.stat_regular_dev_ino(owner.lock_rel_path.as_slice())?
         && (dev, ino) != (owner.dev, owner.ino)
     {
@@ -1873,7 +1898,7 @@ fn verify_lock_if_present(git_dir: &Path, owner: &LockOwner) -> Result<()> {
 }
 
 fn release_owned_lock(ctx: &TxContext<'_>, owner: &LockOwner) -> Result<()> {
-    let git_meta = CheckedRoot::open(ctx.git_dir)?;
+    let git_meta = &ctx.git_meta;
     if let Some((dev, ino)) = git_meta.stat_regular_dev_ino(owner.lock_rel_path.as_slice())? {
         if (dev, ino) != (owner.dev, owner.ino) {
             return Err(foreign_lock_error(owner.lock_rel_path.as_slice()));
@@ -1902,10 +1927,10 @@ fn stage_name_str(name: &BString) -> Result<&str> {
 }
 
 fn cleanup_worktree_temps(ctx: &TxContext<'_>, actions: &[Action]) -> Result<()> {
-    let root = CheckedRoot::open(ctx.workdir)?;
     for (idx, action) in actions.iter().enumerate() {
         if let Action::WriteWorktreeEntry { path, .. } = action {
-            root.cleanup_temp(path.as_slice(), &worktree_temp_name(ctx.tx_id, idx))?;
+            ctx.worktree
+                .cleanup_temp(path.as_slice(), &worktree_temp_name(ctx.tx_id, idx))?;
         }
     }
     Ok(())

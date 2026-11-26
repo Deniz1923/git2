@@ -461,15 +461,13 @@ fn inspect_worktree(
             match kind {
                 PathEntryKind::Directory => {
                     if name.as_slice() == b".git" && !dir.is_empty() {
-                        if under_target_file
-                            || target_dirs.contains(&dir)
-                            || !target_profile.is_ignored(dir.as_slice(), true)
-                        {
-                            return Err(Error::UnsupportedRepository(format!(
-                                "nested repository at {} blocks restore",
-                                escape_path_bytes(dir.as_slice())
-                            )));
-                        }
+                        check_nested_git_dir(
+                            dir.as_slice(),
+                            under_target_file,
+                            target_dirs.contains(&dir),
+                            target_profile,
+                            "restore",
+                        )?;
                         continue;
                     }
                     scan.existing_dirs.insert(rel.clone());
@@ -630,40 +628,14 @@ fn append_worktree_actions(actions: &mut Vec<Action>, ctx: &WorktreePlanContext<
         }
     }
 
-    let mut dirs_to_remove: Vec<BString> = ctx
-        .scan
-        .existing_dirs
-        .iter()
-        .filter(|dir| {
-            let dir_slice = dir.as_slice();
-            let replaced_by_file =
-                target_file_set.contains(dir_slice) || has_ancestor_in(dir_slice, &target_file_set);
-            let orphaned_live_dir = !target_dirs.contains(*dir) && !dirs_with_kept.contains(*dir);
-            replaced_by_file || orphaned_live_dir
-        })
-        .cloned()
-        .collect();
-    dirs_to_remove.sort_by(|left, right| {
-        Reverse(component_count(left.as_slice()))
-            .cmp(&Reverse(component_count(right.as_slice())))
-            .then_with(|| Reverse(left).cmp(&Reverse(right)))
-    });
-    for dir in dirs_to_remove {
-        actions.push(Action::RemoveEmptyDir { path: dir });
-    }
-
-    let mut dirs_to_ensure: Vec<BString> = target_dirs
-        .into_iter()
-        .filter(|dir| !ctx.scan.existing_dirs.contains(dir) || removed_paths.contains(dir))
-        .collect();
-    dirs_to_ensure.sort_by(|left, right| {
-        component_count(left.as_slice())
-            .cmp(&component_count(right.as_slice()))
-            .then_with(|| left.cmp(right))
-    });
-    for dir in dirs_to_ensure {
-        actions.push(Action::EnsureDir { path: dir });
-    }
+    push_dir_lifecycle_actions(
+        actions,
+        &ctx.scan.existing_dirs,
+        &target_dirs,
+        &target_file_set,
+        &dirs_with_kept,
+        &removed_paths,
+    );
 
     for (path, target) in ctx.target_map {
         if ctx.scan.reclassified_keep.contains(path) || ctx.live_map.get(path) == Some(target) {
@@ -680,16 +652,11 @@ fn append_worktree_actions(actions: &mut Vec<Action>, ctx: &WorktreePlanContext<
 
 fn collect_rehydrate_actions(git_dir: &Path, target_view: &View) -> Result<Vec<Action>> {
     let objects = ObjectStore::open(git_dir)?;
+    let mut reader = objects.bounded_reader(retention::MAX_OBJECT_BYTES)?;
     let mut actions = Vec::new();
     for retained in &target_view.retained_objects {
-        match objects.read(retained.oid) {
-            Ok(existing) if existing.id() == retained.oid => {}
-            Ok(_) => {
-                return Err(Error::CorruptObject(format!(
-                    "existing Git object {} failed digest verification",
-                    retained.oid
-                )));
-            }
+        match reader.read(retained.oid) {
+            Ok(_) => {}
             Err(Error::ObjectNotFound(_)) => actions.push(Action::RehydrateObject {
                 oid: retained.oid,
                 content: retained.content,
@@ -874,5 +841,64 @@ pub(crate) fn component_count(path: &[u8]) -> usize {
         0
     } else {
         path.split(|&b| b == b'/').count()
+    }
+}
+
+pub(crate) fn check_nested_git_dir(
+    dir: &[u8],
+    under_target_file: bool,
+    target_has_dir: bool,
+    target_profile: &IgnoreProfile,
+    context: &str,
+) -> Result<()> {
+    if under_target_file || target_has_dir || !target_profile.is_ignored(dir, true) {
+        return Err(Error::UnsupportedRepository(format!(
+            "nested repository at {} blocks {context}",
+            escape_path_bytes(dir)
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn push_dir_lifecycle_actions(
+    actions: &mut Vec<Action>,
+    existing_dirs: &BTreeSet<BString>,
+    target_dirs: &BTreeSet<BString>,
+    target_file_set: &BTreeSet<&[u8]>,
+    dirs_with_kept: &BTreeSet<BString>,
+    removed_paths: &BTreeSet<BString>,
+) {
+    let mut dirs_to_remove: Vec<BString> = existing_dirs
+        .iter()
+        .filter(|dir| {
+            let s = dir.as_slice();
+            let replaced_by_file =
+                target_file_set.contains(s) || has_ancestor_in(s, target_file_set);
+            let orphaned = !target_dirs.contains(*dir) && !dirs_with_kept.contains(*dir);
+            replaced_by_file || orphaned
+        })
+        .cloned()
+        .collect();
+    dirs_to_remove.sort_by(|left, right| {
+        Reverse(component_count(left.as_slice()))
+            .cmp(&Reverse(component_count(right.as_slice())))
+            .then_with(|| Reverse(left).cmp(&Reverse(right)))
+    });
+    for dir in dirs_to_remove {
+        actions.push(Action::RemoveEmptyDir { path: dir });
+    }
+
+    let mut dirs_to_ensure: Vec<BString> = target_dirs
+        .iter()
+        .filter(|dir| !existing_dirs.contains(*dir) || removed_paths.contains(*dir))
+        .cloned()
+        .collect();
+    dirs_to_ensure.sort_by(|left, right| {
+        component_count(left.as_slice())
+            .cmp(&component_count(right.as_slice()))
+            .then_with(|| left.cmp(right))
+    });
+    for dir in dirs_to_ensure {
+        actions.push(Action::EnsureDir { path: dir });
     }
 }

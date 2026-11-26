@@ -20,14 +20,25 @@ git --version
 ```text
 .
 ├── Cargo.toml
+├── .github/workflows/ci.yml
 ├── crates/
 │   ├── git2-core/
 │   │   ├── src/
+│   │   │   ├── lib.rs
 │   │   │   ├── object.rs
-│   │   │   ├── store.rs
+│   │   │   ├── paths.rs
 │   │   │   ├── recovery.rs
+│   │   │   ├── recovery/disk.rs
 │   │   │   ├── repository.rs
-│   │   │   └── status.rs
+│   │   │   ├── reset.rs
+│   │   │   ├── restore.rs
+│   │   │   ├── retention.rs
+│   │   │   ├── stage.rs
+│   │   │   ├── status.rs
+│   │   │   ├── store.rs
+│   │   │   ├── store/packed.rs
+│   │   │   ├── transaction.rs
+│   │   │   └── undo.rs
 │   │   └── tests/
 │   └── git2-cli/
 │       ├── src/main.rs
@@ -38,10 +49,17 @@ git --version
 Module responsibilities:
 
 - `object`: byte-safe Git object model and codecs;
-- `store`: loose object access plus packed fallback;
-- `recovery`: private SHA-256 store and binary records;
+- `paths`: descriptor-relative, no-follow worktree & metadata path operations;
+- `recovery` / `recovery::disk`: owner-private SHA-256 zlib CAS store and binary records;
 - `repository`: discovery, refusal policy, capture, and external import;
+- `retention`: reachable Git object closure verification and retention;
+- `transaction`: 4-phase pending journal and crash recovery;
+- `restore`: verified `restore --view` planning and execution;
+- `reset`: native `reset [--soft | --mixed | --hard]` over commits and branches;
+- `undo`: semantic-index `undo` / redo over completed operations;
+- `stage`: native `add` literal staging with built-in EOL conversion;
 - `status`: merged HEAD/index/worktree status model;
+- `store` / `store::packed`: loose object I/O plus bounded packed-object reads;
 - CLI `main`: parsing, output, and orchestration only.
 
 ## Common commands

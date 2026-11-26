@@ -7,8 +7,6 @@
 //! whereas any staged entry path, stage, mode, OID, flag, worktree, ref, or
 //! HEAD divergence is refused.
 
-use std::path::Path;
-
 use bstr::BString;
 use gix::index::entry::Flags;
 
@@ -232,27 +230,4 @@ fn semantic_index_entries(bytes: &[u8]) -> Result<Vec<SemanticIndexEntry>> {
             flags: entry.flags & mask,
         })
         .collect())
-}
-
-/// Compare two raw views directly without requiring a `LocalRepository` on callers that hold `git_dir`.
-#[allow(dead_code)]
-pub(crate) fn live_matches_after_semantically(
-    git_dir: &Path,
-    store: &RecoveryStore,
-    live_id: ContentId,
-    live_view: &View,
-    expected_id: ContentId,
-    expected_view: &View,
-) -> Result<bool> {
-    let live_index_bytes =
-        CheckedRoot::open(git_dir)?.read_file_raw(b"index", MAX_CAS_BYTES as u64)?;
-    views_semantically_equal(
-        store,
-        live_id,
-        live_view,
-        live_index_bytes.as_deref(),
-        expected_id,
-        expected_view,
-        None,
-    )
 }

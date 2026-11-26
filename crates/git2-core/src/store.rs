@@ -71,8 +71,17 @@ impl ObjectStore {
     /// Returns an error if the object is absent, corrupt, or cannot be read.
     pub fn read(&self, id: GitOid) -> Result<RawObject> {
         let loose_path = self.loose_path(id);
-        if loose_path.is_file() {
-            return read_loose(&loose_path, id);
+        match fs::symlink_metadata(&loose_path) {
+            Ok(meta) => {
+                if !meta.file_type().is_file() {
+                    return Err(Error::CorruptObject(format!(
+                        "loose object {id} is not a regular file"
+                    )));
+                }
+                return read_loose(&loose_path, id);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
 
         let object = self
@@ -111,14 +120,47 @@ impl ObjectStore {
     pub fn write(&self, object: &RawObject) -> Result<GitOid> {
         let id = object.id();
         let target = self.loose_path(id);
-        if target.is_file() {
-            return Ok(id);
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_file() => {
+                read_loose(&target, id)?;
+                return Ok(id);
+            }
+            Ok(_) => {
+                return Err(Error::CorruptObject(format!(
+                    "loose object {id} is not a regular file"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
 
         let parent = target
             .parent()
             .ok_or_else(|| Error::CorruptObject("loose object path has no parent".to_owned()))?;
-        fs::create_dir_all(parent)?;
+        let objects_dir = self.git_dir.join("objects");
+        match fs::symlink_metadata(&objects_dir) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(Error::UnsupportedRepository(
+                    "Git objects must live in a real objects directory".to_owned(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let parent_created = match fs::symlink_metadata(parent) {
+            Ok(meta) if meta.file_type().is_dir() => false,
+            Ok(_) => {
+                return Err(Error::CorruptObject(format!(
+                    "loose object directory {} is not a directory",
+                    parent.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(parent)?;
+                true
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         let compressed = compress(&object.canonical_bytes())?;
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -133,23 +175,23 @@ impl ObjectStore {
 
         match fs::rename(&temporary, &target) {
             Ok(()) => {}
-            Err(error) if target.is_file() => {
+            Err(error) => {
                 let _ = fs::remove_file(&temporary);
-                if !matches!(
+                if matches!(
                     error.kind(),
                     std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) {
+                ) && fs::symlink_metadata(&target).is_ok_and(|meta| meta.file_type().is_file())
+                {
+                    read_loose(&target, id)?;
+                } else {
                     return Err(error.into());
                 }
             }
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error.into());
-            }
         }
 
-        if let Ok(directory) = File::open(parent) {
-            let _ = directory.sync_all();
+        File::open(parent)?.sync_all()?;
+        if parent_created {
+            File::open(&objects_dir)?.sync_all()?;
         }
         Ok(id)
     }

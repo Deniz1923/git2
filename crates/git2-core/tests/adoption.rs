@@ -657,3 +657,24 @@ fn split_index_enabled_after_discovery_is_refused_before_sidecar() {
     );
     assert!(!repository.git_dir().join("git2").exists());
 }
+
+#[test]
+fn repeated_unchanged_import_is_a_no_op() {
+    let directory = repository();
+    std::fs::write(directory.path().join("file.txt"), b"steady\n").unwrap();
+    git(directory.path(), &["add", "file.txt"]);
+    commit(directory.path(), "steady");
+
+    let repo = LocalRepository::discover(directory.path()).unwrap();
+    let adopt = repo.adopt(AdoptOptions::default()).unwrap();
+
+    let first = repo.import_external_changes().unwrap();
+    assert!(!first.changed);
+    assert_eq!(first.operation_id, adopt.operation_id);
+    assert_eq!(first.view_id, adopt.view_id);
+
+    let second = repo.import_external_changes().unwrap();
+    assert!(!second.changed);
+    assert_eq!(second.operation_id, adopt.operation_id);
+    assert_eq!(second.view_id, adopt.view_id);
+}

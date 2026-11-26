@@ -298,3 +298,27 @@ fn restore_dry_run_apply_and_clean_recover_status() {
         "no pending transaction"
     );
 }
+
+#[test]
+fn mismatched_git_dir_and_core_worktree_is_refused() {
+    let repo_a = tempfile::tempdir().unwrap();
+    let repo_b = tempfile::tempdir().unwrap();
+    for repo in [repo_a.path(), repo_b.path()] {
+        git(repo, &["init", "--quiet", "-b", "main"]);
+    }
+    git(
+        repo_b.path(),
+        &["config", "core.worktree", repo_a.path().to_str().unwrap()],
+    );
+
+    let output = git2(repo_b.path(), &["status"]);
+    assert!(
+        !output.status.success(),
+        "mismatched core.worktree must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(".git"),
+        "expected .git directory ownership refusal, got: {stderr}"
+    );
+}

@@ -13,14 +13,16 @@ use crate::recovery::{
     CapturePolicy, ContentId, FileKind, FileRecord, MAX_CAS_BYTES, RecoveryStore, View,
     check_view_size,
 };
-use crate::repository::{LocalRepository, decode_index, validate_index};
+use crate::repository::{LocalRepository, decode_index, known_cas_for_view, validate_index};
 use crate::restore::{
-    IgnoreProfile, MAX_SYMLINK_TARGET_BYTES, ancestor_dir_set, component_count,
-    decode_view_index_readonly, ensure_no_foreign_locks, file_map, has_ancestor_in,
-    is_gitignore_path, join_rel, mark_ancestors, split_refs, tracked_set,
+    IgnoreProfile, MAX_SYMLINK_TARGET_BYTES, ancestor_dir_set, check_nested_git_dir,
+    component_count, decode_view_index_readonly, ensure_no_foreign_locks, file_map,
+    has_ancestor_in, is_gitignore_path, join_rel, mark_ancestors, push_dir_lifecycle_actions,
+    split_refs, tracked_set,
 };
-use crate::retention;
-use crate::store::ObjectStore;
+use crate::retention::{self, MAX_OBJECT_BYTES};
+use crate::stage::RepoFilter;
+use crate::store::{BoundedReader, ObjectStore};
 use crate::transaction::{self, Action, EntryState, Failpoint, MutationPlan, escape_path_bytes};
 use crate::{Error, Result};
 
@@ -67,6 +69,16 @@ pub struct ResetOutcome {
 /// Returns an error if the revision uses unsupported syntax, names an unborn or unknown
 /// reference, does not resolve to a commit object, or exceeds `~N` parent history/bounds.
 pub fn resolve_commit(repo: &LocalRepository, rev: &str) -> Result<GitOid> {
+    let objects = ObjectStore::open(repo.git_dir())?;
+    let mut reader = objects.bounded_reader(MAX_OBJECT_BYTES)?;
+    resolve_commit_with_reader(repo, &mut reader, rev)
+}
+
+fn resolve_commit_with_reader(
+    repo: &LocalRepository,
+    reader: &mut BoundedReader,
+    rev: &str,
+) -> Result<GitOid> {
     if rev.is_empty() || rev.contains('^') || rev.contains("@{") || rev.contains("..") {
         return Err(Error::UnsupportedRepository(format!(
             "unsupported revision syntax {rev:?}; use commit ID, HEAD, branch name, and optional ~N"
@@ -74,9 +86,8 @@ pub fn resolve_commit(repo: &LocalRepository, rev: &str) -> Result<GitOid> {
     }
     let (base, steps) = parse_tilde_suffix(rev)?;
     let meta = CheckedRoot::open(repo.git_dir())?;
-    let objects = ObjectStore::open(repo.git_dir())?;
-    let base_oid = resolve_base_oid(&meta, &objects, base)?;
-    walk_first_parent(&objects, base_oid, steps)
+    let base_oid = resolve_base_oid(&meta, reader, base)?;
+    walk_first_parent(reader, base_oid, steps)
 }
 
 /// Apply `git2 reset` cleanly without failure injection.
@@ -98,21 +109,23 @@ pub fn apply_with_hook(
     hook: impl FnMut(Failpoint) -> Result<()>,
 ) -> Result<ResetOutcome> {
     let store = RecoveryStore::open(repo.git_dir())?;
+    let lock = store.try_lock()?;
     if store.has_pending()? {
         return Err(Error::UnsupportedRepository(
             "a pending transaction exists; reconcile or inspect it with `recover` first".to_owned(),
         ));
     }
 
-    repo.import_external_changes()?;
+    repo.import_external_changes_locked(&store, &lock)?;
     let expected_head = store.head()?;
     let policy = store.policy()?;
     let (live_view_id, live_view) = repo.capture_live_view_readonly(policy)?;
     let live_index = decode_view_index_readonly(repo.git_dir(), &live_view)?;
 
-    let target_commit = resolve_commit(repo, rev)?;
     let objects = ObjectStore::open(repo.git_dir())?;
-    let commit_obj = objects.read(target_commit)?;
+    let mut reader = objects.bounded_reader(MAX_OBJECT_BYTES)?;
+    let target_commit = resolve_commit_with_reader(repo, &mut reader, rev)?;
+    let commit_obj = reader.read(target_commit)?;
     if commit_obj.kind != ObjectKind::Commit {
         return Err(Error::UnsupportedRepository(format!(
             "object {target_commit} is a {}, expected commit",
@@ -121,11 +134,11 @@ pub fn apply_with_hook(
     }
     let commit = Commit::parse(&commit_obj.data)?;
 
-    let (target_head, target_refs, head_actions) = plan_head_update(&live_view, target_commit);
+    let head_plan = plan_head_update(&live_view, target_commit)?;
     let prepared = prepare_reset_state(
         repo,
         &store,
-        &objects,
+        &mut reader,
         mode,
         commit.tree,
         &live_view,
@@ -133,15 +146,17 @@ pub fn apply_with_hook(
         policy,
     )?;
     let mut actions = prepared.worktree_and_index_actions;
-    actions.extend(head_actions);
+    actions.extend(head_plan.actions);
 
     ensure_no_foreign_locks(repo.git_dir(), &actions)?;
 
+    let known_cas = known_cas_for_view(&live_view);
     let target_view_id = persist_target_view(
         &store,
         &objects,
-        target_head,
-        target_refs,
+        &known_cas,
+        head_plan.head,
+        head_plan.refs,
         prepared.target_index_bytes.as_deref(),
         prepared.target_files,
         prepared.cas_writes,
@@ -156,7 +171,7 @@ pub fn apply_with_hook(
         actions,
         changes,
     };
-    let operation_id = transaction::run_with_hook(repo, &plan, hook)?;
+    let operation_id = transaction::run_locked_with_hook(repo, &store, &lock, &plan, hook)?;
     Ok(ResetOutcome {
         operation_id,
         target_commit,
@@ -195,17 +210,18 @@ fn parse_tilde_suffix(rev: &str) -> Result<(&str, usize)> {
     Ok((base, steps))
 }
 
-fn resolve_base_oid(meta: &CheckedRoot, objects: &ObjectStore, base: &str) -> Result<GitOid> {
+fn resolve_base_oid(meta: &CheckedRoot, reader: &mut BoundedReader, base: &str) -> Result<GitOid> {
     if base == "HEAD" {
         let raw_head = meta
             .read_file_raw(b"HEAD", MAX_CAS_BYTES as u64)?
             .ok_or_else(|| Error::UnsupportedRepository("Git HEAD is missing".to_owned()))?;
         let trimmed = trim_newline(&raw_head);
         if let Some(target_ref) = trimmed.strip_prefix(b"ref: ") {
-            return resolve_ref_oid(meta, target_ref)?.ok_or_else(|| {
+            let (leaf_ref, oid) = resolve_ref_chain(meta, target_ref)?;
+            return oid.ok_or_else(|| {
                 Error::UnsupportedRepository(format!(
                     "cannot reset unborn branch {}",
-                    escape_path_bytes(target_ref)
+                    escape_path_bytes(leaf_ref.as_slice())
                 ))
             });
         }
@@ -215,7 +231,7 @@ fn resolve_base_oid(meta: &CheckedRoot, objects: &ObjectStore, base: &str) -> Re
     if base.len() == 40
         && let Ok(oid) = GitOid::from_hex(base.as_bytes())
     {
-        if objects.read(oid)?.kind != ObjectKind::Commit {
+        if reader.read(oid)?.kind != ObjectKind::Commit {
             return Err(Error::UnsupportedRepository(format!(
                 "object {oid} is not a commit"
             )));
@@ -227,17 +243,47 @@ fn resolve_base_oid(meta: &CheckedRoot, objects: &ObjectStore, base: &str) -> Re
     gix::validate::reference::name(branch_ref.as_bytes().as_bstr()).map_err(|_| {
         Error::UnsupportedRepository(format!("unsupported revision or branch name {base:?}"))
     })?;
-    resolve_ref_oid(meta, branch_ref.as_bytes())?.ok_or_else(|| {
+    let (_, oid) = resolve_ref_chain(meta, branch_ref.as_bytes())?;
+    oid.ok_or_else(|| {
         Error::UnsupportedRepository(format!("unknown revision or local branch {base:?}"))
     })
 }
 
-fn resolve_ref_oid(meta: &CheckedRoot, ref_name: &[u8]) -> Result<Option<GitOid>> {
-    checked_split(ref_name)?;
-    if let Some(loose) = meta.read_file_raw(ref_name, MAX_CAS_BYTES as u64)? {
-        let trimmed = trim_newline(&loose);
-        return Ok(Some(GitOid::from_hex(trimmed)?));
+fn resolve_ref_chain(meta: &CheckedRoot, start_ref: &[u8]) -> Result<(BString, Option<GitOid>)> {
+    let mut current = BString::from(start_ref);
+    for _ in 0..32 {
+        checked_split(current.as_slice())?;
+        if !current.starts_with(b"refs/") {
+            return Err(Error::UnsupportedRepository(format!(
+                "unsupported symbolic reference {}",
+                escape_path_bytes(current.as_slice())
+            )));
+        }
+        gix::validate::reference::name(current.as_bstr()).map_err(|_| {
+            Error::UnsupportedRepository(format!(
+                "invalid reference name {}",
+                escape_path_bytes(current.as_slice())
+            ))
+        })?;
+        if let Some(loose) = meta.read_file_raw(current.as_slice(), MAX_CAS_BYTES as u64)? {
+            let trimmed = trim_newline(&loose);
+            if let Some(next_ref) = trimmed.strip_prefix(b"ref: ") {
+                current = BString::from(next_ref);
+                continue;
+            }
+            return Ok((current, Some(GitOid::from_hex(trimmed)?)));
+        }
+        return Ok((
+            current.clone(),
+            resolve_packed_ref_oid(meta, current.as_slice())?,
+        ));
     }
+    Err(Error::UnsupportedRepository(
+        "symbolic reference exceeds maximum indirection depth".to_owned(),
+    ))
+}
+
+fn resolve_packed_ref_oid(meta: &CheckedRoot, ref_name: &[u8]) -> Result<Option<GitOid>> {
     let Some(packed) = meta.read_file_raw(b"packed-refs", MAX_CAS_BYTES as u64)? else {
         return Ok(None);
     };
@@ -255,9 +301,13 @@ fn resolve_ref_oid(meta: &CheckedRoot, ref_name: &[u8]) -> Result<Option<GitOid>
     Ok(None)
 }
 
-fn walk_first_parent(objects: &ObjectStore, mut current: GitOid, steps: usize) -> Result<GitOid> {
+fn walk_first_parent(
+    reader: &mut BoundedReader,
+    mut current: GitOid,
+    steps: usize,
+) -> Result<GitOid> {
     for step in 0..=steps {
-        let object = objects.read(current)?;
+        let object = reader.read(current)?;
         if object.kind != ObjectKind::Commit {
             return Err(Error::UnsupportedRepository(format!(
                 "object {current} is a {}, expected commit",
@@ -277,16 +327,36 @@ fn walk_first_parent(objects: &ObjectStore, mut current: GitOid, steps: usize) -
     Ok(current)
 }
 
-fn plan_head_update(
-    live_view: &View,
-    target_commit: GitOid,
-) -> (BString, Vec<(BString, BString)>, Vec<Action>) {
+struct HeadPlan {
+    head: BString,
+    refs: Vec<(BString, BString)>,
+    actions: Vec<Action>,
+}
+
+fn plan_head_update(live_view: &View, target_commit: GitOid) -> Result<HeadPlan> {
     let trimmed_head = trim_newline(live_view.head.as_slice());
     let oid_line = BString::from(format!("{target_commit}\n"));
     let (packed, mut loose) = split_refs(&live_view.refs);
 
     if let Some(target_ref_bytes) = trimmed_head.strip_prefix(b"ref: ") {
-        let ref_name = BString::from(target_ref_bytes);
+        let mut ref_name = BString::from(target_ref_bytes);
+        let mut resolved = false;
+        for _ in 0..32 {
+            if let Some(val) = loose.get(&ref_name) {
+                let trimmed = trim_newline(val.as_slice());
+                if let Some(next_ref) = trimmed.strip_prefix(b"ref: ") {
+                    ref_name = BString::from(next_ref);
+                    continue;
+                }
+            }
+            resolved = true;
+            break;
+        }
+        if !resolved {
+            return Err(Error::UnsupportedRepository(
+                "symbolic reference exceeds maximum indirection depth".to_owned(),
+            ));
+        }
         let expected_before = loose.get(&ref_name).cloned();
         let mut actions = Vec::new();
         if expected_before.as_ref() != Some(&oid_line) {
@@ -297,7 +367,11 @@ fn plan_head_update(
             });
         }
         loose.insert(ref_name, oid_line);
-        (live_view.head.clone(), rebuild_refs(packed, loose), actions)
+        Ok(HeadPlan {
+            head: live_view.head.clone(),
+            refs: rebuild_refs(packed, loose),
+            actions,
+        })
     } else {
         let expected_before = live_view.head.clone();
         let mut actions = Vec::new();
@@ -307,7 +381,11 @@ fn plan_head_update(
                 target: oid_line.clone(),
             });
         }
-        (oid_line, rebuild_refs(packed, loose), actions)
+        Ok(HeadPlan {
+            head: oid_line,
+            refs: rebuild_refs(packed, loose),
+            actions,
+        })
     }
 }
 
@@ -334,7 +412,7 @@ struct PreparedReset {
 fn prepare_reset_state(
     repo: &LocalRepository,
     store: &RecoveryStore,
-    objects: &ObjectStore,
+    reader: &mut BoundedReader,
     mode: ResetMode,
     tree_oid: GitOid,
     live_view: &View,
@@ -355,7 +433,7 @@ fn prepare_reset_state(
     }
 
     let mut tree_entries = BTreeMap::new();
-    flatten_tree(objects, tree_oid, b"", &mut tree_entries)?;
+    flatten_tree(reader, tree_oid, b"", &mut tree_entries)?;
     let new_index_bytes = build_index_bytes(&tree_entries)?;
     let new_index = decode_index(&new_index_bytes)?;
     validate_index(&new_index)?;
@@ -389,7 +467,7 @@ fn prepare_reset_state(
     } else {
         prepare_hard_reset(
             repo,
-            objects,
+            reader,
             excludes_file,
             case,
             live_index,
@@ -477,7 +555,7 @@ fn prepare_mixed_files(
 #[allow(clippy::too_many_arguments)]
 fn prepare_hard_reset(
     repo: &LocalRepository,
-    objects: &ObjectStore,
+    reader: &mut BoundedReader,
     excludes_file: Option<std::path::PathBuf>,
     case: Case,
     live_index: Option<&gix::index::State>,
@@ -487,8 +565,9 @@ fn prepare_hard_reset(
     policy: CapturePolicy,
     actions: &mut Vec<Action>,
 ) -> Result<(Vec<FileRecord>, Vec<Vec<u8>>)> {
+    let mut filter = RepoFilter::new_smudge(repo, new_index)?;
     let (target_blobs, mut cas_writes, mut gitignores) =
-        collect_hard_target_blobs(objects, live_map, tree_entries, policy)?;
+        collect_hard_target_blobs(reader, &mut filter, live_map, tree_entries, policy)?;
 
     let worktree = CheckedRoot::open(repo.workdir())?;
     let current_profile = IgnoreProfile::for_live(
@@ -587,7 +666,8 @@ fn prepare_hard_reset(
 
 #[allow(clippy::type_complexity)]
 fn collect_hard_target_blobs(
-    objects: &ObjectStore,
+    reader: &mut BoundedReader,
+    filter: &mut RepoFilter<'_>,
     live_map: &BTreeMap<BString, EntryState>,
     tree_entries: &BTreeMap<BString, (FileKind, GitOid)>,
     policy: CapturePolicy,
@@ -603,7 +683,7 @@ fn collect_hard_target_blobs(
     let mut cas_writes = Vec::new();
     let mut gitignores = Vec::new();
     for (path, (kind, oid)) in tree_entries {
-        let obj = objects.read(*oid)?;
+        let obj = reader.read(*oid)?;
         if obj.kind != ObjectKind::Blob {
             return Err(Error::CorruptObject(format!(
                 "tree entry {} points to {}, expected blob",
@@ -611,29 +691,34 @@ fn collect_hard_target_blobs(
                 obj.kind
             )));
         }
-        if obj.data.len() > max_file {
+        let worktree_bytes = if *kind == FileKind::Symlink {
+            if obj.data.len() > MAX_SYMLINK_TARGET_BYTES {
+                return Err(Error::UnsupportedRepository(format!(
+                    "target symlink {} exceeds maximum target length",
+                    escape_path_bytes(path.as_slice())
+                )));
+            }
+            obj.data
+        } else {
+            filter.convert_to_worktree(path.as_slice(), &obj.data, max_file)?
+        };
+        if worktree_bytes.len() > max_file {
             return Err(Error::UnsupportedRepository(format!(
                 "target file {} exceeds persisted size limit",
                 escape_path_bytes(path.as_slice())
             )));
         }
-        if *kind == FileKind::Symlink && obj.data.len() > MAX_SYMLINK_TARGET_BYTES {
-            return Err(Error::UnsupportedRepository(format!(
-                "target symlink {} exceeds maximum target length",
-                escape_path_bytes(path.as_slice())
-            )));
-        }
         let state = EntryState {
             kind: *kind,
-            content: ContentId::for_bytes(&obj.data),
+            content: ContentId::for_bytes(&worktree_bytes),
         };
         if *kind != FileKind::Symlink && is_gitignore_path(path.as_slice()) {
-            gitignores.push((path.clone(), obj.data.clone()));
+            gitignores.push((path.clone(), worktree_bytes.clone()));
         }
         if live_map.get(path) != Some(&state) {
-            cas_writes.push(obj.data.clone());
+            cas_writes.push(worktree_bytes.clone());
         }
-        target_blobs.insert(path.clone(), (state, obj.data));
+        target_blobs.insert(path.clone(), (state, worktree_bytes));
     }
     Ok((target_blobs, cas_writes, gitignores))
 }
@@ -679,15 +764,13 @@ fn inspect_hard_worktree(
             match kind {
                 PathEntryKind::Directory => {
                     if name.as_slice() == b".git" && !dir.is_empty() {
-                        if under_target_file
-                            || target_dirs.contains(&dir)
-                            || !target_profile.is_ignored(dir.as_slice(), true)
-                        {
-                            return Err(Error::UnsupportedRepository(format!(
-                                "nested repository at {} blocks reset",
-                                escape_path_bytes(dir.as_slice())
-                            )));
-                        }
+                        check_nested_git_dir(
+                            dir.as_slice(),
+                            under_target_file,
+                            target_dirs.contains(&dir),
+                            target_profile,
+                            "reset",
+                        )?;
                         continue;
                     }
                     scan.existing_dirs.insert(rel.clone());
@@ -838,40 +921,14 @@ fn append_hard_worktree_actions(
         actions.push(action);
     }
 
-    let mut dirs_to_remove: Vec<BString> = scan
-        .existing_dirs
-        .iter()
-        .filter(|dir| {
-            let s = dir.as_slice();
-            let replaced_by_file =
-                target_file_set.contains(s) || has_ancestor_in(s, target_file_set);
-            let orphaned = !target_dirs.contains(*dir) && !dirs_with_kept.contains(*dir);
-            replaced_by_file || orphaned
-        })
-        .cloned()
-        .collect();
-    dirs_to_remove.sort_by(|left, right| {
-        Reverse(component_count(left.as_slice()))
-            .cmp(&Reverse(component_count(right.as_slice())))
-            .then_with(|| Reverse(left).cmp(&Reverse(right)))
-    });
-    for dir in dirs_to_remove {
-        actions.push(Action::RemoveEmptyDir { path: dir });
-    }
-
-    let mut dirs_to_ensure: Vec<BString> = target_dirs
-        .iter()
-        .filter(|dir| !scan.existing_dirs.contains(*dir) || removed_paths.contains(*dir))
-        .cloned()
-        .collect();
-    dirs_to_ensure.sort_by(|left, right| {
-        component_count(left.as_slice())
-            .cmp(&component_count(right.as_slice()))
-            .then_with(|| left.cmp(right))
-    });
-    for dir in dirs_to_ensure {
-        actions.push(Action::EnsureDir { path: dir });
-    }
+    push_dir_lifecycle_actions(
+        actions,
+        &scan.existing_dirs,
+        target_dirs,
+        target_file_set,
+        &dirs_with_kept,
+        &removed_paths,
+    );
 
     for (path, (target, _)) in target_blobs {
         if scan.reclassified_keep.contains(path) || live_map.get(path) == Some(target) {
@@ -886,12 +943,12 @@ fn append_hard_worktree_actions(
 }
 
 fn flatten_tree(
-    objects: &ObjectStore,
+    reader: &mut BoundedReader,
     tree_oid: GitOid,
     prefix: &[u8],
     out: &mut BTreeMap<BString, (FileKind, GitOid)>,
 ) -> Result<()> {
-    let obj = objects.read(tree_oid)?;
+    let obj = reader.read(tree_oid)?;
     if obj.kind != ObjectKind::Tree {
         return Err(Error::CorruptObject(format!(
             "object {tree_oid} is a {}, expected tree",
@@ -919,7 +976,7 @@ fn flatten_tree(
                     escape_path_bytes(rel.as_slice())
                 )));
             }
-            TreeMode::Directory => flatten_tree(objects, entry.oid, rel.as_slice(), out)?,
+            TreeMode::Directory => flatten_tree(reader, entry.oid, rel.as_slice(), out)?,
             TreeMode::File => {
                 if out
                     .insert(rel.clone(), (FileKind::Regular, entry.oid))
@@ -994,9 +1051,11 @@ pub(crate) fn serialize_index(state: &mut gix::index::State) -> Result<Vec<u8>> 
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_target_view(
     store: &RecoveryStore,
     objects: &ObjectStore,
+    known_cas: &BTreeSet<ContentId>,
     head: BString,
     refs: Vec<(BString, BString)>,
     index_bytes: Option<&[u8]>,
@@ -1005,10 +1064,10 @@ fn persist_target_view(
 ) -> Result<ContentId> {
     files.sort_by(|left, right| left.path.cmp(&right.path));
     for payload in cas_writes {
-        store.put_content(&payload)?;
+        retention::persist_cas_with_known(store, &payload, known_cas)?;
     }
     let index = index_bytes
-        .map(|bytes| store.put_content(bytes))
+        .map(|bytes| retention::persist_cas_with_known(store, bytes, known_cas))
         .transpose()?;
     let decoded_index = index_bytes.map(decode_index).transpose()?;
     let roots = retention::roots(head.as_slice(), &refs, decoded_index.as_ref())?;
@@ -1019,7 +1078,7 @@ fn persist_target_view(
         files.iter().map(|file| file.path.len()),
         roots.len(),
     )?;
-    let retained_objects = retention::retain_roots(store, objects, roots)?;
+    let retained_objects = retention::retain_roots_with_known(store, objects, roots, known_cas)?;
     check_view_size(
         head.len(),
         &refs,

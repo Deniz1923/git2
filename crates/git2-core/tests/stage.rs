@@ -396,3 +396,77 @@ fn add_all_unborn_detached_and_foreign_lock_refusal() {
     assert!(!store.has_pending().unwrap());
     git(unborn.path(), &["fsck", "--full"]);
 }
+
+#[test]
+fn add_clean_file_is_noop_and_encoding_and_df_swap_work() {
+    let dir_git = tempfile::tempdir().unwrap();
+    let dir_git2 = tempfile::tempdir().unwrap();
+    for dir in [dir_git.path(), dir_git2.path()] {
+        git(dir, &["init", "--quiet", "-b", "main"]);
+        fs::write(dir.join("clean.txt"), b"clean\n").unwrap();
+        fs::create_dir(dir.join("slot")).unwrap();
+        fs::write(dir.join("slot/inside.txt"), b"nested\n").unwrap();
+        fs::write(dir.join("file_to_dir"), b"regular\n").unwrap();
+        git(dir, &["add", "clean.txt", "slot/inside.txt", "file_to_dir"]);
+        git(dir, &["commit", "-q", "-m", "base"]);
+    }
+
+    let repo = LocalRepository::discover(dir_git2.path()).unwrap();
+    let adopt = repo.adopt(AdoptOptions::default()).unwrap();
+    let index_before = fs::read(dir_git2.path().join(".git/index")).unwrap();
+
+    // 1. Adding an already-clean file must NOT rewrite `.git/index` or append a spurious operation.
+    let noop = stage::apply(
+        &repo,
+        dir_git2.path(),
+        false,
+        &[OsString::from("clean.txt")],
+    )
+    .unwrap();
+    assert_eq!(noop.staged_count, 0);
+    assert_eq!(noop.removed_count, 0);
+    assert_eq!(noop.operation_id, adopt.operation_id);
+    assert_eq!(noop.after_view, adopt.view_id);
+    assert_eq!(
+        fs::read(dir_git2.path().join(".git/index")).unwrap(),
+        index_before
+    );
+
+    // 2. File <-> directory replacement matches `git add` cleanly.
+    for dir in [dir_git.path(), dir_git2.path()] {
+        fs::remove_dir_all(dir.join("slot")).unwrap();
+        fs::write(dir.join("slot"), b"now regular file\n").unwrap();
+        fs::remove_file(dir.join("file_to_dir")).unwrap();
+        fs::create_dir(dir.join("file_to_dir")).unwrap();
+        fs::write(dir.join("file_to_dir/child.txt"), b"now directory\n").unwrap();
+    }
+    git(dir_git.path(), &["add", "--", "slot", "file_to_dir"]);
+    stage::apply(
+        &repo,
+        dir_git2.path(),
+        false,
+        &[OsString::from("slot"), OsString::from("file_to_dir")],
+    )
+    .unwrap();
+    assert_eq!(
+        git(dir_git.path(), &["ls-files", "--stage", "-z"]),
+        git(dir_git2.path(), &["ls-files", "--stage", "-z"])
+    );
+    git(dir_git2.path(), &["fsck", "--full"]);
+
+    // 3. Unsupported non-UTF-8 `working-tree-encoding` refuses cleanly without touching index.
+    fs::write(
+        dir_git2.path().join(".gitattributes"),
+        b"*.u16 working-tree-encoding=UTF-16\n",
+    )
+    .unwrap();
+    fs::write(dir_git2.path().join("note.u16"), b"bytes\n").unwrap();
+    let idx_snap = fs::read(dir_git2.path().join(".git/index")).unwrap();
+    let err =
+        stage::apply(&repo, dir_git2.path(), false, &[OsString::from("note.u16")]).unwrap_err();
+    assert!(err.to_string().contains("working-tree-encoding"), "{err}");
+    assert_eq!(
+        fs::read(dir_git2.path().join(".git/index")).unwrap(),
+        idx_snap
+    );
+}

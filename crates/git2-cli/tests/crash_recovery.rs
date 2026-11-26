@@ -291,3 +291,29 @@ fn dry_run_reports_pending_without_modifying_state() {
         head_before
     );
 }
+
+#[test]
+fn status_and_checkpoint_report_pending_transaction_cleanly() {
+    let (dir, file_view, _) = init_swap_repo();
+
+    let crashed = git2(
+        dir.path(),
+        &["restore", "--view", &file_view],
+        Some("abort:after_prepare"),
+    );
+    assert!(!crashed.status.success());
+
+    // Even if `.git/index` disappeared mid-crash, `status` and `checkpoint` must direct
+    // the user to `git2 recover` first rather than running repository discovery blindly.
+    fs::remove_file(dir.path().join(".git/index")).unwrap();
+
+    for cmd in [["status"].as_slice(), ["checkpoint"].as_slice()] {
+        let out = git2(dir.path(), cmd, None);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("pending transaction") && stderr.contains("git2 recover"),
+            "{cmd:?} must report pending transaction: {stderr}"
+        );
+    }
+}

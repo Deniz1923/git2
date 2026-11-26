@@ -132,3 +132,31 @@ fn packed_blob_is_read_through_gix() {
     assert_eq!(object.kind, ObjectKind::Blob);
     assert_eq!(object.data, b"eventually packed\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn write_refuses_corrupt_or_symlink_loose_object_destination() {
+    let directory = repository();
+    let store = ObjectStore::discover(directory.path()).expect("discover repository");
+    let object = RawObject {
+        kind: ObjectKind::Blob,
+        data: b"verified loose payload\n".to_vec(),
+    };
+    let id = object.id();
+    let hex = id.to_hex();
+    let parent = store.git_dir().join("objects").join(&hex[..2]);
+    std::fs::create_dir_all(&parent).unwrap();
+    let target = parent.join(&hex[2..]);
+
+    // Pre-existing corrupt regular file must fail verification instead of silently returning Ok.
+    std::fs::write(&target, b"corrupt loose bytes").unwrap();
+    assert!(store.write(&object).is_err());
+    std::fs::remove_file(&target).unwrap();
+
+    // Pre-existing symlink at loose object path must be refused.
+    let decoy = directory.path().join("decoy");
+    std::fs::write(&decoy, b"decoy").unwrap();
+    std::os::unix::fs::symlink(&decoy, &target).unwrap();
+    assert!(store.read(id).is_err());
+    assert!(store.write(&object).is_err());
+}

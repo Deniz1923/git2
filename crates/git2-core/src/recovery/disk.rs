@@ -53,15 +53,15 @@ impl Directory {
     }
 
     pub(super) fn create_child(&self, name: &str, exclusive: bool) -> Result<Self> {
-        match mkdirat(&*self.0, name, DIR_MODE) {
-            Ok(()) => {}
-            Err(Errno::EXIST) if !exclusive => {}
+        let created = match mkdirat(&*self.0, name, DIR_MODE) {
+            Ok(()) => true,
+            Err(Errno::EXIST) if !exclusive => false,
             Err(error) => return Err(io::Error::from(error).into()),
-        }
+        };
         let dir = self.open_child(name, true)?;
-        // Sync the parent even when the directory pre-existed: an earlier attempt
-        // may have created it but failed before syncing its directory entry.
-        self.0.sync_all()?;
+        if created {
+            self.0.sync_all()?;
+        }
         Ok(dir)
     }
 

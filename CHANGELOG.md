@@ -24,9 +24,12 @@ All notable project changes are recorded here. The project has not made a suppor
 - Native `git2 reset [--soft | --mixed | --hard]` (resolving `HEAD`, local branches, full 40-hex commit IDs, and bounded `~N` up to 10,000 steps) and `git2 undo [--dry-run]` / redo with semantic index comparison across stat-cache refreshes, plus full core and CLI crash-recovery tests.
 - Native `git2 add [--all] [--] [<path>...]` literal CWD-relative staging (new/modified/deleted files, recursive directories, binary/executable/symlink fidelity, built-in `gix` text/EOL conversion, active external-filter and ignored-path refusal, transactional index lockfile updates, and differential + CLI crash tests).
 - Product, architecture, compatibility, CLI, format, roadmap, testing, development, contribution, and security documentation.
+- GitHub Actions CI workflow running formatting, clippy, workspace tests, and rustdoc checks.
 
 ### Changed
 
+- Hardened worktree/Git metadata ownership checks (`core.worktree` mismatch refusal), `ObjectStore::read`/`write` symlink and verification checks, bounded object/filter reads, and D/F capture edge cases.
+- Avoided redundant CAS decompressions and `fsync`s during unchanged `status`/`oplog`/`checkpoint` checks, swapped `fs2` for stdlib `File::try_lock`/`unlock`, removed unused helpers, and aligned status type-change reporting (`T`), clean `git2 add` no-ops, `git2 reset` symbolic branch refs and `--hard` EOL checkout, CLI pending guards on `status`/`checkpoint`, and repository documentation.
 - Pinned the workspace to Rust 1.98.0.
 - Reduced the original speculative multi-crate scaffold to one core and one CLI crate.
 - Replaced placeholder commands and ignored tests with implemented vertical slices.

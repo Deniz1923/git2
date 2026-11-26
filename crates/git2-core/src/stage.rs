@@ -14,14 +14,14 @@ use gix::prelude::Find;
 use crate::object::{GitOid, ObjectKind, RawObject, hash_object};
 use crate::paths::{CheckedRoot, PathEntryKind, checked_split};
 use crate::recovery::{CapturePolicy, ContentId, FileKind, RecoveryStore, View, check_view_size};
-use crate::repository::{LocalRepository, decode_index, validate_index};
+use crate::repository::{LocalRepository, decode_index, known_cas_for_view, validate_index};
 use crate::reset::serialize_index;
 use crate::restore::{
     IgnoreProfile, MAX_SYMLINK_TARGET_BYTES, ancestor_dir_set, decode_view_index_readonly,
     ensure_no_foreign_locks, has_ancestor_in, join_rel, tracked_set,
 };
 use crate::retention::{self, MAX_OBJECT_BYTES};
-use crate::store::ObjectStore;
+use crate::store::{BoundedReader, ObjectStore};
 use crate::transaction::{self, Action, Failpoint, MutationPlan, escape_path_bytes};
 use crate::{Error, Result};
 
@@ -72,13 +72,14 @@ pub fn apply_with_hook(
     }
 
     let store = RecoveryStore::open(repo.git_dir())?;
+    let lock = store.try_lock()?;
     if store.has_pending()? {
         return Err(Error::UnsupportedRepository(
             "a pending transaction exists; reconcile or inspect it with `recover` first".to_owned(),
         ));
     }
 
-    repo.import_external_changes()?;
+    repo.import_external_changes_locked(&store, &lock)?;
     let expected_head = store.head()?;
     let policy = store.policy()?;
     let (live_view_id, live_view) = repo.capture_live_view_readonly(policy)?;
@@ -86,56 +87,52 @@ pub fn apply_with_hook(
     let base_index = live_index
         .clone()
         .unwrap_or_else(|| gix::index::State::new(gix::hash::Kind::Sha1));
-    let live_tracked = tracked_set(Some(&base_index));
-
-    let excludes_file = repo.global_excludes_file()?;
-    let case = if repo.ignore_case() {
-        Case::Fold
-    } else {
-        Case::Sensitive
-    };
-    let worktree = CheckedRoot::open(repo.workdir())?;
-    let ignore_profile = IgnoreProfile::for_live(
-        repo.git_dir(),
-        repo.workdir(),
-        &worktree,
-        excludes_file,
-        case,
-        Some(&base_index),
-        None,
-        policy,
-    )?;
-
-    let normalized_targets = if all {
-        Vec::new()
-    } else {
-        resolve_literal_args(repo.workdir(), cwd, paths)?
-    };
-    let targets = collect_stage_targets(
-        &worktree,
-        &ignore_profile,
-        &live_tracked,
-        all,
-        &normalized_targets,
-    )?;
+    let targets = scan_stage_targets(repo, cwd, all, paths, &base_index, policy)?;
 
     let objects = ObjectStore::open(repo.git_dir())?;
-    let mut filter_ctx = StageFilter::new(repo, &base_index)?;
+    let mut reader = objects.bounded_reader(MAX_OBJECT_BYTES)?;
+    let mut filter_ctx = RepoFilter::new_clean(repo, &base_index)?;
+    let worktree = CheckedRoot::open(repo.workdir())?;
     let staged_entries = convert_and_prepare_blobs(
         &worktree,
-        &objects,
+        &mut reader,
         &base_index,
         &mut filter_ctx,
         &targets.staged,
         policy,
     )?;
 
-    let new_index_bytes = rebuild_staged_index(&base_index, &targets.removed, &staged_entries)?;
+    let staged_ancestors = ancestor_dir_set(staged_entries.keys().map(|p| p.as_slice()));
+    let staged_set: BTreeSet<&[u8]> = staged_entries.keys().map(|p| p.as_slice()).collect();
+    let index_differs = index_entries_differ(
+        &base_index,
+        &targets.removed,
+        &staged_entries,
+        &staged_ancestors,
+        &staged_set,
+    );
+    let new_blobs = collect_missing_blobs(&staged_entries);
+    if !index_differs && live_view.index.is_some() && new_blobs.is_empty() {
+        return Ok(AddOutcome {
+            operation_id: expected_head,
+            after_view: live_view_id,
+            staged_count: 0,
+            removed_count: 0,
+        });
+    }
+
+    let new_index_bytes = rebuild_staged_index(
+        &base_index,
+        &targets.removed,
+        &staged_entries,
+        &staged_ancestors,
+        &staged_set,
+    )?;
     let decoded_new = decode_index(&new_index_bytes)?;
     validate_index(&decoded_new)?;
     let new_index_id = ContentId::for_bytes(&new_index_bytes);
 
-    let (actions, new_blobs) = build_stage_actions(live_view.index, new_index_id, &staged_entries);
+    let actions = build_stage_actions(live_view.index, new_index_id, &new_blobs);
     ensure_no_foreign_locks(repo.git_dir(), &actions)?;
 
     let after_view = if actions.is_empty() {
@@ -151,23 +148,61 @@ pub fn apply_with_hook(
         )?
     };
 
-    let command = format_add_command(all, paths);
-    let changes = MutationPlan::changes_for_actions(&actions);
     let plan = MutationPlan {
         expected_head,
         before_view: live_view_id,
         target_view: after_view,
-        command,
+        command: format_add_command(all, paths),
+        changes: MutationPlan::changes_for_actions(&actions),
         actions,
-        changes,
     };
-    let operation_id = transaction::run_with_hook(repo, &plan, hook)?;
+    let operation_id = transaction::run_locked_with_hook(repo, &store, &lock, &plan, hook)?;
     Ok(AddOutcome {
         operation_id,
         after_view,
         staged_count: staged_entries.len(),
         removed_count: targets.removed.len(),
     })
+}
+
+fn scan_stage_targets(
+    repo: &LocalRepository,
+    cwd: &Path,
+    all: bool,
+    paths: &[OsString],
+    base_index: &gix::index::State,
+    policy: CapturePolicy,
+) -> Result<StageTargets> {
+    let live_tracked = tracked_set(Some(base_index));
+    let worktree = CheckedRoot::open(repo.workdir())?;
+    let excludes_file = repo.global_excludes_file()?;
+    let case = if repo.ignore_case() {
+        Case::Fold
+    } else {
+        Case::Sensitive
+    };
+    let ignore_profile = IgnoreProfile::for_live(
+        repo.git_dir(),
+        repo.workdir(),
+        &worktree,
+        excludes_file,
+        case,
+        Some(base_index),
+        None,
+        policy,
+    )?;
+    let normalized_targets = if all {
+        Vec::new()
+    } else {
+        resolve_literal_args(repo.workdir(), cwd, paths)?
+    };
+    collect_stage_targets(
+        &worktree,
+        &ignore_profile,
+        &live_tracked,
+        all,
+        &normalized_targets,
+    )
 }
 
 fn resolve_literal_args(workdir: &Path, cwd: &Path, paths: &[OsString]) -> Result<Vec<BString>> {
@@ -325,9 +360,7 @@ fn collect_stage_targets(
         match entry_kind_or_absent(worktree, rel.as_slice())? {
             Some(PathEntryKind::Directory) => {
                 let prefix = dir_prefix(rel.as_slice());
-                let has_tracked_under = live_tracked
-                    .iter()
-                    .any(|p| p.starts_with(prefix.as_slice()));
+                let has_tracked_under = has_tracked_prefix(live_tracked, prefix.as_slice());
                 if ignore_profile.is_ignored(rel.as_slice(), true) && !has_tracked_under {
                     return Err(Error::UnsupportedRepository(format!(
                         "directory {} is ignored; forced addition is not supported",
@@ -341,10 +374,8 @@ fn collect_stage_targets(
                     rel.as_slice(),
                     &mut out.staged,
                 )?;
-                for tracked in live_tracked {
-                    if tracked.starts_with(prefix.as_slice())
-                        && entry_kind_or_absent(worktree, tracked.as_slice())?.is_none()
-                    {
+                for tracked in tracked_with_prefix(live_tracked, prefix.as_slice()) {
+                    if entry_kind_or_absent(worktree, tracked.as_slice())?.is_none() {
                         out.removed.insert(tracked.clone());
                     }
                 }
@@ -358,10 +389,8 @@ fn collect_stage_targets(
                 }
                 out.staged.insert(rel.clone());
                 let prefix = dir_prefix(rel.as_slice());
-                for tracked in live_tracked {
-                    if tracked.starts_with(prefix.as_slice()) {
-                        out.removed.insert(tracked.clone());
-                    }
+                for tracked in tracked_with_prefix(live_tracked, prefix.as_slice()) {
+                    out.removed.insert(tracked.clone());
                 }
             }
             Some(PathEntryKind::Other) => {
@@ -377,11 +406,9 @@ fn collect_stage_targets(
                     out.removed.insert(rel.clone());
                     matched = true;
                 }
-                for tracked in live_tracked {
-                    if tracked.starts_with(prefix.as_slice()) {
-                        out.removed.insert(tracked.clone());
-                        matched = true;
-                    }
+                for tracked in tracked_with_prefix(live_tracked, prefix.as_slice()) {
+                    out.removed.insert(tracked.clone());
+                    matched = true;
                 }
                 if !matched {
                     return Err(Error::UnsupportedRepository(format!(
@@ -393,6 +420,24 @@ fn collect_stage_targets(
         }
     }
     Ok(out)
+}
+
+fn has_tracked_prefix(live_tracked: &BTreeSet<BString>, prefix: &[u8]) -> bool {
+    let start = BString::from(prefix);
+    live_tracked
+        .range(start..)
+        .next()
+        .is_some_and(|path| path.starts_with(prefix))
+}
+
+fn tracked_with_prefix<'a>(
+    live_tracked: &'a BTreeSet<BString>,
+    prefix: &'a [u8],
+) -> impl Iterator<Item = &'a BString> {
+    let start = BString::from(prefix);
+    live_tracked
+        .range(start..)
+        .take_while(move |path| path.starts_with(prefix))
 }
 
 fn walk_directory_stage(
@@ -419,9 +464,7 @@ fn walk_directory_stage(
                         )));
                     }
                     let prefix = dir_prefix(rel.as_slice());
-                    let has_tracked_child = live_tracked
-                        .iter()
-                        .any(|p| p.starts_with(prefix.as_slice()));
+                    let has_tracked_child = has_tracked_prefix(live_tracked, prefix.as_slice());
                     if !ignore_profile.is_ignored(rel.as_slice(), true) || has_tracked_child {
                         queue.push_back(rel);
                     }
@@ -464,20 +507,55 @@ fn entry_kind_or_absent(worktree: &CheckedRoot, path: &[u8]) -> Result<Option<Pa
     }
 }
 
-struct StageFilter<'repo> {
+pub(crate) struct RepoFilter<'repo> {
     repo: &'repo gix::Repository,
     pipeline: gix::filter::plumbing::Pipeline,
     attr_stack: gix::worktree::Stack,
     active_drivers: BTreeSet<BString>,
+    op_label: &'static str,
 }
 
-impl<'repo> StageFilter<'repo> {
-    fn new(repo: &'repo LocalRepository, index: &gix::index::State) -> Result<Self> {
+impl<'repo> RepoFilter<'repo> {
+    pub(crate) fn new_clean(
+        repo: &'repo LocalRepository,
+        index: &gix::index::State,
+    ) -> Result<Self> {
+        Self::new_inner(
+            repo,
+            index,
+            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+            false,
+        )
+    }
+
+    pub(crate) fn new_smudge(
+        repo: &'repo LocalRepository,
+        index: &gix::index::State,
+    ) -> Result<Self> {
+        Self::new_inner(
+            repo,
+            index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+            true,
+        )
+    }
+
+    fn new_inner(
+        repo: &'repo LocalRepository,
+        index: &gix::index::State,
+        attr_source: gix::worktree::stack::state::attributes::Source,
+        smudge: bool,
+    ) -> Result<Self> {
         let mut options = gix::filter::Pipeline::options(&repo.inner)
             .map_err(|error| Error::UnsupportedRepository(error.to_string()))?;
         let mut active_drivers = BTreeSet::new();
         for driver in &options.drivers {
-            if driver.clean.is_some() || driver.process.is_some() || driver.required {
+            let cmd = if smudge {
+                driver.smudge.is_some()
+            } else {
+                driver.clean.is_some()
+            };
+            if cmd || driver.process.is_some() || driver.required {
                 active_drivers.insert(driver.name.clone());
             }
         }
@@ -491,10 +569,7 @@ impl<'repo> StageFilter<'repo> {
         let pipeline = gix::filter::plumbing::Pipeline::new(command_ctx, options);
         let attr_stack = repo
             .inner
-            .attributes_only(
-                index,
-                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-            )
+            .attributes_only(index, attr_source)
             .map_err(|error| Error::UnsupportedRepository(error.to_string()))?
             .detach();
         Ok(Self {
@@ -502,37 +577,24 @@ impl<'repo> StageFilter<'repo> {
             pipeline,
             attr_stack,
             active_drivers,
+            op_label: if smudge { "smudge" } else { "clean" },
         })
     }
 
-    fn convert_to_git(
-        &mut self,
+    fn check_platform_attrs(
+        active_drivers: &BTreeSet<BString>,
+        op_label: &'static str,
         path: &[u8],
-        raw_bytes: &[u8],
-        index: &gix::index::State,
-    ) -> Result<Vec<u8>> {
-        let rel_path = Path::new(OsStr::from_bytes(path));
-        let mut check = self
-            .attr_stack
-            .selected_attribute_matches(["filter", "working-tree-encoding"]);
-        let platform = self
-            .attr_stack
-            .at_path(
-                rel_path,
-                Some(gix::index::entry::Mode::FILE),
-                &self.repo.objects,
-            )
-            .map_err(|error| Error::UnsupportedRepository(error.to_string()))?;
-
-        platform.matching_attributes(&mut check);
+        check: &gix::attrs::search::Outcome,
+    ) -> Result<()> {
         for matched in check.iter_selected() {
             match matched.assignment.name.as_str() {
                 "filter" => {
                     if let StateRef::Value(name) = matched.assignment.state
-                        && self.active_drivers.contains(name.as_bstr())
+                        && active_drivers.contains(name.as_bstr())
                     {
                         return Err(Error::UnsupportedRepository(format!(
-                            "external clean filter {:?} applies to {}; external filters are not supported",
+                            "external {op_label} filter {:?} applies to {}; external filters are not supported",
                             name.as_bstr(),
                             escape_path_bytes(path)
                         )));
@@ -560,8 +622,31 @@ impl<'repo> StageFilter<'repo> {
                 _ => {}
             }
         }
+        Ok(())
+    }
 
-        let mut outcome = self
+    fn convert_to_git(
+        &mut self,
+        path: &[u8],
+        raw_bytes: &[u8],
+        index: &gix::index::State,
+    ) -> Result<Vec<u8>> {
+        let rel_path = Path::new(OsStr::from_bytes(path));
+        let mut check = self
+            .attr_stack
+            .selected_attribute_matches(["filter", "working-tree-encoding"]);
+        let platform = self
+            .attr_stack
+            .at_path(
+                rel_path,
+                Some(gix::index::entry::Mode::FILE),
+                &self.repo.objects,
+            )
+            .map_err(|error| Error::UnsupportedRepository(error.to_string()))?;
+        platform.matching_attributes(&mut check);
+        Self::check_platform_attrs(&self.active_drivers, self.op_label, path, &check)?;
+
+        let outcome = self
             .pipeline
             .convert_to_git(
                 io::Cursor::new(raw_bytes),
@@ -583,11 +668,58 @@ impl<'repo> StageFilter<'repo> {
                 },
             )
             .map_err(|error| Error::UnsupportedRepository(error.to_string()))?;
-        let mut converted = Vec::with_capacity(raw_bytes.len());
-        outcome.read_to_end(&mut converted)?;
+        let mut converted = Vec::with_capacity(raw_bytes.len().min(MAX_OBJECT_BYTES));
+        outcome
+            .take(MAX_OBJECT_BYTES as u64 + 1)
+            .read_to_end(&mut converted)?;
         if converted.len() > MAX_OBJECT_BYTES {
             return Err(Error::UnsupportedRepository(format!(
                 "converted blob {} exceeds max Git object size",
+                escape_path_bytes(path)
+            )));
+        }
+        Ok(converted)
+    }
+
+    pub(crate) fn convert_to_worktree(
+        &mut self,
+        path: &[u8],
+        git_bytes: &[u8],
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let rel_path = Path::new(OsStr::from_bytes(path));
+        let mut check = self
+            .attr_stack
+            .selected_attribute_matches(["filter", "working-tree-encoding"]);
+        let platform = self
+            .attr_stack
+            .at_path(
+                rel_path,
+                Some(gix::index::entry::Mode::FILE),
+                &self.repo.objects,
+            )
+            .map_err(|error| Error::UnsupportedRepository(error.to_string()))?;
+        platform.matching_attributes(&mut check);
+        Self::check_platform_attrs(&self.active_drivers, self.op_label, path, &check)?;
+
+        let outcome = self
+            .pipeline
+            .convert_to_worktree(
+                git_bytes,
+                path.as_bstr(),
+                &mut |_, attrs| {
+                    platform.matching_attributes(attrs);
+                },
+                gix::filter::plumbing::driver::apply::Delay::Forbid,
+            )
+            .map_err(|error| Error::UnsupportedRepository(error.to_string()))?;
+        let mut converted = Vec::with_capacity(git_bytes.len().min(max_bytes));
+        outcome
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut converted)?;
+        if converted.len() > max_bytes {
+            return Err(Error::UnsupportedRepository(format!(
+                "converted worktree file {} exceeds persisted size limit",
                 escape_path_bytes(path)
             )));
         }
@@ -603,9 +735,9 @@ struct PreparedBlob {
 
 fn convert_and_prepare_blobs(
     worktree: &CheckedRoot,
-    objects: &ObjectStore,
+    reader: &mut BoundedReader,
     index: &gix::index::State,
-    filter: &mut StageFilter<'_>,
+    filter: &mut RepoFilter<'_>,
     staged_paths: &BTreeSet<BString>,
     policy: CapturePolicy,
 ) -> Result<BTreeMap<BString, PreparedBlob>> {
@@ -633,13 +765,8 @@ fn convert_and_prepare_blobs(
         };
 
         let oid = hash_object(ObjectKind::Blob, &blob_bytes);
-        let missing_from_objects = match objects.read(oid) {
-            Ok(existing) if existing.id() == oid => None,
-            Ok(_) => {
-                return Err(Error::CorruptObject(format!(
-                    "existing object {oid} failed verification"
-                )));
-            }
+        let missing_from_objects = match reader.read(oid) {
+            Ok(_) => None,
             Err(Error::ObjectNotFound(_)) => Some(blob_bytes),
             Err(error) => return Err(error),
         };
@@ -655,21 +782,75 @@ fn convert_and_prepare_blobs(
     Ok(prepared)
 }
 
+const fn blob_mode(kind: FileKind) -> gix::index::entry::Mode {
+    match kind {
+        FileKind::Regular => gix::index::entry::Mode::FILE,
+        FileKind::Executable => gix::index::entry::Mode::FILE_EXECUTABLE,
+        FileKind::Symlink => gix::index::entry::Mode::SYMLINK,
+    }
+}
+
+fn index_entries_differ(
+    base: &gix::index::State,
+    removed: &BTreeSet<BString>,
+    staged: &BTreeMap<BString, PreparedBlob>,
+    staged_ancestors: &BTreeSet<BString>,
+    staged_set: &BTreeSet<&[u8]>,
+) -> bool {
+    let mut base_matches = 0_usize;
+    for entry in base.entries() {
+        let path_bytes = entry.path(base).as_ref();
+        let path = BString::from(path_bytes);
+        if removed.contains(&path)
+            || staged_ancestors.contains(&path)
+            || has_ancestor_in(path_bytes, staged_set)
+        {
+            return true;
+        }
+        if let Some(blob) = staged.get(&path) {
+            if entry.stage_raw() != 0
+                || entry
+                    .flags
+                    .contains(gix::index::entry::Flags::INTENT_TO_ADD)
+                || entry.mode != blob_mode(blob.kind)
+                || entry.id.as_slice() != blob.oid.as_bytes()
+            {
+                return true;
+            }
+            base_matches += 1;
+        }
+    }
+    base_matches != staged.len()
+}
+
 fn rebuild_staged_index(
     base: &gix::index::State,
     removed: &BTreeSet<BString>,
     staged: &BTreeMap<BString, PreparedBlob>,
+    staged_ancestors: &BTreeSet<BString>,
+    staged_set: &BTreeSet<&[u8]>,
 ) -> Result<Vec<u8>> {
-    let staged_ancestors = ancestor_dir_set(staged.keys().map(|p| p.as_slice()));
-    let staged_set: BTreeSet<&[u8]> = staged.keys().map(|p| p.as_slice()).collect();
+    let mut preserved: BTreeMap<BString, (gix::index::entry::Stat, gix::index::entry::Flags)> =
+        BTreeMap::new();
     let mut next = gix::index::State::new(gix::hash::Kind::Sha1);
     for entry in base.entries() {
         let path = BString::from(entry.path(base).to_vec());
         if removed.contains(&path)
-            || staged.contains_key(&path)
             || staged_ancestors.contains(&path)
-            || has_ancestor_in(path.as_slice(), &staged_set)
+            || has_ancestor_in(path.as_slice(), staged_set)
         {
+            continue;
+        }
+        if let Some(blob) = staged.get(&path) {
+            if entry.stage_raw() == 0
+                && !entry
+                    .flags
+                    .contains(gix::index::entry::Flags::INTENT_TO_ADD)
+                && entry.mode == blob_mode(blob.kind)
+                && entry.id.as_slice() == blob.oid.as_bytes()
+            {
+                preserved.insert(path, (entry.stat, entry.flags));
+            }
             continue;
         }
         next.dangerously_push_entry(
@@ -681,30 +862,20 @@ fn rebuild_staged_index(
         );
     }
     for (path, blob) in staged {
-        let mode = match blob.kind {
-            FileKind::Regular => gix::index::entry::Mode::FILE,
-            FileKind::Executable => gix::index::entry::Mode::FILE_EXECUTABLE,
-            FileKind::Symlink => gix::index::entry::Mode::SYMLINK,
-        };
-        let gix_oid = gix::ObjectId::from_bytes_or_panic(&blob.oid.as_bytes());
-        next.dangerously_push_entry(
+        let mode = blob_mode(blob.kind);
+        let (stat, flags) = preserved.get(path).copied().unwrap_or((
             gix::index::entry::Stat::default(),
-            gix_oid,
             gix::index::entry::Flags::empty(),
-            mode,
-            path.as_bstr(),
-        );
+        ));
+        let gix_oid = gix::ObjectId::from_bytes_or_panic(&blob.oid.as_bytes());
+        next.dangerously_push_entry(stat, gix_oid, flags, mode, path.as_bstr());
     }
     serialize_index(&mut next)
 }
 
 type PendingBlobMap = BTreeMap<GitOid, (ContentId, Vec<u8>)>;
 
-fn build_stage_actions(
-    live_index_id: Option<ContentId>,
-    new_index_id: ContentId,
-    staged: &BTreeMap<BString, PreparedBlob>,
-) -> (Vec<Action>, PendingBlobMap) {
+fn collect_missing_blobs(staged: &BTreeMap<BString, PreparedBlob>) -> PendingBlobMap {
     let mut new_blobs = BTreeMap::new();
     for blob in staged.values() {
         if let Some(bytes) = &blob.missing_from_objects
@@ -719,9 +890,16 @@ fn build_stage_actions(
             new_blobs.insert(blob.oid, (content, canonical));
         }
     }
+    new_blobs
+}
 
+fn build_stage_actions(
+    live_index_id: Option<ContentId>,
+    new_index_id: ContentId,
+    new_blobs: &PendingBlobMap,
+) -> Vec<Action> {
     let mut actions = Vec::with_capacity(new_blobs.len() + 1);
-    for (&oid, &(content, _)) in &new_blobs {
+    for (&oid, &(content, _)) in new_blobs {
         actions.push(Action::RehydrateObject { oid, content });
     }
     if live_index_id != Some(new_index_id) {
@@ -730,7 +908,7 @@ fn build_stage_actions(
             target: new_index_id,
         });
     }
-    (actions, new_blobs)
+    actions
 }
 
 fn persist_stage_view(
@@ -741,13 +919,14 @@ fn persist_stage_view(
     decoded_index: &gix::index::State,
     new_blobs: &PendingBlobMap,
 ) -> Result<ContentId> {
+    let known = known_cas_for_view(live_view);
     let mut staged_cas_map = BTreeMap::new();
     for (&oid, (expected_content, canonical)) in new_blobs {
-        let written = store.put_content(canonical)?;
+        let written = retention::persist_cas_with_known(store, canonical, &known)?;
         debug_assert_eq!(written, *expected_content);
         staged_cas_map.insert(oid, written);
     }
-    let index_id = store.put_content(new_index_bytes)?;
+    let index_id = retention::persist_cas_with_known(store, new_index_bytes, &known)?;
     let roots = retention::roots(
         live_view.head.as_slice(),
         &live_view.refs,
@@ -761,7 +940,7 @@ fn persist_stage_view(
         roots.len(),
     )?;
     let retained_objects =
-        retention::retain_roots_with_blobs(store, objects, roots, &staged_cas_map)?;
+        retention::retain_roots_with_blobs(store, objects, roots, &staged_cas_map, &known)?;
     check_view_size(
         live_view.head.len(),
         &live_view.refs,
