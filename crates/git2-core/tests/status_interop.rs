@@ -9,6 +9,12 @@ fn git(directory: &Path, arguments: &[&str]) -> Output {
     let output = Command::new("git")
         .args(arguments)
         .current_dir(directory)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "git2 test")
+        .env("GIT_AUTHOR_EMAIL", "git2@example.invalid")
+        .env("GIT_COMMITTER_NAME", "git2 test")
+        .env("GIT_COMMITTER_EMAIL", "git2@example.invalid")
         .output()
         .expect("Git must be installed for status tests");
     assert!(

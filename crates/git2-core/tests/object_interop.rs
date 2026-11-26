@@ -6,10 +6,21 @@ use git2_core::object::{GitOid, ObjectKind, RawObject};
 use git2_core::store::ObjectStore;
 use tempfile::TempDir;
 
-fn git(directory: &Path, arguments: &[&str]) -> Output {
-    let output = Command::new("git")
-        .args(arguments)
+fn git_command(directory: &Path, arguments: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(arguments)
         .current_dir(directory)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "git2 test")
+        .env("GIT_AUTHOR_EMAIL", "git2@example.invalid")
+        .env("GIT_COMMITTER_NAME", "git2 test")
+        .env("GIT_COMMITTER_EMAIL", "git2@example.invalid");
+    cmd
+}
+
+fn git(directory: &Path, arguments: &[&str]) -> Output {
+    let output = git_command(directory, arguments)
         .output()
         .expect("Git must be installed for differential tests");
     assert!(
@@ -21,9 +32,7 @@ fn git(directory: &Path, arguments: &[&str]) -> Output {
 }
 
 fn git_with_stdin(directory: &Path, arguments: &[&str], input: &[u8]) -> Output {
-    let mut child = Command::new("git")
-        .args(arguments)
-        .current_dir(directory)
+    let mut child = git_command(directory, arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

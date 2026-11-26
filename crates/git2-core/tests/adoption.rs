@@ -8,10 +8,21 @@ use git2_core::Error;
 use git2_core::recovery::{FileKind, FileRecord, RecoveryStore, View};
 use git2_core::repository::{AdoptOptions, LocalRepository};
 
-fn git(directory: &Path, arguments: &[&str]) -> Output {
-    let output = Command::new("git")
-        .args(arguments)
+fn git_command(directory: &Path, arguments: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(arguments)
         .current_dir(directory)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "git2 test")
+        .env("GIT_AUTHOR_EMAIL", "git2@example.invalid")
+        .env("GIT_COMMITTER_NAME", "git2 test")
+        .env("GIT_COMMITTER_EMAIL", "git2@example.invalid");
+    cmd
+}
+
+fn git(directory: &Path, arguments: &[&str]) -> Output {
+    let output = git_command(directory, arguments)
         .output()
         .expect("Git must be installed for adoption tests");
     assert!(
@@ -45,9 +56,7 @@ fn commit(directory: &Path, message: &str) {
 }
 
 fn git_expect_failure(directory: &Path, arguments: &[&str]) {
-    let output = Command::new("git")
-        .args(arguments)
-        .current_dir(directory)
+    let output = git_command(directory, arguments)
         .output()
         .expect("Git must be installed for adoption tests");
     assert!(
