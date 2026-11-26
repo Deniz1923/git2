@@ -68,21 +68,26 @@ fn hash_object_command_matches_git() {
 
 #[test]
 fn adoption_and_auto_import_leave_legacy_store_untouched() {
-    let directory = tempfile::tempdir().unwrap();
-    git(directory.path(), &["init", "--quiet"]);
-    let root = directory.path().join(".git/git2");
-    std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("format"), b"1\n").unwrap();
-    std::fs::write(root.join("HEAD"), b"old history").unwrap();
+    for (marker, label) in [
+        (b"1\n".as_slice(), "format 1"),
+        (b"2\n".as_slice(), "format 2"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "--quiet"]);
+        let root = directory.path().join(".git/git2");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("format"), marker).unwrap();
+        std::fs::write(root.join("HEAD"), b"old history").unwrap();
 
-    for command in ["adopt", "status", "oplog"] {
-        let output = git2(directory.path(), &[command]);
-        assert!(!output.status.success(), "{command} must refuse format 1");
-        let error = String::from_utf8_lossy(&output.stderr);
-        assert!(error.contains("format 1"), "{command}: {error}");
-        assert_eq!(std::fs::read(root.join("format")).unwrap(), b"1\n");
-        assert_eq!(std::fs::read(root.join("HEAD")).unwrap(), b"old history");
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        for command in ["adopt", "checkpoint", "status", "oplog"] {
+            let output = git2(directory.path(), &[command]);
+            assert!(!output.status.success(), "{command} must refuse {label}");
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains(label), "{command}: {error}");
+            assert_eq!(std::fs::read(root.join("format")).unwrap(), marker);
+            assert_eq!(std::fs::read(root.join("HEAD")).unwrap(), b"old history");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        }
     }
 }
 

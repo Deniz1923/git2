@@ -2,9 +2,9 @@
 
 ## Status and compatibility
 
-The recovery sidecar format is currently version 2 and is experimental. A format 1 store is refused in place; git2 does not migrate, delete, or overwrite it. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. Neither old snapshots nor current captures are a backup or restorable yet. `git2 checkpoint` is an explicit capture, not a restore or backup operation, and there is still no pending-transaction journal.
+The recovery sidecar format is currently version 3 and is experimental. Format 1 and format 2 stores are refused in place; git2 does not migrate, delete, or overwrite them. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. Neither old snapshots nor current captures are a backup or restorable yet. `git2 checkpoint` is an explicit capture, not a restore or backup operation, and there is still no pending-transaction journal.
 
-The reader also refuses unknown top-level versions. Any incompatible change must increment that version and update this document and fixtures. Populating the reserved retained-object map in version 2 views did not change the on-disk format: format 2 records written before retention shipped have an empty map and remain readable, but they are not retroactively completed. A new checkpoint (or adoption/automatic import) can only retain objects that are still available in the repository when it runs. git2 does not monitor ordinary Git in the background.
+The reader also refuses unknown top-level versions. Any incompatible change must increment that version and update this document and fixtures. Format 3 keeps the format 2 binary view, operation, and policy record layouts intact and adds RFC 1950 zlib compression to on-disk `cas/` entries. git2 does not monitor ordinary Git in the background.
 
 If initialization or adoption is interrupted and the store has no format, policy, or HEAD, git2 reports the missing entry. Preserve the incomplete directory separately before trying adoption again; git2 does not automatically remove it.
 
@@ -37,11 +37,11 @@ The format is private to one clone. It is stored below the Git directory and nev
 
 ## Non-goals
 
-Version 2 does not:
+Version 3 does not:
 
 - encrypt recovery content;
 - authenticate content against a secret key;
-- compress CAS payloads;
+- deltify CAS payloads across records;
 - garbage-collect unreachable records;
 - preserve ACLs, ownership, xattrs, or timestamps;
 - capture ignored files, config, hooks, or reflogs;
@@ -76,10 +76,10 @@ The first byte of hexadecimal output provides a 256-directory fanout. Git SHA-1 
 Exact bytes for the current format:
 
 ```text
-2\n
+3\n
 ```
 
-An existing different value is refused as an unsupported repository. Creating the store writes this file atomically. The marker is the only file read before checking for owner-private permissions so that older stores can be identified without modifying them.
+An existing different value is refused as an unsupported repository. Creating the store writes this file atomically. The marker is the only file read before checking for owner-private permissions so that older stores (`1\n` or `2\n`) can be identified without modifying them.
 
 ### `policy`
 
@@ -125,7 +125,7 @@ Before allocation, decoders also verify that each record count is plausible for 
 
 ## CAS records
 
-`cas/` stores raw payload bytes with no header or compression. The filename is the SHA-256 digest of those exact bytes.
+`cas/` stores RFC 1950 zlib-compressed payload bytes on disk. The filename is the SHA-256 digest of the **uncompressed** payload bytes, not of the compressed stream.
 
 Current CAS consumers:
 
@@ -135,7 +135,7 @@ Current CAS consumers:
 - symlink target bytes;
 - canonical bytes of retained Git objects (blob, tree, commit, and tag payloads with their framing).
 
-Reading recomputes SHA-256 and rejects a mismatch. Writing an ID that already exists verifies that the existing bytes are identical; different existing content is treated as corruption.
+Reads bound the compressed file size (`limit + 1 MiB`), inflate incrementally with a strict `limit` cap on uncompressed bytes, reject truncated streams (including truncated Adler-32 trailers) and any trailing bytes after the zlib stream end, and recompute SHA-256 over the uncompressed bytes to reject mismatches. Writing an ID whose `cas/` entry already exists reads and decompresses the existing record and verifies that its uncompressed bytes match byte for byte; different existing content is treated as corruption.
 
 ## View records
 
@@ -196,7 +196,7 @@ Ref records contain paths relative to the Git directory, such as `refs/heads/mai
 
 File records are generated from a path-sorted map. Paths use `/` separators in Git/index form and are interpreted as Unix bytes by the current repository implementation.
 
-The retained-object map is ordered by strictly increasing Git object ID, so duplicates are invalid. It is the reserved version 2 map, now populated by adoption, automatic imports, and explicit checkpoints with the Git object closure described below. Earlier format 2 views may carry an empty map and remain readable, but they are not retroactively completed. A format 2 view does not yet prove restore is possible.
+The retained-object map is ordered by strictly increasing Git object ID, so duplicates are invalid. It is populated by adoption, automatic imports, and explicit checkpoints with the Git object closure described below. A format 3 view does not yet prove restore is possible.
 
 ### Retained Git object map
 
@@ -265,7 +265,7 @@ An adoption operation has no parent and currently uses the same view ID for `bef
 
 ## Atomicity and durability
 
-Sidecar directories are created with mode `0700` and files with `0600` (a stricter process umask can remove permissions). Git2 checks ownership against the effective user and rejects group/other access to v2 store entries. It checks file types and uses descriptor-relative opens that do not follow symlinks inside the store.
+Sidecar directories are created with mode `0700` and files with `0600` (a stricter process umask can remove permissions). Git2 checks ownership against the effective user and rejects group/other access to v3 store entries. It checks file types and uses descriptor-relative opens that do not follow symlinks inside the store.
 
 Immutable records and mutable pointers follow this pattern:
 
@@ -301,7 +301,7 @@ Future garbage collection must begin from HEAD, walk all parent operations, reta
 
 ## Pending transactions: required design
 
-Before any user-facing mutation is enabled, `pending/` must gain a versioned durable record containing at least:
+Before any user-facing mutation is enabled, `pending/` must gain a versioned durable record driving a constrained 4-phase state machine (`Prepared -> Applying -> Finalizing -> Committed`) over a small fixed vocabulary of primitive checked actions (object rehydration, checked worktree entry writes/removals, empty-directory ensures/removals, index write/removal, and ref/packed-refs/HEAD updates), containing at least:
 
 - parent operation ID;
 - complete pre-operation view ID;

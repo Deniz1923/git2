@@ -39,7 +39,7 @@ The command refuses an already adopted repository. It also refuses unsupported r
 
 The selected size limit is stored in `.git/git2/policy`. Later checkpoints and automatic imports performed by `status` or `oplog` use that same limit.
 
-Format 1 sidecars are refused, not upgraded or removed. To start a new format 2 store, first preserve the old directory separately; see the [format notes](recovery-format.md#status-and-compatibility).
+Format 1 and format 2 sidecars are refused, not upgraded or removed. To start a new format 3 store, first preserve the old directory separately; see the [format notes](recovery-format.md#status-and-compatibility).
 
 The command does not make restore available; adoption is currently useful for format and capture testing only.
 
@@ -66,7 +66,7 @@ Like adoption and automatic imports, a checkpoint also retains the current Git o
 
 Scope and limits: checkpoint refuses indexes with resolve-undo (REUC) records and historical trees containing gitlink entries. Each retained object payload is bounded to 128 MiB, the map to 1,000,000 distinct Git objects, packed delta chains to depth 64 with a 128 MiB aggregate instruction budget, and the whole view to 64 MiB. A required object that is missing or over a limit refuses the checkpoint before a new view is exposed.
 
-Earlier format 2 views written before retention shipped have an empty retained-object map. They remain readable but are not retroactively completed; a new checkpoint can only retain objects that are still available in the repository at the time it runs. The on-disk format is unchanged. Checkpoint is a capture, not a backup: there is no restore command or pending-transaction journal yet.
+Earlier format 1 and format 2 stores are refused untouched; format 3 keeps the version 2 view/operation layout and stores CAS entries zlib-compressed on disk. Checkpoint is a capture, not a backup: there is no restore command or pending-transaction journal yet.
 
 ## `git2 status`
 
@@ -156,12 +156,13 @@ Only full 40-character object IDs are accepted.
 The following names are roadmap commitments, not current CLI features:
 
 ```text
+git2 restore
+git2 recover
+git2 reset
+git2 undo
 git2 add
 git2 commit
 git2 log
-git2 reset
-git2 restore
-git2 undo
 ```
 
 They will appear only after their transaction, interoperability, and failure-injection exit criteria pass.

@@ -110,6 +110,28 @@ impl Directory {
         }
     }
 
+    pub(super) fn sync(&self) -> Result<()> {
+        self.0.sync_all()?;
+        Ok(())
+    }
+
+    pub(super) fn publish_new(&self, name: &str, bytes: &[u8]) -> Result<bool> {
+        if self.exists(name)? {
+            return Ok(false);
+        }
+        let temp = self.stage(bytes)?;
+        let published = match linkat(&*self.0, &temp.name, &*self.0, name, AtFlags::empty()) {
+            Ok(()) => true,
+            Err(Errno::EXIST) => false,
+            Err(error) => return Err(io::Error::from(error).into()),
+        };
+        temp.remove()?;
+        if published {
+            self.0.sync_all()?;
+        }
+        Ok(published)
+    }
+
     pub(super) fn write_immutable(&self, name: &str, bytes: &[u8]) -> Result<()> {
         if self.exists(name)? {
             self.verify_existing(name, bytes)?;

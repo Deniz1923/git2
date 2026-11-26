@@ -11,6 +11,7 @@ use git2_core::recovery::{
 };
 
 const LEGACY_FORMAT: &[u8] = include_bytes!("fixtures/recovery/format-v1.txt");
+const LEGACY_FORMAT_V2: &[u8] = include_bytes!("fixtures/recovery/format-v2.txt");
 
 fn initialize(git_dir: &Path) -> RecoveryStore {
     RecoveryStore::initialize(git_dir, CapturePolicy::default()).unwrap()
@@ -54,6 +55,73 @@ fn v1_is_refused_without_a_byte_changed() {
         b"sentinel old history"
     );
     assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+}
+
+#[test]
+fn v2_is_refused_without_a_byte_changed() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let root = git_dir.path().join("git2");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    for (name, bytes) in [
+        ("format", LEGACY_FORMAT_V2),
+        ("HEAD", b"v2 sentinel history"),
+    ] {
+        let path = root.join(name);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let Err(Error::UnsupportedRepository(message)) = RecoveryStore::open(git_dir.path()) else {
+        panic!("a version 2 store must be refused");
+    };
+    assert!(message.contains('2'), "{message}");
+    assert!(RecoveryStore::initialize(git_dir.path(), CapturePolicy::default()).is_err());
+    assert_eq!(fs::read(root.join("format")).unwrap(), LEGACY_FORMAT_V2);
+    assert_eq!(fs::read(root.join("HEAD")).unwrap(), b"v2 sentinel history");
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+}
+
+#[test]
+fn cas_compresses_payloads_and_rejects_truncation_and_trailing_bytes() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let store = initialize(git_dir.path());
+    let large = vec![b'A'; 65_536];
+    let large_id = store.put_content(&large).unwrap();
+    let large_path = record_path(&store, "cas", large_id);
+    let on_disk = fs::read(&large_path).unwrap();
+    assert!(
+        on_disk.len() < 1024,
+        "expected zlib-compressed CAS record, got {} bytes",
+        on_disk.len()
+    );
+    assert_eq!(store.read_content(large_id).unwrap(), large);
+
+    let sample = b"hello compressed cas payload";
+    let sample_id = store.put_content(sample).unwrap();
+    let sample_path = record_path(&store, "cas", sample_id);
+    let compressed = fs::read(&sample_path).unwrap();
+    for end in 0..compressed.len() {
+        fs::write(&sample_path, &compressed[..end]).unwrap();
+        assert!(
+            matches!(
+                store.read_content(sample_id),
+                Err(Error::CorruptRecovery(_))
+            ),
+            "truncation at {end} must fail"
+        );
+    }
+
+    let mut trailing = compressed.clone();
+    trailing.push(0x00);
+    fs::write(&sample_path, &trailing).unwrap();
+    assert!(matches!(
+        store.read_content(sample_id),
+        Err(Error::CorruptRecovery(_))
+    ));
+
+    fs::write(&sample_path, &compressed).unwrap();
+    assert_eq!(store.read_content(sample_id).unwrap(), sample);
 }
 
 #[test]

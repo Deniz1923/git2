@@ -45,7 +45,8 @@ The core currently owns:
 - packed-object reads delegated to `gix`;
 - supported-repository discovery and refusal checks;
 - snapshot capture of HEAD, refs, index, and eligible worktree entries;
-- SHA-256 content-addressed recovery storage;
+- SHA-256 zlib-compressed content-addressed recovery storage (format 3);
+- Git object-closure retention and explicit `checkpoint` capture;
 - immutable views and operation records;
 - advisory locking and external-change import;
 - deterministic two-column status modeling.
@@ -147,7 +148,7 @@ open existing recovery store
   → atomically update git2 HEAD
 ```
 
-External import is currently triggered by `git2 status` for adopted repositories and by `git2 oplog`. It is not a background watcher.
+External import is currently triggered by `git2 status` for adopted repositories and by `git2 oplog`; `git2 checkpoint` explicitly saves the current state as `git2:checkpoint`. None of these commands run a background watcher.
 
 ### Status
 
@@ -155,20 +156,18 @@ Status uses `gix` to compare HEAD → index and index → worktree. git2 merges 
 
 ## Target mutation protocol
 
-No user-facing Git mutation is implemented yet. Every future mutation must use this protocol:
+No user-facing Git mutation is implemented yet. Every future mutation must use a constrained 4-phase (`Prepared -> Applying -> Finalizing -> Committed`) state machine over a small fixed vocabulary of primitive checked actions:
 
 1. Validate all repository and command preconditions.
 2. Acquire the git2 recovery lock.
 3. Import any state change made by another Git client.
 4. Persist and fsync the complete pre-operation view.
-5. Write and fsync a pending transaction record.
-6. Apply Git changes atomically where Git supports it.
-7. Capture and persist the post-operation view.
-8. Append the immutable git2 operation.
-9. Atomically update git2 HEAD.
-10. Remove the pending record and sync its directory.
+5. Write and fsync a pending transaction record (`Prepared`).
+6. Advance through `Applying` using individually verifiable primitive actions (object rehydration, checked worktree writes/removals, empty-directory updates, index writes/removals, and transactional ref/HEAD updates).
+7. Capture and verify the post-operation view (`Finalizing`), append the immutable git2 operation, and atomically update git2 HEAD (`Committed`).
+8. Remove the pending record and sync its directory.
 
-On startup, a pending record must be reconciled before another mutation: either prove nothing changed and discard it, or capture the resulting state and finalize a recoverable operation. A mutation must never be exposed merely because its happy-path implementation works.
+On startup, a pending record must be reconciled idempotently before another mutation: either prove nothing changed and discard it, or complete/verify rollback/finalization without duplicating history. A mutation must never be exposed merely because its happy-path implementation works.
 
 ## Target undo semantics
 
@@ -179,7 +178,7 @@ operation N: before=A, after=B, kind=git2:reset
 operation N+1: before=B, after=A, kind=git2:undo
 ```
 
-Restoring a view must update HEAD/refs/index/worktree as a checked transaction. It must first snapshot the current state, avoid following unsafe paths or symlinks, remove eligible paths absent from the target view, restore exact captured bytes and supported modes, and append its own operation. Redo can then restore the undo operation’s `before` view.
+Restoring a view must update HEAD/refs/index/worktree as a checked transaction. It must first snapshot the current state, avoid following unsafe paths or symlinks, remove eligible paths absent from the target view, restore exact captured bytes and supported modes, and append its own operation. `git2 undo` ignores stat-cache-only index refreshes (such as plain `git status`) while still requiring exact staged paths, stages, modes, OIDs, and flags, and still restoring exact captured raw index bytes. Redo can then undo the undo operation.
 
 These are design requirements, not current capabilities.
 

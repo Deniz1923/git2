@@ -30,16 +30,16 @@ At that pace, the remaining v0.1 work is roughly 22–32 focused weeks, or about
 | --- | --- | --- |
 | 0. Repository rescue | Done | Honest two-crate workspace, private artifacts removed, clean gates |
 | 1. Git object interoperability | Done | Loose round trips, packed reads, byte-safe commit/tree tests |
-| 2. Adoption and immutable history | Done | CAS, views, operations, lock, external import, object retention, explicit checkpoint |
+| 2. Adoption and immutable history | Done | Zlib-compressed format 3 CAS, views, operations, lock, external import, object retention, explicit checkpoint |
 | 3. Status | Done | Differential two-column porcelain and `-z` output |
-| 4. Mutation transaction foundation | Planned | Still next; required before staging |
-| 5. Staging | Planned | `git2 add` with Git-compatible index writes |
-| 6. Commit and history | Planned | `commit` and `log` |
-| 7. Reset and restore engine | Planned | General view restoration and reset |
-| 8. Non-destructive undo proof | Planned | `undo`, redo path, interruption tests |
-| 9. Experimental v0.1 release | Planned | Packaging, CI, demo, limitations, checksums |
+| 4. Mutation transaction foundation | Planned | Next milestone; 4-phase constrained-action journal + synthetic crash proof |
+| 5. Restore planning, apply, and recovery | Planned | `restore --view [--dry-run]`, `recover [--status]`, read-only pending `oplog` |
+| 6. Native reset and non-destructive undo proof | Planned | `reset`, semantic-index `undo`/redo, interruption tests + **stop/review gate** |
+| 7. Git-style staging | Planned | `git2 add` (literal paths, `--all`, built-in EOL) after post-proof review gate |
+| 8. Commit and history | Planned | `commit -m` and bounded first-parent `log` |
+| 9. Status completion, docs, and experimental v0.1 release | Planned | Complete supported status matrix, Linux CI, mirror-push privacy check, demo, package, checksums |
 
-Explicit `git2 checkpoint` capture and Git object retention are already done under Milestone 2, alongside the earlier adoption/capture work. They do not complete a mutation transaction: Milestone 4 remains the next planned milestone, and no mutating command ships before its pending-transaction foundation passes.
+Explicit `git2 checkpoint` capture, Git object retention, and zlib-compressed format 3 CAS are already done under Milestone 2, alongside the earlier adoption/capture work. They do not complete a mutation transaction: Milestone 4 remains the next planned milestone, and no mutating command ships before its pending-transaction foundation passes. After Milestone 6 proves `reset --hard` → `undo` → `redo` end to end under process-kill testing, the plan pauses at an explicit review gate before starting Milestones 7–9.
 
 ## Milestone 0 — repository rescue
 
@@ -102,7 +102,7 @@ Delivered:
 - adoption baseline and atomic recovery HEAD;
 - external-change import without duplicate unchanged operations;
 - CLI operation log;
-- checked worktree capture, v2 bounded records, persisted limits, and owner-private storage;
+- checked worktree capture, format 3 zlib-compressed CAS records, persisted limits, and owner-private storage;
 - retention of the Git object closure from saved physical loose and packed refs (including shadowed values and peeled OIDs), HEAD, concrete index blobs, and valid cache-tree IDs, following tag/commit/tree edges without public refs or object writes;
 - explicit `git2 checkpoint` on an adopted repository, reporting the full 64-hex view ID, logging `git2:checkpoint` on a changed save and reusing the same view with no new operation when unchanged.
 
@@ -112,13 +112,13 @@ Exit criteria met:
 - oversized files refuse adoption before sidecar creation;
 - known in-progress Git state is refused;
 - imported external changes form a correct parent/before/after chain;
-- corrupt/truncated records and concurrent git2 lock acquisition are tested;
+- corrupt/truncated records (including truncated/trailing-byte zlib CAS entries), legacy format 1/2 stores, and concurrent git2 lock acquisition are tested;
 - retained objects survive ordinary Git pruning of shadowed refs and staged blobs, and unchanged checkpoints reuse the current view.
 
 Known debt carried forward:
 
 - capture consistency against concurrently running ordinary Git is not proven; git2 does not monitor plain Git and checkpoints are explicit;
-- retention is bounded (128 MiB per object payload, 1,000,000 distinct objects, pack delta depth 64 with a 128 MiB aggregate instruction budget, plus the whole-view limit) and refuses REUC indexes and historical gitlink trees; earlier empty-map views are not retroactively completed;
+- retention is bounded (128 MiB per object payload, 1,000,000 distinct objects, pack delta depth 64 with a 128 MiB aggregate instruction budget, plus the whole-view limit) and refuses REUC indexes and historical gitlink trees;
 - no streaming capture or garbage collection;
 - no restore or pending-transaction journal exists yet, and captures are not backups.
 
@@ -151,86 +151,148 @@ Rename/copy detection is not enabled in the current command, and unresolved inde
 
 **Status: Planned — next milestone**
 
-Explicit checkpoint capture and object retention were completed under Milestone 2; they do not provide a mutation transaction. This milestone is still the next planned work before staging.
+Explicit checkpoint capture, object retention, and format 3 zlib-compressed CAS were completed under Milestone 2; they do not provide a mutation transaction. This milestone is the next planned work before restore or any user-facing Git mutation.
 
 Estimated effort: 2–4 focused weeks.
 
 Deliverables:
 
-1. Define and document a versioned pending-transaction record.
-2. Add `RecoveryStore` APIs to create, advance, read, and clear one pending transaction under the advisory lock.
+1. Define and document a versioned pending-transaction record using a constrained 4-phase state machine (`Prepared -> Applying -> Finalizing -> Committed`) over a small fixed vocabulary of primitive checked actions (`RehydrateObject`, `WriteWorktreeEntry`, `RemoveWorktreeEntry`, `EnsureDir`, `RemoveEmptyDir`, `WriteIndex`, `RemoveIndex`, `WriteRef`, `RemoveRef`, `WritePackedRefs`, `WriteHead`).
+2. Add `RecoveryStore` / transaction APIs to create, advance, read, and clear one pending transaction under the advisory lock, with same-filesystem staged-inode lock attribution.
 3. Capture a pre-operation view and sync it before any mutation callback runs.
 4. Add a transaction runner that finalizes an after-view and immutable operation only on success.
-5. Reconcile pending state on startup.
+5. Reconcile pending state idempotently on startup, including survival of a second crash after recovery `HEAD` selection.
 6. Detect or refuse concurrent ordinary-Git changes across capture/mutation boundaries.
 7. Add deterministic failpoints after every durable write and before/after each mutation boundary.
-8. Build process-kill tests that reopen the repository and prove an actionable state remains.
+8. Build process-kill tests that reopen the repository and prove an actionable state remains with zero manual repair.
 9. Apply the existing bounded-record, persisted-limit, and private-storage rules to journal data.
 
 Exit criteria:
 
 - a no-op synthetic mutation produces a valid before/after operation;
 - killing the process at every failpoint never loses the pre-operation view;
-- restart reconciliation is idempotent;
-- lock contention fails immediately without partial mutation;
+- restart reconciliation is idempotent across repeated interruptions;
+- lock contention fails immediately without partial mutation, and unknown Git locks remain untouched;
 - pending corruption is refused with no Git-state write;
 - every newly written view/operation is guaranteed readable under the same format limits;
 - the format and recovery procedure are documented byte for byte.
 
-Stop condition: do not begin user-facing index or ref mutation until this gate passes.
+Stop condition: do not begin user-facing restore, index, or ref mutation until this gate passes.
 
-## Milestone 5 — Git-style staging
+## Milestone 5 — restore planning, apply, and recovery
 
 **Status: Planned**
 
 Estimated effort: 3–5 focused weeks after Milestone 4.
 
-Initial command:
+Commands:
 
 ```text
-git2 add [--all] [--force] <pathspec>...
+git2 restore --view <recovery-id> --dry-run
+git2 restore --view <recovery-id>
+git2 recover [--status]
 ```
 
 Deliverables:
 
-- parse byte-safe repository-relative pathspecs on Unix;
-- use `gix` index/filter/attribute plumbing;
-- write blobs compatible with Git clean filters and line-ending rules;
-- add new files and update modified files;
-- stage deletions with `--all`;
-- preserve executable and symlink modes;
-- obey ignore rules and require `--force` for ignored additions;
-- use Git index lockfile semantics;
-- wrap every index mutation in the transaction runner;
-- append `git2:add` operations;
-- refresh status correctly after staging.
-
-Differential matrix:
-
-- new/modified/deleted files;
-- executable-bit changes;
-- symlinks;
-- empty files and binary content;
-- non-UTF-8 paths;
-- nested `.gitignore` and forced ignored files;
-- `.gitattributes`, CRLF, and clean filters that do not require interactive input;
-- partial pathspecs and `--all`;
-- unborn HEAD;
-- lock contention and interrupted index write.
+- verify every target operation/view/CAS record and retained Git object before mutation;
+- rehydrate missing required Git objects before publishing refs or index;
+- evaluate both current and target ignore rules (including planned `.gitignore` changes) and refuse ignored-child directory obstructions before writing;
+- display a byte-safe `--dry-run` plan for HEAD, refs, index, and worktree creates/replacements/removals without modifying Git state or sidecar history;
+- snapshot current state before restore and write files without following symlinks or escaping the worktree;
+- preserve ignored files and make multi-path restore restartable through pending phases;
+- expose `git2 recover [--status]` and read-only `git2 oplog` when a transaction is pending;
+- append `git2:restore` operations.
 
 Exit criteria:
 
-- Git and git2 produce equivalent index entries for the supported matrix;
-- `git diff --cached` shows equivalent changes;
+- restoring a captured view after `git gc` rehydrates staged-only and shadowed objects and reproduces modeled bytes, modes, symlinks, refs, HEAD, and raw index exactly;
+- extra eligible files are removed while ignored files remain untouched;
+- non-UTF-8 paths, symlinks, executable bits, and deleted tracked paths round-trip;
+- restore interruption at every durable or destructive boundary reconciles cleanly without manual repair;
+- traversal and symlink-attack tests cannot write outside the worktree.
+
+## Milestone 6 — native reset and non-destructive undo proof (review gate)
+
+**Status: Planned**
+
+Estimated effort: 3–5 focused weeks after Milestone 5.
+
+Commands:
+
+```text
+git2 reset [--soft|--mixed|--hard] <commit>
+git2 undo [--dry-run]
+```
+
+Deliverables:
+
+- resolve full commit IDs, `HEAD`, and bounded `HEAD~N` (up to 10,000 first-parent steps);
+- implement soft, mixed (default), and hard reset semantics for supported repositories without touching `ORIG_HEAD` or reflogs;
+- preserve unrelated untracked paths and refuse out-of-scope obstructions;
+- undo the latest eligible completed git2 mutation by restoring its `before` view and appending a new `git2:undo` operation (undoing the undo to redo);
+- compare current index semantic entries (paths, stages, modes, OIDs, and flags) against the recorded after-view so plain `git status` stat-cache refreshes do not falsely block `git2 undo`, while real staged/ref/worktree divergence still refuses and restored pre-reset index bytes match exact raw bytes;
+- provide a complete recorded crash-recovery demonstration.
+
+Core demonstration:
+
+1. Adopt a disposable repository containing tracked, staged, modified, deleted, executable, symlink, non-UTF-8, non-ignored untracked, and ignored state.
+2. Perform a destructive `git2 reset --hard`.
+3. Verify ordinary Git (`git status`, `git fsck --full`) accepts the reset state.
+4. Run `git2 undo`, then `git2 undo` again to redo.
+5. Verify HEAD, refs, raw index, all eligible bytes, modes, symlinks, and absences equal the expected views while ignored files remain untouched.
+6. Verify the reset, undo, and redo operations all remain in `oplog`.
+7. Repeat with forced termination at every transaction phase.
+
+Exit criteria:
+
+- soft/mixed/hard results match Git for the supported matrix;
+- the demonstration passes automatically and manually, including stat-only `git status` before `undo`;
+- undo never deletes an operation or immutable record, and undo itself can be undone;
+- staged/ref/worktree divergence is detected rather than silently overwritten;
+- **Stop & Review Gate:** pause after this milestone passes to review the recovery proof before starting Milestones 7–9.
+
+## Milestone 7 — Git-style staging
+
+**Status: Planned (after Milestone 6 review gate)**
+
+Estimated effort: 3–5 focused weeks.
+
+Command:
+
+```text
+git2 add [--all] [--] [<path>...]
+```
+
+Deliverables:
+
+- treat path arguments as literal repository- or cwd-relative files and directories (supporting `--` for flag-like names, with no pathspec magic/globs);
+- stage new/modified files and deletions, plus `--all` repository-wide;
+- compute built-in text/EOL conversions through `gix`, preserve executable and symlink modes, and refuse active external filters or unsupported conversions where they would apply;
+- obey ignore rules (no forced addition of ignored files in v0.1);
+- use Git index lockfile semantics wrapped in the transaction runner and append `git2:add` operations.
+
+Differential matrix:
+
+- new/modified/deleted files, empty files, and binary content;
+- executable-bit changes and symlinks;
+- literal filenames with leading `-`, newline, brackets, and non-UTF-8 bytes;
+- nested `.gitignore` and ignored-path refusal;
+- `.gitattributes` and CRLF built-in conversions vs active external-filter refusal;
+- partial literal paths and `--all`, unborn/detached HEAD, foreign `index.lock` refusal, and interrupted index write.
+
+Exit criteria:
+
+- Git (`git ls-files --stage -z`, `git diff --cached --raw -z`) and git2 produce equivalent index entries for the supported matrix;
 - `git fsck` succeeds;
 - every successful add has a complete recoverable before/after operation;
 - every failpoint leaves a valid index or an actionable pending transaction.
 
-## Milestone 6 — commit and history
+## Milestone 8 — commit and bounded log
 
 **Status: Planned**
 
-Estimated effort: 4–6 focused weeks.
+Estimated effort: 2–4 focused weeks.
 
 Commands:
 
@@ -242,116 +304,21 @@ git2 log [--max-count <n>]
 Deliverables:
 
 - build canonical trees recursively from stage-zero index entries;
-- reject unmerged index stages;
-- resolve author/committer identity and timezone with clear precedence;
-- create root and single-parent commits;
-- preserve byte-safe commit messages internally;
-- update symbolic or detached HEAD with transactional ref compare-and-swap;
-- write reflog entries compatible with Git, or explicitly document any initial limitation;
-- wrap commit/ref updates in the mutation transaction;
-- show first-parent/full-parent history without loading unbounded history;
-- append `git2:commit` operations.
-
-Differential matrix:
-
-- root commit;
-- normal parent commit;
-- empty tree/files and nested directories;
-- executable and symlink tree modes;
-- detached HEAD;
-- concurrent ref movement;
-- packed parent/tree reads;
-- author/committer environment and config cases.
+- reject unmerged index stages, blank commit messages, empty tree changes, and active hooks/signing/unsupported config;
+- resolve author/committer identity and local time/timezone from Git env overrides and config;
+- create root and single-parent commits, preserving byte-safe commit messages internally;
+- update symbolic or detached HEAD with transactional ref compare-and-swap (leaving reflogs unchanged in v0.1);
+- wrap commit/ref updates in the mutation transaction and append `git2:commit` operations;
+- walk bounded first-parent history from `HEAD` (default 50, max 10,000), reporting missing/corrupt parents rather than silently truncating.
 
 Exit criteria:
 
 - `git log`, `git cat-file`, and `git fsck` accept every git2 commit fixture;
 - tree IDs match Git for equivalent index state;
 - ref races fail without overwriting another writer;
-- interrupted commit/ref updates reconcile through pending state;
-- `git2 log` has bounded traversal and corruption errors.
+- interrupted commit/ref updates reconcile through pending state.
 
-## Milestone 7 — reset and general restore engine
-
-**Status: Planned**
-
-Estimated effort: 5–7 focused weeks.
-
-Commands:
-
-```text
-git2 reset [--soft|--mixed|--hard] <commit>
-git2 restore --view <recovery-id> --dry-run
-git2 restore --view <recovery-id>
-```
-
-Deliverables:
-
-- resolve full commit IDs and a deliberately small revision syntax;
-- implement soft, mixed, and hard reset semantics for supported repositories;
-- verify every target operation/view/CAS record before mutation;
-- compute a restore plan for HEAD, refs, index, files, modes, symlinks, and removals;
-- display a byte-safe dry-run plan;
-- snapshot current state before restore;
-- write files without following symlinks or escaping the worktree;
-- preserve ignored files;
-- use atomic temp/write/rename where possible;
-- make multi-path restore restartable through pending phases;
-- append `git2:reset` and `git2:restore` operations.
-
-Exit criteria:
-
-- soft/mixed/hard results match Git for the supported matrix;
-- restoring a captured view reproduces its modeled bytes exactly;
-- extra eligible files are removed while ignored files remain untouched;
-- non-UTF-8 paths, symlinks, executable bits, and deleted tracked paths round-trip;
-- restore interruption at every path boundary can be resumed or safely reconciled;
-- traversal and symlink-attack tests cannot write outside the worktree.
-
-## Milestone 8 — non-destructive undo proof
-
-**Status: Planned**
-
-Estimated effort: 3–5 focused weeks.
-
-Commands:
-
-```text
-git2 undo [<operation-id>]
-git2 undo --dry-run [<operation-id>]
-```
-
-Deliverables:
-
-- default to undoing the selected operation’s transition;
-- restore the chosen operation’s `before` view using the general restore engine;
-- append a new `git2:undo` operation instead of moving/deleting old history;
-- make redo possible by undoing the undo transition or through an explicit follow-up UI decision;
-- show conflicts when current state diverges from the expected selected view;
-- define policy for undoing `external-git` operations;
-- make operation IDs safely abbreviatable only when unique;
-- provide a complete recorded demonstration.
-
-Core demonstration:
-
-1. Adopt a disposable repository containing tracked, staged, modified, deleted, executable, symlink, and non-ignored untracked state.
-2. Perform a destructive hard reset through git2.
-3. Verify ordinary Git sees the reset state and `git fsck` passes.
-4. Run `git2 undo`.
-5. Verify HEAD, refs, raw index, all eligible bytes, modes, symlinks, and absences equal the pre-reset view.
-6. Verify ignored files were untouched.
-7. Verify the reset and undo operations both remain in `oplog`.
-8. Repeat with forced termination at every transaction phase.
-
-Exit criteria:
-
-- the demonstration passes automatically and manually;
-- undo never deletes an operation or immutable record;
-- undo itself can be undone;
-- divergence is detected rather than silently overwritten;
-- documentation stops warning that snapshots are not restorable only after this gate passes.
-
-## Milestone 9 — experimental v0.1 release
+## Milestone 9 — status completion, docs, and experimental v0.1 release
 
 **Status: Planned**
 
@@ -359,17 +326,12 @@ Estimated effort: 3–5 focused weeks.
 
 Deliverables:
 
-- Linux CI for formatting, clippy, tests, docs, differential tests, and failure tests;
-- release-mode build and smoke test;
-- versioned binary archive and SHA-256 checksum;
-- generated shell completions if support is low-risk;
-- reproducible demo repository/script;
-- complete limitations and recovery runbook;
-- changelog and release notes;
-- storage-size reporting and an explicit no-silent-prune statement;
-- audit that `git push --mirror` cannot expose `.git/git2/`;
-- dependency/license review;
-- benchmark baselines for adoption, status, and restore on representative repositories.
+- close remaining Milestone 3 status follow-up coverage (executable bits, symlinks, type transitions, non-UTF-8/newline `-z`, nested/global excludes, unborn/detached HEAD) with rename detection disabled;
+- reconcile all user documentation and relative links, and stop warning that snapshots are non-restorable only after Milestone 6 passes;
+- Linux CI for formatting, warning-denied clippy/docs, tests, differential fixtures, and process-kill crash suites;
+- release-mode build, smoke test with no Git on `PATH`, versioned binary archive, and SHA-256 checksum;
+- mirror-push privacy test proving `.git/git2/` and staged-only objects never transfer via `git push --mirror`;
+- reproducible demo script, limitations/recovery runbook, storage-size reporting, dependency/license review, and benchmark baselines.
 
 Release gate:
 
@@ -378,7 +340,7 @@ Release gate:
 - no known data-loss bug remains in supported scope;
 - the CLI refuses unsupported states before mutation;
 - a new user can follow the documented disposable demo exactly;
-- the release is labeled experimental and not recommended for important repositories.
+- the release is labeled experimental and not recommended for important repositories; do not publish without separate authorization.
 
 ## Deferred v0.2 themes
 

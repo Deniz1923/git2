@@ -14,11 +14,11 @@ The project uses ordinary Git repositories as its interchange format. It adds a 
 | Git object interoperability | Implemented | Byte-safe SHA-1 IDs, loose reads/writes, packed reads, commits, and trees |
 | Repository adoption | Implemented | Captures HEAD, refs, index, tracked files, and non-ignored untracked files |
 | Object retention and checkpoints | Implemented | Adoption, automatic imports, and `checkpoint` retain the current Git object closure privately |
-| Recovery storage | Implemented | Immutable SHA-256 CAS, views, operations, integrity checks, and advisory lock |
+| Recovery storage | Implemented | Immutable SHA-256 zlib-compressed CAS (format 3), views, operations, integrity checks, and advisory lock |
 | External Git import | Implemented | `status` and `oplog` record changed state as `external-git` operations |
 | Status | Implemented | Two-column porcelain output; `-z` is byte-safe |
-| Staging and commits | Not implemented | Next mutation milestone |
-| Restore and undo | Not implemented | Core product proof; do not rely on recovery data yet |
+| Transaction journal & restore/undo | Not implemented | Next milestones (`recover`, `restore`, `reset`, `undo`) |
+| Staging and commits | Not implemented | Follows the verified recovery proof (`add`, `commit`, `log`) |
 | Networking | Not implemented | Deferred until the local safety model works |
 
 See the [full roadmap](docs/roadmap.md) for milestones and exit criteria.
@@ -38,7 +38,7 @@ The current build proves steps of the storage and observation model. It does not
 
 The active target is an ordinary, non-bare, single-worktree SHA-1 repository on Linux. git2 refuses known states it cannot restore safely, including linked worktrees, sparse indexes, partial clones, submodules, unresolved conflicts, and in-progress merge/rebase-like operations.
 
-Ignored files and repository-local Git configuration are outside the recovery guarantee. The default eligible regular-file limit is 100 MiB; `adopt --max-file-mib` accepts up to 1024 MiB and persists the choice for future imports. New sidecars use format 2 with owner-private permissions. Format 1 stores are refused and left unchanged; see [recovery format](docs/recovery-format.md) before starting a new store.
+Ignored files and repository-local Git configuration are outside the recovery guarantee. The default eligible regular-file limit is 100 MiB; `adopt --max-file-mib` accepts up to 1024 MiB and persists the choice for future imports. New sidecars use format 3 with owner-private permissions and zlib-compressed CAS records. Format 1 and format 2 stores are refused and left unchanged; see [recovery format](docs/recovery-format.md) before starting a new store.
 
 Object retention has its own bounds (128 MiB per Git object payload, 1,000,000 distinct retained objects, pack delta depth 64, and the whole-view limit) and refuses indexes with resolve-undo (REUC) entries and historical gitlink trees. Read the [compatibility matrix](docs/compatibility.md) before experimenting.
 

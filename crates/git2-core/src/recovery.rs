@@ -1,21 +1,23 @@
 //! Versioned, owner-private, content-addressed storage for recovery views.
 //!
-//! The database under `.git/git2` is format `2\n`: a private `format` marker, a
-//! versioned `policy` record, an advisory `lock`, immutable SHA-256 content under
-//! `cas` plus immutable records under `operations` and `views`, a reserved
-//! `pending` directory for the future journal, and one atomically replaced `HEAD`
-//! pointer. Every filesystem access is descriptor-relative and never follows
-//! symlinks, and effective ownership and permission bits are verified along the
-//! way. Legacy format 1 databases are refused byte-for-byte untouched rather than
-//! migrated or reinterpreted.
+//! The database under `.git/git2` is format `3\n`: a private `format` marker, a
+//! versioned `policy` record, an advisory `lock`, immutable zlib-compressed
+//! SHA-256 content under `cas` plus immutable records under `operations` and
+//! `views`, a reserved `pending` directory for the future journal, and one
+//! atomically replaced `HEAD` pointer. Every filesystem access is
+//! descriptor-relative and never follows symlinks, and effective ownership and
+//! permission bits are verified along the way. Legacy format 1 and format 2
+//! databases are refused byte-for-byte untouched rather than migrated or
+//! reinterpreted.
 
 use std::fmt;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use bstr::BString;
+use flate2::{Compression, Decompress, FlushDecompress, Status, write::ZlibEncoder};
 use sha2::{Digest as _, Sha256};
 
 use crate::object::GitOid;
@@ -26,7 +28,7 @@ mod disk;
 use self::disk::Directory;
 
 /// The on-disk format marker this version writes and reads.
-const FORMAT: &[u8] = b"2\n";
+const FORMAT: &[u8] = b"3\n";
 /// The operation record header, unchanged from format 1.
 const OPERATION_MAGIC: &[u8] = b"git2-operation\0\x01";
 /// The view record header introduced with format 2.
@@ -46,6 +48,8 @@ const MAX_VIEW_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OPERATION_BYTES: usize = 1024 * 1024;
 /// Largest single content-addressed payload.
 pub(crate) const MAX_CAS_BYTES: usize = 1024 * 1024 * 1024;
+/// Framing overhead allowed on disk for zlib-compressed CAS records.
+const CAS_ZLIB_OVERHEAD: usize = 1024 * 1024;
 /// Smallest possible encoded reference entry: two empty length prefixes.
 const REFERENCE_ENTRY_BYTES: usize = size_of::<u64>() * 2;
 /// Smallest possible encoded file entry: empty path, kind byte, digest.
@@ -577,11 +581,11 @@ impl Drop for RecoveryLock {
 }
 
 impl RecoveryStore {
-    /// Create a brand-new format 2 recovery database under `git_dir`.
+    /// Create a brand-new format 3 recovery database under `git_dir`.
     ///
     /// Creation is exclusive: any pre-existing `git2` entry is refused without
-    /// modifying a byte, and a legacy format 1 store earns the same preservation
-    /// advice that opening reports.
+    /// modifying a byte, and a legacy format 1 or 2 store earns the same
+    /// preservation advice that opening reports.
     ///
     /// # Errors
     ///
@@ -623,12 +627,12 @@ impl RecoveryStore {
         Directory::open_git_dir(git_dir.as_ref())?.exists("git2")
     }
 
-    /// Open an existing format 2 recovery database.
+    /// Open an existing format 3 recovery database.
     ///
     /// Opening first reads only the format marker with relaxed permission checks,
-    /// so a legacy format 1 store earns format-specific preservation advice even
-    /// when its old directories and files carry ordinary 0755/0644 modes. For
-    /// format 2, open validates the store and its top-level entries. Fanout
+    /// so a legacy format 1 or 2 store earns format-specific preservation advice
+    /// even when its old directories and files carry ordinary 0755/0644 modes. For
+    /// format 3, open validates the store and its top-level entries. Fanout
     /// directories and records are checked when accessed.
     ///
     /// # Errors
@@ -641,12 +645,12 @@ impl RecoveryStore {
             directory.read_with_permissions("format", 32, false),
             "format",
         )?;
-        if actual == b"1\n" {
-            return Err(Error::UnsupportedRepository(
-                "git2 recovery format 1 is not supported; the store was left untouched. \
+        if actual == b"1\n" || actual == b"2\n" {
+            let legacy = if actual == b"1\n" { '1' } else { '2' };
+            return Err(Error::UnsupportedRepository(format!(
+                "git2 recovery format {legacy} is not supported; the store was left untouched. \
                  Archive the entire .git/git2 directory separately before adopting again"
-                    .to_owned(),
-            ));
+            )));
         }
         if actual != FORMAT {
             return Err(Error::UnsupportedRepository(format!(
@@ -708,7 +712,7 @@ impl RecoveryStore {
     /// # Errors
     ///
     /// Returns an error if the content exceeds the store's payload limit or cannot
-    /// be persisted without replacing existing bytes.
+    /// be compressed or persisted without replacing existing bytes.
     pub fn put_content(&self, bytes: &[u8]) -> Result<ContentId> {
         if bytes.len() > MAX_CAS_BYTES {
             return Err(Error::CorruptRecovery(format!(
@@ -717,8 +721,29 @@ impl RecoveryStore {
             )));
         }
         let id = ContentId::for_bytes(bytes);
-        self.fanout_directory("cas", id, true)?
-            .write_immutable(&record_name(id), bytes)?;
+        let dir = self.fanout_directory("cas", id, true)?;
+        let name = record_name(id);
+        if dir.exists(&name)? {
+            let existing = read_cas_entry(&dir, &name, id, bytes.len())?;
+            if existing != bytes {
+                return Err(Error::CorruptRecovery(format!(
+                    "immutable record {name} has unexpected content"
+                )));
+            }
+            dir.sync()?;
+            return Ok(id);
+        }
+
+        let compressed = compress_cas(bytes)?;
+        if !dir.publish_new(&name, &compressed)? {
+            let existing = read_cas_entry(&dir, &name, id, bytes.len())?;
+            if existing != bytes {
+                return Err(Error::CorruptRecovery(format!(
+                    "immutable record {name} has unexpected content"
+                )));
+            }
+            dir.sync()?;
+        }
         Ok(id)
     }
 
@@ -732,11 +757,8 @@ impl RecoveryStore {
     }
 
     pub(crate) fn read_content_bounded(&self, id: ContentId, limit: usize) -> Result<Vec<u8>> {
-        let bytes = self
-            .fanout_directory("cas", id, false)?
-            .read(&record_name(id), limit.min(MAX_CAS_BYTES))?;
-        verify_id(id, &bytes, "content")?;
-        Ok(bytes)
+        let dir = self.fanout_directory("cas", id, false)?;
+        read_cas_entry(&dir, &record_name(id), id, limit)
     }
 
     /// Persist an immutable view and return its identifier.
@@ -849,6 +871,67 @@ impl RecoveryStore {
             parent.open_child(&hex[..2], true)
         }
     }
+}
+
+fn compress_cas(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes)?;
+    Ok(encoder.finish()?)
+}
+
+fn decompress_cas(compressed: &[u8], limit: usize, id: ContentId) -> Result<Vec<u8>> {
+    let mut decoder = Decompress::new(true);
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let consumed = usize::try_from(decoder.total_in()).unwrap_or(usize::MAX);
+        let input = compressed.get(consumed..).unwrap_or(&[]);
+        let before_in = decoder.total_in();
+        let before_out = decoder.total_out();
+        let status = decoder
+            .decompress(input, &mut chunk, FlushDecompress::None)
+            .map_err(|error| {
+                Error::CorruptRecovery(format!("corrupt compressed CAS content {id}: {error}"))
+            })?;
+        let produced = usize::try_from(decoder.total_out() - before_out).unwrap_or(usize::MAX);
+        let new_len = output.len().checked_add(produced).ok_or_else(|| {
+            Error::CorruptRecovery(format!(
+                "recovery content {id} exceeds the {limit} byte limit"
+            ))
+        })?;
+        if new_len > limit {
+            return Err(Error::CorruptRecovery(format!(
+                "recovery content {id} exceeds the {limit} byte limit"
+            )));
+        }
+        output.extend_from_slice(&chunk[..produced]);
+        match status {
+            Status::StreamEnd => {
+                if decoder.total_in() != compressed.len() as u64 {
+                    return Err(Error::CorruptRecovery(format!(
+                        "compressed CAS content {id} has trailing bytes"
+                    )));
+                }
+                return Ok(output);
+            }
+            Status::Ok | Status::BufError => {
+                if decoder.total_in() == before_in && produced == 0 {
+                    return Err(Error::CorruptRecovery(format!(
+                        "truncated compressed CAS content {id}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+fn read_cas_entry(dir: &Directory, name: &str, id: ContentId, limit: usize) -> Result<Vec<u8>> {
+    let limit = limit.min(MAX_CAS_BYTES);
+    let compressed_limit = limit.saturating_add(CAS_ZLIB_OVERHEAD);
+    let compressed = dir.read(name, compressed_limit)?;
+    let bytes = decompress_cas(&compressed, limit, id)?;
+    verify_id(id, &bytes, "content")?;
+    Ok(bytes)
 }
 
 fn required_entry<T>(entry: Result<T>, name: &str) -> Result<T> {
@@ -1193,17 +1276,32 @@ mod tests {
 
     #[test]
     fn initialize_is_exclusive_and_preserves_legacy_stores() {
+        for (marker, expected) in [(b"1\n".as_slice(), '1'), (b"2\n".as_slice(), '2')] {
+            let git_dir = tempfile::tempdir().unwrap();
+            let root = git_dir.path().join("git2");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("format"), marker).unwrap();
+            assert!(RecoveryStore::initialize(git_dir.path(), CapturePolicy::default()).is_err());
+            assert!(matches!(
+                RecoveryStore::open(git_dir.path()),
+                Err(Error::UnsupportedRepository(message)) if message.contains(expected)
+            ));
+            assert_eq!(std::fs::read(root.join("format")).unwrap(), marker);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn cas_bounded_read_rejects_decompression_over_limit() {
         let git_dir = tempfile::tempdir().unwrap();
-        let root = git_dir.path().join("git2");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("format"), b"1\n").unwrap();
-        assert!(RecoveryStore::initialize(git_dir.path(), CapturePolicy::default()).is_err());
+        let store = RecoveryStore::initialize(git_dir.path(), CapturePolicy::default()).unwrap();
+        let payload = vec![0_u8; 16_384];
+        let id = store.put_content(&payload).unwrap();
         assert!(matches!(
-            RecoveryStore::open(git_dir.path()),
-            Err(Error::UnsupportedRepository(message)) if message.contains('1')
+            store.read_content_bounded(id, 1024),
+            Err(Error::CorruptRecovery(_))
         ));
-        assert_eq!(std::fs::read(root.join("format")).unwrap(), b"1\n");
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(store.read_content_bounded(id, 16_384).unwrap(), payload);
     }
 
     #[test]

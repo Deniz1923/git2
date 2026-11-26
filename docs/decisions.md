@@ -21,6 +21,8 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 | D013 | Defer networking and initially delegate it to Git | Accepted |
 | D014 | Do not silently prune recovery data | Accepted |
 | D015 | Refuse legacy recovery stores and enforce private v2 storage | Accepted |
+| D016 | Compress recovery CAS payloads with zlib in format 3 | Accepted |
+| D017 | Sequence recovery proof before native add/commit, constrain journal, and check semantic index for undo | Accepted |
 
 ## D001 — ordinary Git remains the repository format
 
@@ -141,6 +143,22 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 **Decision:** Use format 2 with an immutable capture policy, symmetric encoder/decoder limits, owner-private access, and strict sync errors. Reserve a versioned map for retained Git objects. Refuse v1 without rewriting it.
 
 **Consequences:** Users of v1 must preserve their old store separately before adopting again. The object map is populated for new captures; views written before retention was implemented remain unchanged. The format 2 capture alpha is still not a restore or backup tool.
+
+## D016 — format 3 zlib-compressed CAS storage
+
+**Context:** Retaining complete Git object closures alongside worktree bytes in uncompressed CAS records inflates `.git/git2/` far beyond Git's compressed loose and packed object storage.
+
+**Decision:** Bump the sidecar format marker to `3\n` and store `.git/git2/cas/` entries RFC 1950 zlib-compressed on disk while keeping `ContentId` as SHA-256 over the uncompressed payload bytes. Enforce bounded decompression, stream-end/trailing-byte checks, and uncompressed SHA-256 verification. Refuse format 1 and format 2 stores byte-for-byte untouched with archive instructions.
+
+**Consequences:** Sidecar disk usage drops substantially without adding a silent garbage collector or complicating `ContentId` deduplication. Pre-release format 2 stores must be archived separately before adopting under format 3.
+
+## D017 — recovery-first build order, constrained journal, and semantic index check for `undo`
+
+**Context:** Building staging and commits before proving crash-safe restore and undo delays validation of git2's core differentiator, an unconstrained transaction journal risks over-engineering, and strict raw-byte `.git/index` checks on `git2 undo` would cause plain read-only `git status` calls to block undo after `git2 reset --hard`.
+
+**Decision:** Sequence v0.1 recovery-first: build the pending-transaction journal (constrained to 4 phases — `Prepared`, `Applying`, `Finalizing`, `Committed` — over a fixed set of primitive checked actions), restore/recover, native `reset`, and append-only `undo`/redo first, pause at an explicit review gate, then build native `add`, `commit`, and `log`. For `git2 undo` divergence checks, ignore stat-cache-only index refreshes while still requiring exact staged paths, stages, modes, OIDs, and flags, and still restoring exact captured raw index bytes.
+
+**Consequences:** Crash-recovery guarantees remain complete with a small, auditable state machine, ordinary `git status` inspection does not break `git2 undo`, and staging/commit complexity stays gated behind the verified recovery proof.
 
 ## Open decisions
 

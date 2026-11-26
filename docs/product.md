@@ -67,17 +67,19 @@ The v0.1 user-facing command set is planned as:
 
 ```text
 git2 adopt
+git2 checkpoint
 git2 status
+git2 oplog
+git2 restore
+git2 recover
+git2 reset
+git2 undo
 git2 add
 git2 commit
 git2 log
-git2 reset
-git2 oplog
-git2 restore
-git2 undo
 ```
 
-Only `adopt`, `status`, and `oplog` exist today. Debug object commands are development aids and are not part of the product promise.
+Only `adopt`, `checkpoint`, `status`, and `oplog` exist today. Debug object commands are development aids and are not part of the product promise.
 
 ## Non-goals
 

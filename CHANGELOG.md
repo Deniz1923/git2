@@ -17,7 +17,7 @@ All notable project changes are recorded here. The project has not made a suppor
 - Two-column status with NUL-delimited byte-safe mode.
 - Differential object/status tests and recovery refusal tests.
 - Descriptor-relative capture of worktree bytes and executable mode, without running configured content filters during adoption.
-- Format 2 recovery storage with persisted capture limits, owner-private access, and bounded record encoding and reads.
+- Format 3 recovery storage with zlib-compressed CAS payloads, persisted capture limits, owner-private access, and bounded record encoding and reads.
 - `git2 checkpoint`, and private retention of Git objects needed by new captured views.
 - Product, architecture, compatibility, CLI, format, roadmap, testing, development, contribution, and security documentation.
 
@@ -28,7 +28,7 @@ All notable project changes are recorded here. The project has not made a suppor
 - Replaced placeholder commands and ignored tests with implemented vertical slices.
 - Narrowed the declared target to Linux, SHA-1, non-bare, single-worktree repositories.
 - Refuse shallow, split-index, alternate-object, reftable, separate metadata, and other unsupported repository layouts before recording recovery data.
-- Format 1 sidecars are refused and left untouched; there is no automatic migration.
+- Format 1 and format 2 sidecars are refused and left untouched; there is no automatic migration.
 
 ### Removed
 
