@@ -19,6 +19,8 @@ pub mod restore;
 #[cfg(unix)]
 pub mod retention;
 #[cfg(unix)]
+pub mod stage;
+#[cfg(unix)]
 pub mod status;
 pub mod store;
 #[cfg(unix)]

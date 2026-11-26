@@ -975,6 +975,10 @@ fn build_index_bytes(entries: &BTreeMap<BString, (FileKind, GitOid)>) -> Result<
             path.as_bstr(),
         );
     }
+    serialize_index(&mut state)
+}
+
+pub(crate) fn serialize_index(state: &mut gix::index::State) -> Result<Vec<u8>> {
     state.sort_entries();
 
     let mut out = Vec::new();

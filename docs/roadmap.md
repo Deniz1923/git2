@@ -34,12 +34,12 @@ At that pace, the remaining v0.1 work is roughly 22–32 focused weeks, or about
 | 3. Status | Done | Differential two-column porcelain and `-z` output |
 | 4. Mutation transaction foundation | Done | 4-phase constrained-action journal, staged-inode lock attribution, and child process-kill proof |
 | 5. Restore planning, apply, and recovery | Done | `restore --view [--dry-run]`, `recover [--status \| --rollback]`, pending read-only full-hex `oplog`, dual ignore profiles, pruned-object rehydration, CLI crash tests |
-| 6. Native reset and non-destructive undo proof | Done | `reset [--soft\|--mixed\|--hard]`, semantic-index `undo [--dry-run]` / redo, full core & CLI crash proof (**at stop/review gate**) |
-| 7. Git-style staging | Planned | Next after review gate; `git2 add` (literal paths, `--all`, built-in EOL) |
-| 8. Commit and history | Planned | `commit -m` and bounded first-parent `log` |
+| 6. Native reset and non-destructive undo proof | Done | `reset [--soft\|--mixed\|--hard]`, semantic-index `undo [--dry-run]` / redo, full core & CLI crash proof |
+| 7. Git-style staging | Done | `git2 add [--all] [--] [<path>...]`, built-in EOL conversion, external-filter & ignore refusal, differential & crash suites |
+| 8. Commit and history | Planned | Next milestone; `commit -m` and bounded first-parent `log [--max-count <n>]` |
 | 9. Status completion, docs, and experimental v0.1 release | Planned | Complete supported status matrix, Linux CI, mirror-push privacy check, demo, package, checksums |
 
-Explicit `git2 checkpoint` capture, Git object retention, zlib-compressed format 3 CAS, the 4-phase pending-transaction foundation, `git2 restore --view [--dry-run]`, `git2 recover [--status | --rollback]`, native `git2 reset`, and semantic-index `git2 undo` / redo are implemented under Milestones 2, 4, 5, and 6. With Milestone 6's `reset --hard` → `undo` → `redo` proof complete across process-kill tests, the project is at the **post-Milestone 6 review gate** before starting Milestones 7–9.
+Explicit `git2 checkpoint` capture, Git object retention, zlib-compressed format 3 CAS, the 4-phase pending-transaction foundation, `git2 restore --view [--dry-run]`, `git2 recover [--status | --rollback]`, native `git2 reset`, semantic-index `git2 undo` / redo, and native `git2 add` staging are implemented under Milestones 2 and 4–7. Milestone 8 (`commit -m` and bounded `log`) is the next planned milestone.
 
 ## Milestone 0 — repository rescue
 
@@ -228,9 +228,7 @@ Exit criteria met:
 
 ## Milestone 7 — Git-style staging
 
-**Status: Planned (after Milestone 6 review gate)**
-
-Estimated effort: 3–5 focused weeks.
+**Status: Done**
 
 Command:
 
@@ -238,33 +236,23 @@ Command:
 git2 add [--all] [--] [<path>...]
 ```
 
-Deliverables:
+Delivered:
 
-- treat path arguments as literal repository- or cwd-relative files and directories (supporting `--` for flag-like names, with no pathspec magic/globs);
-- stage new/modified files and deletions, plus `--all` repository-wide;
-- compute built-in text/EOL conversions through `gix`, preserve executable and symlink modes, and refuse active external filters or unsupported conversions where they would apply;
-- obey ignore rules (no forced addition of ignored files in v0.1);
-- use Git index lockfile semantics wrapped in the transaction runner and append `git2:add` operations.
+- literal repository- and cwd-relative file/directory staging (`git2-core::stage`) with `--` support for flag-like names and zero pathspec glob/magic expansion;
+- stages new, modified, and deleted entries (including D/F replacements and recursive directories) plus `--all` repository-wide;
+- built-in text/EOL conversions through `gix::filter` (`text`, `eol`, `core.autocrlf`, `core.eol`), preserving executable and raw symlink modes while refusing active external `filter=` drivers and non-UTF-8 `working-tree-encoding` before mutation;
+- enforces effective repository ignore rules (no forced addition of ignored files in v0.1) and appends new loose blobs before transactional `.git/index.lock` index replacement and `git2:add` operation recording.
 
-Differential matrix:
+Exit criteria met:
 
-- new/modified/deleted files, empty files, and binary content;
-- executable-bit changes and symlinks;
-- literal filenames with leading `-`, newline, brackets, and non-UTF-8 bytes;
-- nested `.gitignore` and ignored-path refusal;
-- `.gitattributes` and CRLF built-in conversions vs active external-filter refusal;
-- partial literal paths and `--all`, unborn/detached HEAD, foreign `index.lock` refusal, and interrupted index write.
-
-Exit criteria:
-
-- Git (`git ls-files --stage -z`, `git diff --cached --raw -z`) and git2 produce equivalent index entries for the supported matrix;
-- `git fsck` succeeds;
-- every successful add has a complete recoverable before/after operation;
-- every failpoint leaves a valid index or an actionable pending transaction.
+- Git (`git ls-files --stage -z`, `git diff --cached --raw -z`) and git2 produce matching index entries across binary/empty/exec/symlink/weird-path/nested-ignore/CRLF/unborn/detached cases;
+- `git fsck --full` succeeds after staging and recovery;
+- every successful `git2 add` records a recoverable before/after operation reversible via `git2 undo`;
+- every injected crash and I/O failpoint recovers or rolls back cleanly.
 
 ## Milestone 8 — commit and bounded log
 
-**Status: Planned**
+**Status: Planned — next milestone**
 
 Estimated effort: 2–4 focused weeks.
 

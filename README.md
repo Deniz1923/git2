@@ -5,7 +5,7 @@
 The project uses ordinary Git repositories as its interchange format. It adds a private, clone-local operation history under `.git/git2/` and is being developed as a learning-first, portfolio-grade implementation of Git’s local mechanics.
 
 > [!WARNING]
-> git2 is experimental and not ready for important repositories. It implements verified baselines, checkpoints, `restore --view`, `recover`, `reset`, and `undo`, while native `add`, `commit`, `log`, and release readiness follow next.
+> git2 is experimental and not ready for important repositories. It implements verified baselines, checkpoints, `restore --view`, `recover`, `reset`, `undo`, and `add`, while native `commit`, `log`, and release readiness follow next.
 
 ## Current status
 
@@ -18,8 +18,9 @@ The project uses ordinary Git repositories as its interchange format. It adds a 
 | External Git import | Implemented | `status` and `oplog` record changed state as `external-git` operations |
 | Status | Implemented | Two-column porcelain output; `-z` is byte-safe |
 | Transaction journal & restore | Implemented | 4-phase pending journal, `restore --view [--dry-run]`, and `recover [--status \| --rollback]` |
-| Reset and undo | Implemented | `reset [--soft \| --mixed \| --hard]`, semantic-index `undo [--dry-run]` / redo + crash tests (at review gate) |
-| Staging and commits | Not implemented | Follows the Milestone 6 review gate (`add`, `commit`, `log`) |
+| Reset and undo | Implemented | `reset [--soft \| --mixed \| --hard]`, semantic-index `undo [--dry-run]` / redo + crash tests |
+| Staging | Implemented | `add [--all] [--] [<path>...]` with built-in EOL conversion, ignore rules, and atomic index lock |
+| Commits and log | Not implemented | Next milestone (`commit -m`, bounded `log`) |
 | Networking | Not implemented | Deferred until the local safety model works |
 
 See the [full roadmap](docs/roadmap.md) for milestones and exit criteria.
@@ -33,7 +34,7 @@ Git already has reflogs and recoverable objects, but recovery is fragmented acro
 3. Record the before/after transition in an immutable local operation log.
 4. Let the user restore an earlier view without rewriting or deleting that history.
 
-The current build implements the storage, observation, pending-transaction journal, verified `restore --view`, `recover`, `reset`, and semantic-index `undo`/redo flows; native `add`, `commit`, and `log` follow after the Milestone 6 review gate.
+The current build implements the storage, observation, pending-transaction journal, verified `restore --view`, `recover`, `reset`, `undo`/redo, and `add` staging flows; native `commit` and bounded `log` follow next.
 
 ## Supported environment
 
@@ -96,6 +97,7 @@ printf 'checked point\n' > hello.txt
 ```text
 git2 adopt [--max-file-mib <MiB>]
 git2 checkpoint
+git2 add [--all] [--] [<path>...]
 git2 reset [--soft | --mixed | --hard] [<commit>]
 git2 undo [--dry-run]
 git2 restore --view <64-hex-view-id> [--dry-run]

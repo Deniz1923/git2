@@ -120,6 +120,18 @@ The fixture combines:
 
 `crates/git2-cli/tests/reset_undo_cli.rs` verifies end-to-end CLI workflows and debug-only `GIT2_TEST_FAILPOINT` process kills and I/O rollback for both `git2 reset --hard` and `git2 undo`.
 
+### Staging (`git2 add`) tests
+
+`crates/git2-core/tests/stage.rs` tests literal staging against `git add` (`git ls-files --stage -z`, `git diff --cached --raw -z`, and `git fsck --full`):
+
+- new, modified, deleted, empty, binary (`\0`), executable (`0755`), and symlink entries, plus `git2 undo` reverting `.git/index`;
+- literal filenames (`-flag`, `[bracket].txt`, `star*.txt`, embedded newlines, and non-UTF-8 bytes) staged from subdirectories without pathspec globbing;
+- nested `.gitignore` negation (`!keep.log`) alongside ignored file/directory refusal with zero index writes;
+- `.gitattributes` CRLF conversion matching Git blob IDs vs active `filter=<name>` refusal without running external commands;
+- `--all` on unborn repositories, detached `HEAD`, and pre-existing foreign `.git/index.lock` refusal.
+
+`crates/git2-cli/tests/stage_cli.rs` verifies `git2 add -- -dash.txt`, subdirectory invocation, `--all`, `undo`, and debug-only `GIT2_TEST_FAILPOINT` process kills and I/O rollback across `.git/index.lock` writes.
+
 ## Rules for new tests
 
 ### Use Git as the oracle

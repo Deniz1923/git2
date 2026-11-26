@@ -156,12 +156,28 @@ Kinds currently include:
 - `git2:checkpoint`, emitted by `git2 checkpoint`;
 - `git2:restore --view <64-hex-view-id>`, emitted by `git2 restore --view <id>`;
 - `git2:reset --<mode> <rev>`, emitted by `git2 reset`;
+- `git2:add ...`, emitted by `git2 add`;
 - `git2:undo`, emitted by `git2 undo`;
 - other `git2:<command>` values in the format, reserved for future mutating commands.
 
 An unchanged `checkpoint` does not append a new operation, so repeated identical saves leave `oplog` unchanged.
 
 Output is intentionally simple and not yet declared a stable porcelain format.
+
+## `git2 add`
+
+```text
+git2 add [--all] [--] [<path>...]
+```
+
+Requires an adopted repository and stages changes to `.git/index` transactionally (writing newly staged loose blobs before updating `index` via `.git/index.lock` and appending one `git2:add` operation).
+
+Behavior:
+
+- treats every `<path>` argument literally relative to the current directory (use `--` for leading `-` names; brackets, `*`, newlines, and non-UTF-8 bytes match verbatim with no pathspec globs);
+- stages new, modified, and deleted entries (including directory trees and directory deletions), or pass `-A` / `--all` across the repository;
+- applies built-in `.gitattributes` / `core.autocrlf` / `core.eol` text-to-Git conversions via `gix`, preserves executable bits and raw symlink targets without filtering;
+- refuses active external `filter=` clean/process drivers, non-UTF-8 `working-tree-encoding`, ignored explicit targets (no `--force` in v0.1), nested `.git` directories, special entries, and pre-existing foreign `.git/index.lock` files without touching Git state.
 
 ## `git2 reset`
 
@@ -229,7 +245,6 @@ Only full 40-character object IDs are accepted.
 The following names are roadmap commitments, not current CLI features:
 
 ```text
-git2 add
 git2 commit
 git2 log
 ```

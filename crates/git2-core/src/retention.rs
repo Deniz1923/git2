@@ -40,23 +40,43 @@ pub(crate) fn retain_roots(
     objects: &ObjectStore,
     roots: impl IntoIterator<Item = Root>,
 ) -> Result<Vec<RetainedObject>> {
-    walk_objects(objects, roots, |bytes| store.put_content(bytes))
+    walk_objects(objects, roots, None, |bytes| store.put_content(bytes))
+}
+
+pub(crate) fn retain_roots_with_blobs(
+    store: &RecoveryStore,
+    objects: &ObjectStore,
+    roots: impl IntoIterator<Item = Root>,
+    staged_blobs: &BTreeMap<GitOid, ContentId>,
+) -> Result<Vec<RetainedObject>> {
+    walk_objects(objects, roots, Some(staged_blobs), |bytes| {
+        store.put_content(bytes)
+    })
 }
 
 pub(crate) fn compute_roots_readonly(
     objects: &ObjectStore,
     roots: impl IntoIterator<Item = Root>,
 ) -> Result<Vec<RetainedObject>> {
-    walk_objects(objects, roots, |bytes| Ok(ContentId::for_bytes(bytes)))
+    walk_objects(objects, roots, None, |bytes| {
+        Ok(ContentId::for_bytes(bytes))
+    })
 }
 
 fn walk_objects(
     objects: &ObjectStore,
     roots: impl IntoIterator<Item = Root>,
+    staged_blobs: Option<&BTreeMap<GitOid, ContentId>>,
     mut persist: impl FnMut(&[u8]) -> Result<ContentId>,
 ) -> Result<Vec<RetainedObject>> {
     let mut reader = objects.bounded_reader(MAX_OBJECT_BYTES)?;
     walk(roots, |id, graph| {
+        if let Some(blobs) = staged_blobs
+            && let Some(&content) = blobs.get(&id)
+        {
+            graph.visit(id, ObjectKind::Blob, &[])?;
+            return Ok((ObjectKind::Blob, content));
+        }
         let object = reader.read(id)?;
         graph.visit(id, object.kind, &object.data)?;
         let content = persist(&object.canonical_bytes())?;

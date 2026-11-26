@@ -1,5 +1,6 @@
 //! Command-line entry point for the experimental git2 client.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -15,6 +16,8 @@ use git2_core::repository::{AdoptOptions, LocalRepository};
 use git2_core::reset::{self, ResetMode, ResetOutcome};
 #[cfg(unix)]
 use git2_core::restore;
+#[cfg(unix)]
+use git2_core::stage::{self, AddOutcome};
 use git2_core::store::ObjectStore;
 #[cfg(unix)]
 use git2_core::transaction::{
@@ -49,6 +52,18 @@ enum Command {
     /// Save an explicit checkpoint of an adopted repository.
     #[cfg(unix)]
     Checkpoint,
+
+    /// Stage literal file or directory paths (including deletions) or `--all` into the index.
+    #[cfg(unix)]
+    Add {
+        /// Stage all non-ignored and tracked changes, including deletions, across the repository.
+        #[arg(short = 'A', long, conflicts_with = "paths")]
+        all: bool,
+
+        /// Literal files or directories relative to the current directory (use `--` for leading `-`).
+        #[arg(value_name = "PATH")]
+        paths: Vec<OsString>,
+    },
 
     /// Preview or restore a previously recorded recovery view.
     #[cfg(unix)]
@@ -154,6 +169,8 @@ fn main() -> anyhow::Result<()> {
         Command::Adopt { max_file_mib } => run_adopt(max_file_mib),
         #[cfg(unix)]
         Command::Checkpoint => run_checkpoint(),
+        #[cfg(unix)]
+        Command::Add { all, paths } => run_add(all, &paths),
         #[cfg(unix)]
         Command::Restore { view, dry_run } => run_restore(view, dry_run),
         #[cfg(unix)]
@@ -298,6 +315,21 @@ fn run_reset(soft: bool, _mixed: bool, hard: bool, commit: &str) -> anyhow::Resu
 }
 
 #[cfg(unix)]
+fn run_add(all: bool, paths: &[OsString]) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let cwd = std::env::current_dir().context("could not determine current working directory")?;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    let outcome =
+        run_add_apply(&repository, &cwd, all, paths).context("could not stage changes")?;
+    println!(
+        "staged {} entries (removed {}) at view {} as operation {}",
+        outcome.staged_count, outcome.removed_count, outcome.after_view, outcome.operation_id
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 fn run_undo(dry_run: bool) -> anyhow::Result<()> {
     ensure_no_pending()?;
     let repository =
@@ -313,6 +345,26 @@ fn run_undo(dry_run: bool) -> anyhow::Result<()> {
         outcome.restored_view, outcome.operation_id
     );
     Ok(())
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_add_apply(
+    repository: &LocalRepository,
+    cwd: &std::path::Path,
+    all: bool,
+    paths: &[OsString],
+) -> git2_core::Result<AddOutcome> {
+    stage::apply_with_hook(repository, cwd, all, paths, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_add_apply(
+    repository: &LocalRepository,
+    cwd: &std::path::Path,
+    all: bool,
+    paths: &[OsString],
+) -> git2_core::Result<AddOutcome> {
+    stage::apply(repository, cwd, all, paths)
 }
 
 #[cfg(all(unix, debug_assertions))]
