@@ -164,8 +164,7 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 
 These must be resolved by their roadmap milestones:
 
-- exact pending-transaction binary encoding and phase model;
-- consistency/retry policy for concurrent ordinary Git activity;
+- consistency/retry policy for concurrent ordinary Git activity during restore/native commands;
 - reflog requirements for v0.1 commits/resets;
 - revision syntax supported by reset/log;
 - operation abbreviation and ambiguity rules;

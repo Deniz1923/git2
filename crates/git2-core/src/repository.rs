@@ -190,7 +190,7 @@ impl LocalRepository {
             before: persisted.view_id,
             after: persisted.view_id,
             kind: OperationKind::Adopt,
-            timestamp_seconds: timestamp_seconds(),
+            timestamp_seconds: current_timestamp_seconds(),
         };
         let operation_id = store.put_operation(&operation)?;
         store.set_head(operation_id)?;
@@ -230,6 +230,11 @@ impl LocalRepository {
     fn record_view(&self, kind: OperationKind) -> Result<ExternalImport> {
         let store = RecoveryStore::open(&self.git_dir)?;
         let _lock = store.try_lock()?;
+        if store.has_pending()? {
+            return Err(Error::UnsupportedRepository(
+                "a pending transaction exists; recover it before recording new history".to_owned(),
+            ));
+        }
         let parent = store.head()?;
         let before = store.current_view()?;
         let draft = self.capture_draft(store.policy()?)?;
@@ -248,7 +253,7 @@ impl LocalRepository {
             before,
             after: persisted.view_id,
             kind,
-            timestamp_seconds: timestamp_seconds(),
+            timestamp_seconds: current_timestamp_seconds(),
         };
         let operation_id = store.put_operation(&operation)?;
         store.set_head(operation_id)?;
@@ -259,6 +264,11 @@ impl LocalRepository {
             file_count: persisted.file_count,
             content_bytes: persisted.content_bytes,
         })
+    }
+
+    pub(crate) fn capture_and_persist_view(&self, store: &RecoveryStore) -> Result<ContentId> {
+        let draft = self.capture_draft(store.policy()?)?;
+        Ok(self.persist_draft(store, draft)?.view_id)
     }
 
     fn capture_draft(&self, options: AdoptOptions) -> Result<ViewDraft> {
@@ -453,7 +463,7 @@ fn persist_draft(
     })
 }
 
-fn timestamp_seconds() -> i64 {
+pub(crate) fn current_timestamp_seconds() -> i64 {
     let now = std::time::SystemTime::now();
     match now.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),

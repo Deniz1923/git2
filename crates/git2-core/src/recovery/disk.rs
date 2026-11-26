@@ -1,7 +1,9 @@
 //! Owner-private, descriptor-relative storage for recovery records.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
+use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +30,7 @@ const DIR_MODE: Mode = Mode::RUSR.union(Mode::WUSR).union(Mode::XUSR);
 const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 
 #[derive(Debug, Clone)]
-pub(super) struct Directory(Arc<File>);
+pub(crate) struct Directory(Arc<File>);
 
 impl Directory {
     pub(super) fn open_git_dir(path: &Path) -> Result<Self> {
@@ -63,7 +65,7 @@ impl Directory {
         Ok(dir)
     }
 
-    pub(super) fn exists(&self, name: &str) -> Result<bool> {
+    pub(crate) fn exists(&self, name: &str) -> Result<bool> {
         match statat(&*self.0, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(_) => Ok(true),
             Err(Errno::NOENT) => Ok(false),
@@ -71,7 +73,7 @@ impl Directory {
         }
     }
 
-    pub(super) fn read(&self, name: &str, limit: usize) -> Result<Vec<u8>> {
+    pub(crate) fn read(&self, name: &str, limit: usize) -> Result<Vec<u8>> {
         self.read_with_permissions(name, limit, true)
     }
 
@@ -107,6 +109,40 @@ impl Directory {
                 self.open_regular(NAME, OFlags::RDWR, true)
             }
             Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn remove_if_exists(&self, name: &str) -> Result<()> {
+        match unlinkat(&*self.0, name, AtFlags::empty()) {
+            Ok(()) => {
+                self.0.sync_all()?;
+                Ok(())
+            }
+            Err(Errno::NOENT) => Ok(()),
+            Err(error) => Err(io::Error::from(error).into()),
+        }
+    }
+
+    pub(crate) fn create_stage_file(&self, name: &str, bytes: &[u8]) -> Result<(u64, u64)> {
+        let _ = unlinkat(&*self.0, name, AtFlags::empty());
+        let mut file = self.create_file(name, OFlags::WRONLY)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let stat = io_result(fstat(&file))?;
+        self.0.sync_all()?;
+        Ok((stat.st_dev, stat.st_ino))
+    }
+
+    pub(crate) fn link_to(
+        &self,
+        name: &str,
+        target_dir: BorrowedFd<'_>,
+        target_name: &OsStr,
+    ) -> Result<bool> {
+        match linkat(&*self.0, name, target_dir, target_name, AtFlags::empty()) {
+            Ok(()) => Ok(true),
+            Err(Errno::EXIST) => Ok(false),
+            Err(error) => Err(io::Error::from(error).into()),
         }
     }
 
@@ -148,7 +184,7 @@ impl Directory {
         Ok(())
     }
 
-    pub(super) fn write_pointer(&self, name: &str, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write_pointer(&self, name: &str, bytes: &[u8]) -> Result<()> {
         if self.exists(name)? {
             self.open_regular(name, OFlags::RDONLY, true)?;
         }

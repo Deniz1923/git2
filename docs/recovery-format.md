@@ -2,7 +2,7 @@
 
 ## Status and compatibility
 
-The recovery sidecar format is currently version 3 and is experimental. Format 1 and format 2 stores are refused in place; git2 does not migrate, delete, or overwrite them. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. Neither old snapshots nor current captures are a backup or restorable yet. `git2 checkpoint` is an explicit capture, not a restore or backup operation, and there is still no pending-transaction journal.
+The recovery sidecar format is currently version 3 and is experimental. Format 1 and format 2 stores are refused in place; git2 does not migrate, delete, or overwrite them. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. Neither old snapshots nor current captures are a backup or restorable via CLI yet. `git2 checkpoint` is an explicit capture, not a restore or backup operation; the internal 4-phase pending-transaction journal exists and is crash-tested, while user-facing mutating CLI commands (`restore`, `recover`, `reset`, `undo`) remain unexposed until Milestone 5+.
 
 The reader also refuses unknown top-level versions. Any incompatible change must increment that version and update this document and fixtures. Format 3 keeps the format 2 binary view, operation, and policy record layouts intact and adds RFC 1950 zlib compression to on-disk `cas/` entries. git2 does not monitor ordinary Git in the background.
 
@@ -20,9 +20,12 @@ The format is private to one clone. It is stored below the Git directory and nev
   views/<2 hex>/<62 hex>
   operations/<2 hex>/<62 hex>
   pending/
+    active
+    plan
+    stage_<16hex>_<index>
 ```
 
-`pending/` is reserved but unused. No current command mutates HEAD, refs, index, or worktree, so the crash-recovery journal has not been implemented yet.
+`pending/` holds the active transaction state (`active`, `plan`, and transient same-filesystem lock-staging files `stage_<16hex>_<index>`). While no transaction is running or awaiting reconciliation, `pending/` is empty.
 
 ## Design goals
 
@@ -299,24 +302,74 @@ Views reference CAS content. The store may contain unreachable CAS, view, or ope
 
 Future garbage collection must begin from HEAD, walk all parent operations, retain both before and after views, retain every CAS ID referenced by those views, report the deletion plan, and never prune silently.
 
-## Pending transactions: required design
+## Pending transactions
 
-Before any user-facing mutation is enabled, `pending/` must gain a versioned durable record driving a constrained 4-phase state machine (`Prepared -> Applying -> Finalizing -> Committed`) over a small fixed vocabulary of primitive checked actions (object rehydration, checked worktree entry writes/removals, empty-directory ensures/removals, index write/removal, and ref/packed-refs/HEAD updates), containing at least:
+The transaction layer (`crates/git2-core/src/transaction.rs`) drives a constrained 4-phase state machine (`Prepared -> Applying -> Finalizing -> Committed`) over 11 fixed primitive checked actions before any Git or worktree state is modified.
 
-- parent operation ID;
-- complete pre-operation view ID;
-- command kind and arguments needed for diagnostics;
-- start timestamp;
-- transaction phase;
-- optional expected ref/index identities for compare-and-swap checks.
+### `pending/active` (`b"git2-pending\0\x01"`)
 
-The pending record must be written and synced before Git state changes. Startup recovery must be idempotent. It should either:
+Whole record limit: 1 MiB (`MAX_OPERATION_BYTES`), atomically replaced via staged temp write + `fsync` + `renameat` + directory `fsync`.
 
-- prove no mutation occurred, remove the pending record, and retain the original HEAD; or
-- capture the resulting supported state, append a completed/interrupted command operation, move HEAD, and remove the pending record; or
-- refuse with precise manual recovery instructions if a complete capture is impossible.
+```text
+magic:              14 bytes ("git2-pending\0\x01")
+tx_id:              32 bytes (SHA-256 of parent, before_view, target_view, plan_id, timestamp, command)
+parent_operation:   32 bytes
+before_view:        32 bytes
+target_view:        32 bytes
+plan_id:            32 bytes (SHA-256 of pending/plan)
+timestamp_seconds:  i64
+command:            bytes
+phase:              u8 (1=Prepared, 2=Applying, 3=Finalizing, 4=Committed)
+next_action:        u64
+lock_owner_marker:  u8 (0=None, 1=Present)
+  when marker = 1:
+    action_index:   u64
+    dev:            u64 (st_dev of staged lock inode)
+    ino:            u64 (st_ino of staged lock inode)
+    lock_rel_path:  bytes (relative to .git/, e.g. "index.lock")
+    stage_name:     bytes (filename inside pending/, e.g. "stage_<16hex>_<index>")
+end of record
+```
 
-The exact pending encoding is intentionally unspecified until failure-injection tests drive it.
+### `pending/plan` (`b"git2-plan\0\x01"`)
+
+Whole record limit: 64 MiB (`MAX_VIEW_BYTES`). Written and synced before `pending/active` is published.
+
+```text
+magic:              11 bytes ("git2-plan\0\x01")
+action_count:       u64
+actions[action_count]:
+  tag:              u8
+  payload:          tag-specific fields
+end of record
+```
+
+Action tags:
+
+| Tag | Variant | Payload |
+| --- | --- | --- |
+| `1` | `RehydrateObject` | `oid: 20 bytes`, `content: 32 bytes` |
+| `2` | `WriteWorktreeEntry` | `path: bytes`, `expected_before: u8 marker + (kind: u8, content: 32B)`, `target: (kind: u8, content: 32B)` |
+| `3` | `RemoveWorktreeEntry` | `path: bytes`, `expected_before: (kind: u8, content: 32B)` |
+| `4` | `EnsureDir` | `path: bytes` |
+| `5` | `RemoveEmptyDir` | `path: bytes` |
+| `6` | `WriteIndex` | `expected_before: u8 marker + optional 32B`, `target: 32 bytes` |
+| `7` | `RemoveIndex` | `expected_before: 32 bytes` |
+| `8` | `WriteRef` | `name: bytes`, `expected_before: u8 marker + optional bytes`, `target: bytes` |
+| `9` | `RemoveRef` | `name: bytes`, `expected_before: bytes` |
+| `10` | `WritePackedRefs` | `expected_before: u8 marker + optional bytes`, `target: u8 marker + optional bytes` |
+| `11` | `WriteHead` | `expected_before: bytes`, `target: bytes` |
+
+### Lock ownership, temp debris, and recovery procedure
+
+1. **Pre-write durability:** The runner acquires `.git/git2/lock`, checks for any active pending record, verifies `expected_head`, captures live state (publishing `external-git` if live state matches `before_view` and differs from `current_view`), writes `pending/plan`, and writes `pending/active` (`Prepared`) before touching any Git or worktree entry.
+2. **Staged-inode Git lock attribution:** Lock-based Git metadata actions (`WriteIndex`, `RemoveIndex`, `WriteRef`, `RemoveRef`, `WritePackedRefs`, `WriteHead`) first create `pending/stage_<16hex>_<index>` (`O_CREAT | O_EXCL`), record its `(st_dev, st_ino)` in `pending/active` (`Applying`), and then hard-link (`linkat`, never replacing) to `<target>.lock`. On collision (`EEXIST`) or during recovery/rollback, git2 verifies `(st_dev, st_ino)` matches `pending/active`; any unknown lock is refused byte-for-byte untouched.
+3. **Worktree temp debris:** Checked atomic worktree entry writes create `.git2-tmp-<16hex>-<index>` in the target's validated parent directory (`O_NOFOLLOW`, `fsync` + `renameat` + parent `fsync`). Recovery and rollback unlink any leftover `.git2-tmp-*` sibling before proceeding.
+4. **Idempotent reconciliation (`recover`) and rollback (`rollback`):**
+   - No `pending/active`: clean up any orphan `pending/plan` or `stage_*` debris and return `Clean`.
+   - `HEAD` already equals deterministic `operation_id`: release any verified owned lock, clean temp/pending files, and return `Finalized` without appending duplicate operations.
+   - `phase == Prepared`: probe all reversible actions at `expected_before` (refusing unexpected divergence), clean pending files, and return `Aborted`.
+   - `phase == Applying | Finalizing | Committed` (with `HEAD == parent`): `recover` probes outcomes per action (resuming owned locks/unfinished actions and refusing foreign locks or divergence), verifies live state matches `target_view`, writes the deterministic `Operation`, publishes `HEAD`, cleans pending state, and returns `Finalized`. Alternatively, `rollback` walks reversible actions in reverse (skipping append-only `RehydrateObject`), verifies `before_view`, cleans pending state, and returns `RolledBack`.
 
 ## Restore requirements
 

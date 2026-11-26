@@ -16,6 +16,8 @@ pub mod retention;
 #[cfg(unix)]
 pub mod status;
 pub mod store;
+#[cfg(unix)]
+pub mod transaction;
 
 /// Errors returned by the local repository core.
 #[derive(Debug, thiserror::Error)]

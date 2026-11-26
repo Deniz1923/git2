@@ -32,14 +32,14 @@ At that pace, the remaining v0.1 work is roughly 22–32 focused weeks, or about
 | 1. Git object interoperability | Done | Loose round trips, packed reads, byte-safe commit/tree tests |
 | 2. Adoption and immutable history | Done | Zlib-compressed format 3 CAS, views, operations, lock, external import, object retention, explicit checkpoint |
 | 3. Status | Done | Differential two-column porcelain and `-z` output |
-| 4. Mutation transaction foundation | Planned | Next milestone; 4-phase constrained-action journal + synthetic crash proof |
-| 5. Restore planning, apply, and recovery | Planned | `restore --view [--dry-run]`, `recover [--status]`, read-only pending `oplog` |
+| 4. Mutation transaction foundation | Done | 4-phase constrained-action journal, staged-inode lock attribution, and child process-kill proof |
+| 5. Restore planning, apply, and recovery | Planned | Next milestone; `restore --view [--dry-run]`, `recover [--status]`, read-only pending `oplog` |
 | 6. Native reset and non-destructive undo proof | Planned | `reset`, semantic-index `undo`/redo, interruption tests + **stop/review gate** |
 | 7. Git-style staging | Planned | `git2 add` (literal paths, `--all`, built-in EOL) after post-proof review gate |
 | 8. Commit and history | Planned | `commit -m` and bounded first-parent `log` |
 | 9. Status completion, docs, and experimental v0.1 release | Planned | Complete supported status matrix, Linux CI, mirror-push privacy check, demo, package, checksums |
 
-Explicit `git2 checkpoint` capture, Git object retention, and zlib-compressed format 3 CAS are already done under Milestone 2, alongside the earlier adoption/capture work. They do not complete a mutation transaction: Milestone 4 remains the next planned milestone, and no mutating command ships before its pending-transaction foundation passes. After Milestone 6 proves `reset --hard` → `undo` → `redo` end to end under process-kill testing, the plan pauses at an explicit review gate before starting Milestones 7–9.
+Explicit `git2 checkpoint` capture, Git object retention, and zlib-compressed format 3 CAS are done under Milestone 2, and the internal 4-phase pending-transaction foundation is done under Milestone 4. No user-facing mutating CLI commands (`restore`, `reset`, `undo`, `add`, `commit`) ship yet: Milestone 5 is the next planned milestone. After Milestone 6 proves `reset --hard` → `undo` → `redo` end to end under process-kill testing, the plan pauses at an explicit review gate before starting Milestones 7–9.
 
 ## Milestone 0 — repository rescue
 
@@ -149,39 +149,29 @@ Rename/copy detection is not enabled in the current command, and unresolved inde
 
 ## Milestone 4 — mutation transaction foundation
 
-**Status: Planned — next milestone**
+**Status: Done**
 
-Explicit checkpoint capture, object retention, and format 3 zlib-compressed CAS were completed under Milestone 2; they do not provide a mutation transaction. This milestone is the next planned work before restore or any user-facing Git mutation.
+Delivered:
 
-Estimated effort: 2–4 focused weeks.
+1. Defined and documented byte-for-byte versioned `pending/active` (`git2-pending\0\x01`) and `pending/plan` (`git2-plan\0\x01`) records driving a 4-phase state machine (`Prepared -> Applying -> Finalizing -> Committed`) over 11 checked primitive actions (`RehydrateObject`, `WriteWorktreeEntry`, `RemoveWorktreeEntry`, `EnsureDir`, `RemoveEmptyDir`, `WriteIndex`, `RemoveIndex`, `WriteRef`, `RemoveRef`, `WritePackedRefs`, `WriteHead`).
+2. Added `RecoveryRepository`, `pending`, `run` / `run_with_hook`, `recover` / `recover_with_hook`, and `rollback` under the exclusive advisory lock, plus checked descriptor-relative worktree/directory write primitives in `paths.rs`.
+3. Implemented same-filesystem lock staging (`pending/stage_<16hex>_<index>`) and `(st_dev, st_ino)` ownership attribution before hard-linking Git locks without replacement, leaving foreign locks byte-identical.
+4. Enforced pre-write durability, automatic `external-git` chaining or stale-plan refusal, pending guards on `checkpoint` and `import_external_changes`, and idempotent startup reconciliation (including double-crash survival after `HEAD` selection).
+5. Added deterministic failpoints and real child `std::process::abort()` crash-recovery tests, injected I/O rollback tests, and pending-corruption refusal tests in `crates/git2-core/tests/transaction.rs`.
 
-Deliverables:
-
-1. Define and document a versioned pending-transaction record using a constrained 4-phase state machine (`Prepared -> Applying -> Finalizing -> Committed`) over a small fixed vocabulary of primitive checked actions (`RehydrateObject`, `WriteWorktreeEntry`, `RemoveWorktreeEntry`, `EnsureDir`, `RemoveEmptyDir`, `WriteIndex`, `RemoveIndex`, `WriteRef`, `RemoveRef`, `WritePackedRefs`, `WriteHead`).
-2. Add `RecoveryStore` / transaction APIs to create, advance, read, and clear one pending transaction under the advisory lock, with same-filesystem staged-inode lock attribution.
-3. Capture a pre-operation view and sync it before any mutation callback runs.
-4. Add a transaction runner that finalizes an after-view and immutable operation only on success.
-5. Reconcile pending state idempotently on startup, including survival of a second crash after recovery `HEAD` selection.
-6. Detect or refuse concurrent ordinary-Git changes across capture/mutation boundaries.
-7. Add deterministic failpoints after every durable write and before/after each mutation boundary.
-8. Build process-kill tests that reopen the repository and prove an actionable state remains with zero manual repair.
-9. Apply the existing bounded-record, persisted-limit, and private-storage rules to journal data.
-
-Exit criteria:
+Exit criteria met:
 
 - a no-op synthetic mutation produces a valid before/after operation;
-- killing the process at every failpoint never loses the pre-operation view;
+- killing a child process at every failpoint never loses the pre-operation view;
 - restart reconciliation is idempotent across repeated interruptions;
 - lock contention fails immediately without partial mutation, and unknown Git locks remain untouched;
 - pending corruption is refused with no Git-state write;
-- every newly written view/operation is guaranteed readable under the same format limits;
+- every newly written pending/plan/operation record is bounded and readable under the same format limits;
 - the format and recovery procedure are documented byte for byte.
-
-Stop condition: do not begin user-facing restore, index, or ref mutation until this gate passes.
 
 ## Milestone 5 — restore planning, apply, and recovery
 
-**Status: Planned**
+**Status: Planned — next milestone**
 
 Estimated effort: 3–5 focused weeks after Milestone 4.
 

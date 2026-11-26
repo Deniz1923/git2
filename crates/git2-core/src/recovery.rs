@@ -23,7 +23,7 @@ use sha2::{Digest as _, Sha256};
 use crate::object::GitOid;
 use crate::{Error, Result};
 
-mod disk;
+pub(crate) mod disk;
 
 use self::disk::Directory;
 
@@ -35,7 +35,7 @@ const OPERATION_MAGIC: &[u8] = b"git2-operation\0\x01";
 const VIEW_MAGIC: &[u8] = b"git2-view\0\x02";
 /// The versioned capture-policy record header.
 const POLICY_MAGIC: &[u8] = b"git2-policy\0\x01";
-const DIGEST_LEN: usize = 32;
+pub(crate) const DIGEST_LEN: usize = 32;
 const DIGEST_HEX_LEN: usize = DIGEST_LEN * 2;
 const OID_LEN: usize = 20;
 /// Safety cap on any declared record count.
@@ -43,9 +43,9 @@ const MAX_RECORDS: usize = 10_000_000;
 /// Largest single byte field inside a view record.
 pub(crate) const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 /// Largest whole view record.
-const MAX_VIEW_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_VIEW_BYTES: usize = 64 * 1024 * 1024;
 /// Largest whole operation record; control records use the same limit.
-const MAX_OPERATION_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_OPERATION_BYTES: usize = 1024 * 1024;
 /// Largest single content-addressed payload.
 pub(crate) const MAX_CAS_BYTES: usize = 1024 * 1024 * 1024;
 /// Framing overhead allowed on disk for zlib-compressed CAS records.
@@ -101,6 +101,10 @@ impl ContentId {
         }
         output
     }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; DIGEST_LEN] {
+        &self.0
+    }
 }
 
 impl fmt::Debug for ContentId {
@@ -146,7 +150,7 @@ pub enum FileKind {
 }
 
 impl FileKind {
-    const fn code(self) -> u8 {
+    pub(crate) const fn code(self) -> u8 {
         match self {
             Self::Regular => 1,
             Self::Executable => 2,
@@ -154,7 +158,7 @@ impl FileKind {
         }
     }
 
-    fn from_code(code: u8) -> Result<Self> {
+    pub(crate) fn from_code(code: u8) -> Result<Self> {
         match code {
             1 => Ok(Self::Regular),
             2 => Ok(Self::Executable),
@@ -861,6 +865,19 @@ impl RecoveryStore {
             .map(|operation| operation.after)
     }
 
+    /// Report whether an active pending transaction record exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `pending` directory or entry cannot be inspected.
+    pub fn has_pending(&self) -> Result<bool> {
+        self.pending_dir()?.exists("active")
+    }
+
+    pub(crate) fn pending_dir(&self) -> Result<Directory> {
+        self.directory.open_child("pending", true)
+    }
+
     /// Open the fanout directory that holds one record, creating it if requested.
     fn fanout_directory(&self, namespace: &str, id: ContentId, create: bool) -> Result<Directory> {
         let hex = id.to_hex();
@@ -986,14 +1003,14 @@ fn parse_policy(record: &[u8]) -> Result<CapturePolicy> {
 }
 
 /// Add two encoded sizes, refusing the impossible overflow before allocation.
-fn add_sizes(total: usize, addend: usize) -> Result<usize> {
+pub(crate) fn add_sizes(total: usize, addend: usize) -> Result<usize> {
     total
         .checked_add(addend)
         .ok_or_else(|| Error::CorruptRecovery("the encoded record size overflows".to_owned()))
 }
 
 /// Return one view field's length, refusing fields beyond the per-field cap.
-fn checked_field(len: usize, noun: &str) -> Result<usize> {
+pub(crate) fn checked_field(len: usize, noun: &str) -> Result<usize> {
     if len > MAX_FIELD_BYTES {
         return Err(Error::CorruptRecovery(format!(
             "the {noun} field is {len} bytes, above the {MAX_FIELD_BYTES} byte field limit"
@@ -1003,7 +1020,12 @@ fn checked_field(len: usize, noun: &str) -> Result<usize> {
 }
 
 /// Refuse a declared count whose minimum encoding cannot fit in the remaining bytes.
-fn check_count(count: usize, entry_bytes: usize, remaining: usize, noun: &str) -> Result<()> {
+pub(crate) fn check_count(
+    count: usize,
+    entry_bytes: usize,
+    remaining: usize,
+    noun: &str,
+) -> Result<()> {
     let required = count.checked_mul(entry_bytes).ok_or_else(|| {
         Error::CorruptRecovery(format!("the {noun} count overflows the record size"))
     })?;
@@ -1025,16 +1047,16 @@ fn verify_id(expected: ContentId, bytes: &[u8], noun: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_count(output: &mut Vec<u8>, count: usize) {
+pub(crate) fn write_count(output: &mut Vec<u8>, count: usize) {
     output.extend_from_slice(&(count as u64).to_le_bytes());
 }
 
-fn write_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn write_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     output.extend_from_slice(bytes);
 }
 
-fn read_count(input: &mut &[u8]) -> Result<usize> {
+pub(crate) fn read_count(input: &mut &[u8]) -> Result<usize> {
     let count = read_u64(input)?;
     let count = usize::try_from(count).map_err(|_| {
         Error::CorruptRecovery("record count does not fit this platform".to_owned())
@@ -1047,7 +1069,7 @@ fn read_count(input: &mut &[u8]) -> Result<usize> {
     Ok(count)
 }
 
-fn read_bytes(input: &mut &[u8]) -> Result<BString> {
+pub(crate) fn read_bytes(input: &mut &[u8]) -> Result<BString> {
     let length = read_u64(input)?;
     let length = usize::try_from(length).map_err(|_| {
         Error::CorruptRecovery("field length does not fit this platform".to_owned())
@@ -1062,32 +1084,36 @@ fn read_bytes(input: &mut &[u8]) -> Result<BString> {
     ))
 }
 
-fn read_u64(input: &mut &[u8]) -> Result<u64> {
+pub(crate) fn read_u64(input: &mut &[u8]) -> Result<u64> {
     let bytes = take_required(input, size_of::<u64>(), "integer")?;
     let mut value = [0_u8; size_of::<u64>()];
     value.copy_from_slice(bytes);
     Ok(u64::from_le_bytes(value))
 }
 
-fn read_content_id(input: &mut &[u8], noun: &str) -> Result<ContentId> {
+pub(crate) fn read_content_id(input: &mut &[u8], noun: &str) -> Result<ContentId> {
     Ok(ContentId(read_fixed::<DIGEST_LEN>(input, noun)?))
 }
 
-fn read_fixed<const N: usize>(input: &mut &[u8], noun: &str) -> Result<[u8; N]> {
+pub(crate) fn read_fixed<const N: usize>(input: &mut &[u8], noun: &str) -> Result<[u8; N]> {
     let mut bytes = [0_u8; N];
     bytes.copy_from_slice(take_required(input, N, noun)?);
     Ok(bytes)
 }
 
-fn take_byte(input: &mut &[u8]) -> Result<u8> {
+pub(crate) fn take_byte(input: &mut &[u8]) -> Result<u8> {
     Ok(take_required(input, 1, "marker")?[0])
 }
 
-fn take_required<'a>(input: &mut &'a [u8], length: usize, noun: &str) -> Result<&'a [u8]> {
+pub(crate) fn take_required<'a>(
+    input: &mut &'a [u8],
+    length: usize,
+    noun: &str,
+) -> Result<&'a [u8]> {
     take_exact(input, length).ok_or_else(|| Error::CorruptRecovery(format!("truncated {noun}")))
 }
 
-fn take_exact<'a>(input: &mut &'a [u8], length: usize) -> Option<&'a [u8]> {
+pub(crate) fn take_exact<'a>(input: &mut &'a [u8], length: usize) -> Option<&'a [u8]> {
     let (head, tail) = input.split_at_checked(length)?;
     *input = tail;
     Some(head)

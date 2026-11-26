@@ -71,6 +71,17 @@ The fixture combines:
 - an unstaged deletion;
 - an untracked file.
 
+### Transaction and crash-recovery tests
+
+`crates/git2-core/tests/transaction.rs` exercises the 4-phase pending journal (`run`, `pending`, `recover`, `rollback`) using deterministic named `Failpoint` hooks and real child processes terminated via `std::process::abort()`:
+
+- no-op synthetic mutation (`git2:synthetic-noop`);
+- stale-plan refusal, automatic `external-git` chaining, and advisory lock contention;
+- real child `abort()` across every failpoint (`BeforePendingWrite`, `AfterPrepare`, `BeforeLockPublish(i)`, `AfterLockPublish(i)`, `BeforeAction(i)`, `AfterAction(i)`, `BeforeFinalize`, `AfterOperationWrite`, `AfterHeadSelection`, `BeforePendingCleanup`, plus `RecoverAfterHeadSelection` double-crash);
+- staged-inode lock attribution recovery for `index.lock` and `refs/heads/*.lock`, and refusal leaving foreign locks byte-identical;
+- pruned Git object rehydration, checked directory/worktree/index/ref mutations, `git fsck --full`, and clean `pending/` / lock cleanup;
+- injected `Error::Io` rollback verification and corrupt/truncated/missing `pending` refusal tests.
+
 ### CLI integration tests
 
 `crates/git2-cli/tests/cli.rs` launches the built binary and verifies:

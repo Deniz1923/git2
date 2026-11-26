@@ -19,6 +19,7 @@ All notable project changes are recorded here. The project has not made a suppor
 - Descriptor-relative capture of worktree bytes and executable mode, without running configured content filters during adoption.
 - Format 3 recovery storage with zlib-compressed CAS payloads, persisted capture limits, owner-private access, and bounded record encoding and reads.
 - `git2 checkpoint`, and private retention of Git objects needed by new captured views.
+- Internal 4-phase pending-transaction journal (`Prepared`, `Applying`, `Finalizing`, `Committed`), 11 checked primitive worktree/metadata actions, staged-inode Git lock attribution, idempotent startup reconciliation/rollback, and real child process-kill crash tests.
 - Product, architecture, compatibility, CLI, format, roadmap, testing, development, contribution, and security documentation.
 
 ### Changed
@@ -39,7 +40,6 @@ All notable project changes are recorded here. The project has not made a suppor
 
 ### Known limitations
 
-- No staging, commit, reset, restore, or undo command.
-- No pending-transaction/crash-recovery journal for mutations.
+- No staging, commit, reset, restore, recover, or undo CLI command yet.
 - No networking or cross-platform recovery support.
-- Captured recovery views are not yet restorable.
+- Captured recovery views are not yet restorable via CLI.

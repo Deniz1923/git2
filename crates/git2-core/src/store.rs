@@ -77,16 +77,9 @@ impl ObjectStore {
 
         let object = self
             .repository
-            .find_object(gix::hash::ObjectId::from(id.as_bytes()))
-            .map_err(|error| {
-                if error.to_string().contains("did not exist")
-                    || error.to_string().contains("not found")
-                {
-                    Error::ObjectNotFound(id)
-                } else {
-                    Error::Gix(error.to_string())
-                }
-            })?;
+            .try_find_object(gix::hash::ObjectId::from(id.as_bytes()))
+            .map_err(|error| Error::Gix(error.to_string()))?
+            .ok_or(Error::ObjectNotFound(id))?;
         Ok(RawObject {
             kind: from_gix_kind(object.kind),
             data: object.data.clone(),

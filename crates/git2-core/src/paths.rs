@@ -8,13 +8,17 @@
 //! truncated prefix.
 
 use std::ffi::OsStr;
-use std::io;
+use std::fs::File;
+use std::io::{self, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use bstr::BString;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, readlinkat, statat};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, fstat, fsync, mkdirat, open, openat, readlinkat, renameat,
+    statat, symlinkat, unlinkat,
+};
 use rustix::io::{Errno, read};
 
 use crate::recovery::FileKind;
@@ -25,6 +29,16 @@ const READ_CHUNK_BYTES: usize = 16 * 1024;
 
 /// Symlink targets this long cannot be faithful on Linux; anything longer is refused.
 const MAX_SYMLINK_TARGET_BYTES: usize = 64 * 1024;
+
+/// Filesystem entry classification observed without following symlinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathEntryKind {
+    Regular,
+    Executable,
+    Symlink,
+    Directory,
+    Other,
+}
 
 /// One faithfully capturable worktree entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +114,384 @@ impl CheckedRoot {
         }
         Ok(Some(entry))
     }
+
+    /// Read a regular file entry (refusing symlinks and directories) relative to the root.
+    pub(crate) fn read_file_raw(&self, path: &[u8], limit: u64) -> Result<Option<Vec<u8>>> {
+        let Some(entry) = self.read_entry(path, limit)? else {
+            return Ok(None);
+        };
+        if entry.kind == FileKind::Symlink {
+            return Err(Error::UnsupportedRepository(format!(
+                "path {:?} must not be a symlink",
+                BString::from(path)
+            )));
+        }
+        Ok(Some(entry.bytes))
+    }
+
+    /// Inspect `path` without following a final symlink or any symlinked parent.
+    pub(crate) fn entry_kind(&self, path: &[u8]) -> Result<Option<PathEntryKind>> {
+        let (parents, leaf) = checked_split(path)?;
+        let Some(parent) = traverse_parents_ro(self.fd.as_fd(), path, &parents, false)? else {
+            return Ok(None);
+        };
+        let stat = match statat(
+            parent.as_fd(),
+            OsStr::from_bytes(leaf),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(io::Error::from(error).into()),
+        };
+        let file_type = FileType::from_raw_mode(stat.st_mode);
+        let kind = if file_type.is_symlink() {
+            PathEntryKind::Symlink
+        } else if file_type.is_dir() {
+            PathEntryKind::Directory
+        } else if file_type.is_file() {
+            if stat.st_mode & 0o111 == 0 {
+                PathEntryKind::Regular
+            } else {
+                PathEntryKind::Executable
+            }
+        } else {
+            PathEntryKind::Other
+        };
+        Ok(Some(kind))
+    }
+
+    /// Inspect `(st_dev, st_ino)` for `path` without following symlinks, refusing non-regular files.
+    pub(crate) fn stat_regular_dev_ino(&self, path: &[u8]) -> Result<Option<(u64, u64)>> {
+        let (parents, leaf) = checked_split(path)?;
+        let Some(parent) = traverse_parents_ro(self.fd.as_fd(), path, &parents, false)? else {
+            return Ok(None);
+        };
+        let stat = match statat(
+            parent.as_fd(),
+            OsStr::from_bytes(leaf),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(io::Error::from(error).into()),
+        };
+        if !FileType::from_raw_mode(stat.st_mode).is_file() {
+            return Err(Error::CorruptRecovery(format!(
+                "lock entry {:?} is not a regular file",
+                BString::from(path)
+            )));
+        }
+        Ok(Some((stat.st_dev, stat.st_ino)))
+    }
+
+    /// Open the validated parent directory for `path` with `O_RDONLY` (creating parents if requested).
+    pub(crate) fn open_parent_dir(
+        &self,
+        path: &[u8],
+        create_missing: bool,
+    ) -> Result<(OwnedFd, Vec<u8>)> {
+        let (parents, leaf) = checked_split(path)?;
+        let parent = traverse_parents_rw(self.fd.as_fd(), path, &parents, create_missing)?
+            .ok_or_else(|| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing parent directory for {:?}", BString::from(path)),
+                ))
+            })?;
+        Ok((parent, leaf.to_vec()))
+    }
+
+    /// Ensure `path` exists as a real directory without following symlinks.
+    pub(crate) fn ensure_dir(&self, path: &[u8]) -> Result<()> {
+        let (parents, leaf) = checked_split(path)?;
+        let mut components = parents;
+        components.push(leaf);
+        let mut current = open_dot_rw(self.fd.as_fd())?;
+        for component in components {
+            current = open_or_create_dir(current.as_fd(), path, component, true)?
+                .expect("create_missing=true either succeeds or returns Err");
+        }
+        Ok(())
+    }
+
+    /// Remove an empty directory at `path` if it exists; absent paths succeed idempotently.
+    pub(crate) fn remove_empty_dir(&self, path: &[u8]) -> Result<()> {
+        let (parents, leaf) = checked_split(path)?;
+        let Some(parent) = traverse_parents_rw(self.fd.as_fd(), path, &parents, false)? else {
+            return Ok(());
+        };
+        let leaf_os = OsStr::from_bytes(leaf);
+        match statat(parent.as_fd(), leaf_os, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_dir() => {}
+            Ok(_) => {
+                return Err(Error::UnsupportedRepository(format!(
+                    "expected directory at {:?}, found non-directory",
+                    BString::from(path)
+                )));
+            }
+            Err(Errno::NOENT) => return Ok(()),
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+        match unlinkat(parent.as_fd(), leaf_os, AtFlags::REMOVEDIR) {
+            Ok(()) => {}
+            Err(Errno::NOENT) => return Ok(()),
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+        fsync(parent.as_fd()).map_err(io::Error::from)?;
+        Ok(())
+    }
+
+    /// Atomically write or replace a regular file, executable, or symlink at `path`.
+    pub(crate) fn write_entry_atomic(
+        &self,
+        path: &[u8],
+        kind: FileKind,
+        bytes: &[u8],
+        temp_name: &str,
+    ) -> Result<()> {
+        if is_unsafe_component(temp_name.as_bytes()) || temp_name.contains('/') {
+            return Err(unsafe_path_error(temp_name.as_bytes()));
+        }
+        if kind == FileKind::Symlink && bytes.len() > MAX_SYMLINK_TARGET_BYTES {
+            return Err(Error::UnsupportedRepository(format!(
+                "symlink {:?} has a target too long to write",
+                BString::from(path)
+            )));
+        }
+        let (parent, leaf) = self.open_parent_dir(path, true)?;
+        let leaf_os = OsStr::from_bytes(&leaf);
+        if let Ok(stat) = statat(parent.as_fd(), leaf_os, AtFlags::SYMLINK_NOFOLLOW)
+            && FileType::from_raw_mode(stat.st_mode).is_dir()
+        {
+            return Err(Error::UnsupportedRepository(format!(
+                "cannot replace directory {:?} with a file or symlink",
+                BString::from(path)
+            )));
+        }
+        let temp_os = OsStr::new(temp_name);
+        let _ = unlinkat(parent.as_fd(), temp_os, AtFlags::empty());
+        let mut guard = TempEntryGuard {
+            parent: parent.as_fd(),
+            name: temp_os,
+            active: false,
+        };
+        match kind {
+            FileKind::Regular | FileKind::Executable => {
+                let mode = if kind == FileKind::Executable {
+                    Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH
+                } else {
+                    Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH
+                };
+                let fd = openat(
+                    parent.as_fd(),
+                    temp_os,
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    mode,
+                )
+                .map_err(io::Error::from)?;
+                guard.active = true;
+                let mut file = File::from(fd);
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                drop(file);
+            }
+            FileKind::Symlink => {
+                symlinkat(OsStr::from_bytes(bytes), parent.as_fd(), temp_os)
+                    .map_err(io::Error::from)?;
+                guard.active = true;
+            }
+        }
+        renameat(parent.as_fd(), temp_os, parent.as_fd(), leaf_os).map_err(io::Error::from)?;
+        guard.active = false;
+        fsync(parent.as_fd()).map_err(io::Error::from)?;
+        Ok(())
+    }
+
+    /// Remove a regular file or symlink at `path`; absent paths succeed idempotently.
+    pub(crate) fn remove_entry(&self, path: &[u8]) -> Result<()> {
+        let (parents, leaf) = checked_split(path)?;
+        let Some(parent) = traverse_parents_rw(self.fd.as_fd(), path, &parents, false)? else {
+            return Ok(());
+        };
+        let leaf_os = OsStr::from_bytes(leaf);
+        match statat(parent.as_fd(), leaf_os, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_dir() => {
+                return Err(Error::UnsupportedRepository(format!(
+                    "cannot remove directory {:?} as a file entry",
+                    BString::from(path)
+                )));
+            }
+            Ok(_) => {}
+            Err(Errno::NOENT) => return Ok(()),
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+        match unlinkat(parent.as_fd(), leaf_os, AtFlags::empty()) {
+            Ok(()) => {}
+            Err(Errno::NOENT) => return Ok(()),
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+        fsync(parent.as_fd()).map_err(io::Error::from)?;
+        Ok(())
+    }
+
+    /// Remove a stray temporary sibling `temp_name` in `path`'s parent directory if present.
+    pub(crate) fn cleanup_temp(&self, path: &[u8], temp_name: &str) -> Result<()> {
+        if is_unsafe_component(temp_name.as_bytes()) || temp_name.contains('/') {
+            return Err(unsafe_path_error(temp_name.as_bytes()));
+        }
+        let (parents, _) = checked_split(path)?;
+        let Some(parent) = traverse_parents_rw(self.fd.as_fd(), path, &parents, false)? else {
+            return Ok(());
+        };
+        match unlinkat(parent.as_fd(), OsStr::new(temp_name), AtFlags::empty()) {
+            Ok(()) => {
+                fsync(parent.as_fd()).map_err(io::Error::from)?;
+            }
+            Err(Errno::NOENT) => {}
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+        Ok(())
+    }
+}
+
+struct TempEntryGuard<'a> {
+    parent: BorrowedFd<'a>,
+    name: &'a OsStr,
+    active: bool,
+}
+
+impl Drop for TempEntryGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = unlinkat(self.parent, self.name, AtFlags::empty());
+        }
+    }
+}
+
+fn open_dot_rw(root: BorrowedFd<'_>) -> Result<OwnedFd> {
+    openat(
+        root,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| Error::Io(io::Error::from(error)))
+}
+
+fn open_or_create_dir(
+    parent: BorrowedFd<'_>,
+    full_path: &[u8],
+    component: &[u8],
+    create_missing: bool,
+) -> Result<Option<OwnedFd>> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let name = OsStr::from_bytes(component);
+    match openat(parent, name, flags, Mode::empty()) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(Errno::NOENT) if create_missing => {
+            let mode = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+            match mkdirat(parent, name, mode) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(error) => return Err(io::Error::from(error).into()),
+            }
+            fsync(parent).map_err(io::Error::from)?;
+            openat(parent, name, flags, Mode::empty())
+                .map(Some)
+                .map_err(|error| Error::Io(io::Error::from(error)))
+        }
+        Err(Errno::NOENT) => Ok(None),
+        Err(Errno::LOOP) => Err(Error::UnsupportedRepository(format!(
+            "worktree path {:?} crosses a symlink",
+            BString::from(full_path)
+        ))),
+        Err(Errno::NOTDIR) => match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_symlink() => {
+                Err(Error::UnsupportedRepository(format!(
+                    "worktree path {:?} crosses a symlink",
+                    BString::from(full_path)
+                )))
+            }
+            Ok(_) => Err(Error::UnsupportedRepository(format!(
+                "path {:?} has a non-directory parent",
+                BString::from(full_path)
+            ))),
+            Err(error) => Err(io::Error::from(error).into()),
+        },
+        Err(error) => Err(io::Error::from(error).into()),
+    }
+}
+
+fn traverse_parents_ro(
+    root: BorrowedFd<'_>,
+    full_path: &[u8],
+    parents: &[&[u8]],
+    create_missing: bool,
+) -> Result<Option<OwnedFd>> {
+    if parents.is_empty() {
+        return openat(root, ".", directory_flags(true), Mode::empty())
+            .map(Some)
+            .map_err(|error| Error::Io(io::Error::from(error)));
+    }
+    if create_missing {
+        return traverse_parents_rw(root, full_path, parents, true);
+    }
+    let mut current = openat(root, ".", directory_flags(true), Mode::empty())
+        .map_err(|error| Error::Io(io::Error::from(error)))?;
+    for component in parents {
+        let name = OsStr::from_bytes(component);
+        match openat(current.as_fd(), name, directory_flags(false), Mode::empty()) {
+            Ok(next) => current = next,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(Errno::LOOP) => {
+                return Err(Error::UnsupportedRepository(format!(
+                    "worktree path {:?} crosses a symlink",
+                    BString::from(full_path)
+                )));
+            }
+            Err(Errno::NOTDIR) => match statat(current.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_symlink() => {
+                    return Err(Error::UnsupportedRepository(format!(
+                        "worktree path {:?} crosses a symlink",
+                        BString::from(full_path)
+                    )));
+                }
+                Ok(_) => return Err(Error::Io(io::Error::from(Errno::NOTDIR))),
+                Err(error) => return Err(io::Error::from(error).into()),
+            },
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+    }
+    Ok(Some(current))
+}
+
+fn traverse_parents_rw(
+    root: BorrowedFd<'_>,
+    full_path: &[u8],
+    parents: &[&[u8]],
+    create_missing: bool,
+) -> Result<Option<OwnedFd>> {
+    let Some((last, prefix)) = parents.split_last() else {
+        return open_dot_rw(root).map(Some);
+    };
+    let current = if create_missing {
+        let mut dir = open_dot_rw(root)?;
+        for component in prefix {
+            dir = open_or_create_dir(dir.as_fd(), full_path, component, true)?
+                .expect("create_missing=true returns Some or Err");
+        }
+        dir
+    } else {
+        let Some(dir) = traverse_parents_ro(root, full_path, prefix, false)? else {
+            return Ok(None);
+        };
+        dir
+    };
+    open_or_create_dir(current.as_fd(), full_path, last, create_missing)
 }
 
 /// Walk `parents` without following symlinks, then read the leaf entry.
@@ -239,7 +631,7 @@ fn read_leaf_at(
 }
 
 /// Split a worktree-relative byte path into validated parent components and its leaf name.
-fn checked_split(path: &[u8]) -> Result<(Vec<&[u8]>, &[u8])> {
+pub(crate) fn checked_split(path: &[u8]) -> Result<(Vec<&[u8]>, &[u8])> {
     let mut components: Vec<&[u8]> = path.split(|byte| *byte == b'/').collect();
     // Splitting any slice yields at least one component, so the `None` arm below is
     // unreachable; it only exists to keep this function total without panicking.
