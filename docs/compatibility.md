@@ -30,6 +30,8 @@ The repository and status modules intentionally use Unix byte-path and permissio
 | Sparse index/checkout | Refused at discovery and again at capture | Sparse markers, `SKIP_WORKTREE` flags, or `core.sparseCheckout` config detected |
 | Partial/promisor clone | Refused when promisor packs, `remote.*.promisor`, or `extensions.partialClone` config are detected | Missing objects violate complete local capture assumptions |
 | Submodules/gitlinks | Refused at repository level | Nested repository state not captured |
+| Gitlinks in historical trees reached by retention | Refused at capture | Reachability traversal refuses submodule-linked trees |
+| Index with resolve-undo (REUC) records | Refused at capture | Retention does not model resolve-undo entries |
 | Nested repository under the worktree | Refused at capture | Not a capturable file tree, including bare nested repositories |
 | Unresolved index conflicts | Refused | Multi-stage index restoration not implemented |
 | In-progress merge | Refused | `MERGE_HEAD` detected |
@@ -51,7 +53,8 @@ Detection is conservative but not yet exhaustive. Unknown extensions or concurre
 | Tree parsing/serialization | Implemented, including non-UTF-8 names and gitlink modes |
 | Annotated tag-specific model | Not implemented; raw tag objects are readable |
 | Abbreviated object IDs | Not implemented in CLI |
-| Object writes other than debug blobs | Not exposed yet |
+| Object writes | Not exposed; `debug hash-object` is read-only and retention writes only to the private CAS |
+| Retained object closure | Implemented for refs/HEAD/index roots with tag/commit/tree traversal; writes no public refs or objects |
 
 ## Captured state
 
@@ -65,6 +68,7 @@ Detection is conservative but not yet exhaustive. Unknown extensions or concurre
 | Present tracked executable files | Yes, with the on-disk mode even when the index disagrees | No |
 | Present tracked symlinks | Yes, as the raw target without dereference | No |
 | Non-ignored untracked files | Yes, through a checked walk that never applies filters | No |
+| Git object closure reachable from saved refs/HEAD/index | Yes, on adoption, automatic imports, and explicit checkpoints, in the private CAS | No |
 | Ignored files | No | No |
 | Deleted tracked path absence | Represented by omission plus captured index | No |
 | Empty directories | No | No |
@@ -92,6 +96,8 @@ and the index semantics validated at discovery are validated again on the bytes 
 - Recovery fields are bounded to 16 MiB when decoding.
 - Record counts are bounded to 10,000,000 when decoding.
 - Whole recovery views are bounded to 64 MiB, operations to 1 MiB, and CAS payloads to 1 GiB.
+- Each retained Git object payload is bounded to 128 MiB; packed delta chains are limited to depth 64 with a 128 MiB aggregate inflated-instruction budget. Decoding can also use two object-sized working buffers.
+- Retention keeps at most 1,000,000 distinct Git objects, further bounded by the 64 MiB whole-view limit.
 - New format 2 sidecars are owner-private; format 1 sidecars are refused without migration.
 - There is no automatic garbage collection or pruning.
 - Capture currently reads each eligible file into memory before persisting it.
@@ -122,7 +128,8 @@ An advisory lock excludes a second cooperating git2 writer. Ordinary Git does no
 
 - Restore has not been implemented, so captured views have not passed an end-to-end recovery proof.
 - Captures and bounded recovery reads still use memory. This is not a streaming or large-repository backup.
-- The sidecar does not yet retain Git objects referenced by snapshots, so ordinary Git pruning can remove required history.
+- Retention saves only the Git object closure available at capture time; earlier format 2 views with an empty map are not retroactively completed, and ordinary Git can still prune objects that were never captured.
+- git2 does not monitor ordinary Git in the background. Outside changes are imported only when `status`, `oplog`, or `checkpoint` runs, and a checkpoint is a capture rather than a backup.
 - Ordinary Git can race capture despite the git2 advisory lock.
 - Recovery-store sync errors are reported, but process-crash reconciliation and machine/power-loss testing are not implemented.
 - Object-not-found classification in packed fallback relies partly on dependency error text and needs a typed error path.

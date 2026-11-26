@@ -178,7 +178,13 @@ pub fn canonical_object_bytes(kind: ObjectKind, data: &[u8]) -> Vec<u8> {
 /// Hash object data exactly as Git does for SHA-1 repositories.
 #[must_use]
 pub fn hash_object(kind: ObjectKind, data: &[u8]) -> GitOid {
-    let digest = Sha1::digest(canonical_object_bytes(kind, data));
+    let mut hasher = Sha1::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b" ");
+    hasher.update(data.len().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(data);
+    let digest = hasher.finalize();
     let mut bytes = [0_u8; SHA1_LEN];
     bytes.copy_from_slice(&digest);
     GitOid(bytes)
@@ -190,6 +196,14 @@ pub fn hash_object(kind: ObjectKind, data: &[u8]) -> GitOid {
 ///
 /// Returns [`Error::CorruptObject`] if the header, kind, length, or payload is malformed.
 pub fn parse_canonical_object(bytes: &[u8]) -> Result<RawObject> {
+    let (kind, data) = canonical_object_parts(bytes)?;
+    Ok(RawObject {
+        kind,
+        data: data.to_vec(),
+    })
+}
+
+pub(crate) fn canonical_object_parts(bytes: &[u8]) -> Result<(ObjectKind, &[u8])> {
     let nul = bytes
         .iter()
         .position(|byte| *byte == 0)
@@ -200,7 +214,13 @@ pub fn parse_canonical_object(bytes: &[u8]) -> Result<RawObject> {
         .position(|byte| *byte == b' ')
         .ok_or_else(|| Error::CorruptObject("object header has no length".to_owned()))?;
     let kind = ObjectKind::from_bytes(&header[..space])?;
-    let declared = std::str::from_utf8(&header[space + 1..])
+    let length = &header[space + 1..];
+    if !length.iter().all(u8::is_ascii_digit) || (length.len() > 1 && length[0] == b'0') {
+        return Err(Error::CorruptObject(
+            "object length is not canonical".to_owned(),
+        ));
+    }
+    let declared = std::str::from_utf8(length)
         .map_err(|_| Error::CorruptObject("object length is not ASCII".to_owned()))?
         .parse::<usize>()
         .map_err(|_| Error::CorruptObject("object length is invalid".to_owned()))?;
@@ -211,10 +231,7 @@ pub fn parse_canonical_object(bytes: &[u8]) -> Result<RawObject> {
             data.len()
         )));
     }
-    Ok(RawObject {
-        kind,
-        data: data.to_vec(),
-    })
+    Ok((kind, data))
 }
 
 /// A byte-safe Git identity and timestamp.

@@ -5,7 +5,7 @@
 The project uses ordinary Git repositories as its interchange format. It adds a private, clone-local operation history under `.git/git2/` and is being developed as a learning-first, portfolio-grade implementation of Git’s local mechanics.
 
 > [!WARNING]
-> git2 is not ready for important repositories. It can capture and inspect recovery history, but restore and undo are not implemented yet. A snapshot that cannot yet be restored is not a backup.
+> git2 is not ready for important repositories. It can capture and inspect recovery history, including explicit checkpoints, but restore and undo are not implemented yet. A snapshot that cannot yet be restored is not a backup.
 
 ## Current status
 
@@ -13,6 +13,7 @@ The project uses ordinary Git repositories as its interchange format. It adds a 
 | --- | --- | --- |
 | Git object interoperability | Implemented | Byte-safe SHA-1 IDs, loose reads/writes, packed reads, commits, and trees |
 | Repository adoption | Implemented | Captures HEAD, refs, index, tracked files, and non-ignored untracked files |
+| Object retention and checkpoints | Implemented | Adoption, automatic imports, and `checkpoint` retain the current Git object closure privately |
 | Recovery storage | Implemented | Immutable SHA-256 CAS, views, operations, integrity checks, and advisory lock |
 | External Git import | Implemented | `status` and `oplog` record changed state as `external-git` operations |
 | Status | Implemented | Two-column porcelain output; `-z` is byte-safe |
@@ -39,7 +40,7 @@ The active target is an ordinary, non-bare, single-worktree SHA-1 repository on 
 
 Ignored files and repository-local Git configuration are outside the recovery guarantee. The default eligible regular-file limit is 100 MiB; `adopt --max-file-mib` accepts up to 1024 MiB and persists the choice for future imports. New sidecars use format 2 with owner-private permissions. Format 1 stores are refused and left unchanged; see [recovery format](docs/recovery-format.md) before starting a new store.
 
-Read the [compatibility matrix](docs/compatibility.md) before experimenting.
+Object retention has its own bounds (128 MiB per Git object payload, 1,000,000 distinct retained objects, pack delta depth 64, and the whole-view limit) and refuses indexes with resolve-undo (REUC) entries and historical gitlink trees. Read the [compatibility matrix](docs/compatibility.md) before experimenting.
 
 ## Build
 
@@ -80,17 +81,26 @@ printf 'changed\n' > hello.txt
 
 `status` or `oplog` notices the change made outside git2 and appends one `external-git` operation. Repeating the command without another state change does not append duplicate history.
 
+`checkpoint` explicitly saves the current state of an adopted repository and prints the full 64-hex recovery view ID. A changed state appends one `git2:checkpoint` operation; an unchanged state returns the same view and appends nothing. git2 does not monitor ordinary Git in the background, so a checkpoint captures the state at the moment you run it. Captures retain the Git objects currently reachable from the saved refs, HEAD, and index, but this is not a backup and does not make restore available.
+
+```sh
+printf 'checked point\n' > hello.txt
+/path/to/git2 checkpoint
+/path/to/git2 oplog
+```
+
 ## Implemented commands
 
 ```text
 git2 adopt [--max-file-mib <MiB>]
+git2 checkpoint
 git2 status [-z|--nul]
 git2 oplog
-git2 debug hash-object [-w|--write] [--stdin | <path>]
+git2 debug hash-object [--stdin | <path>]
 git2 debug cat-object [-t|--type-only] <full-sha1>
 ```
 
-The debug commands expose the object layer for interoperability work; they are not the intended long-term user interface. See the [CLI reference](docs/cli.md) for exact behavior.
+The debug commands expose the object layer for interoperability work; they are read-only and are not the intended long-term user interface. See the [CLI reference](docs/cli.md) for exact behavior.
 
 ## Architecture
 
@@ -98,7 +108,7 @@ The workspace deliberately contains two crates:
 
 | Crate | Responsibility |
 | --- | --- |
-| `git2-core` | Git object model, repository validation, recovery store, snapshots, operation history, and status |
+| `git2-core` | Git object model, repository validation, recovery store, snapshots, object retention, operation history, and status |
 | `git2-cli` | Argument parsing, output, and command orchestration |
 
 git2 owns its local semantics. `gix` supplies difficult plumbing such as packed-object reads, index parsing, ignore/path traversal, and status machinery. Future networking will initially call the installed Git executable with argument vectors rather than reimplementing the wire protocol.

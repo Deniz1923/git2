@@ -12,6 +12,8 @@ pub mod recovery;
 #[cfg(unix)]
 pub mod repository;
 #[cfg(unix)]
+pub mod retention;
+#[cfg(unix)]
 pub mod status;
 pub mod store;
 

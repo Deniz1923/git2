@@ -2,9 +2,9 @@
 
 ## Status and compatibility
 
-The recovery sidecar format is currently version 2 and is experimental. A format 1 store is refused in place; git2 does not migrate, delete, or overwrite it. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. Neither old snapshots nor current captures are a backup or restorable yet.
+The recovery sidecar format is currently version 2 and is experimental. A format 1 store is refused in place; git2 does not migrate, delete, or overwrite it. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. Neither old snapshots nor current captures are a backup or restorable yet. `git2 checkpoint` is an explicit capture, not a restore or backup operation, and there is still no pending-transaction journal.
 
-The reader also refuses unknown top-level versions. Any incompatible change must increment that version and update this document and fixtures.
+The reader also refuses unknown top-level versions. Any incompatible change must increment that version and update this document and fixtures. Populating the reserved retained-object map in version 2 views did not change the on-disk format: format 2 records written before retention shipped have an empty map and remain readable, but they are not retroactively completed. A new checkpoint (or adoption/automatic import) can only retain objects that are still available in the repository when it runs. git2 does not monitor ordinary Git in the background.
 
 If initialization or adoption is interrupted and the store has no format, policy, or HEAD, git2 reports the missing entry. Preserve the incomplete directory separately before trying adoption again; git2 does not automatically remove it.
 
@@ -45,6 +45,7 @@ Version 2 does not:
 - garbage-collect unreachable records;
 - preserve ACLs, ownership, xattrs, or timestamps;
 - capture ignored files, config, hooks, or reflogs;
+- monitor ordinary Git in the background — checkpoints are explicit captures;
 - provide compatibility with Jujutsu or another operation-log format;
 - promise cross-platform path equivalence.
 
@@ -131,7 +132,8 @@ Current CAS consumers:
 - raw Git index bytes;
 - regular file content;
 - executable file content;
-- symlink target bytes.
+- symlink target bytes;
+- canonical bytes of retained Git objects (blob, tree, commit, and tag payloads with their framing).
 
 Reading recomputes SHA-256 and rejects a mismatch. Writing an ID that already exists verifies that the existing bytes are identical; different existing content is treated as corruption.
 
@@ -194,7 +196,18 @@ Ref records contain paths relative to the Git directory, such as `refs/heads/mai
 
 File records are generated from a path-sorted map. Paths use `/` separators in Git/index form and are interpreted as Unix bytes by the current repository implementation.
 
-The retained-object map is ordered by strictly increasing Git object ID, so duplicates are invalid. Current alpha captures write an empty map; retention of the saved refs/index object graph is a later milestone. A format 2 view does not yet prove restore is possible.
+The retained-object map is ordered by strictly increasing Git object ID, so duplicates are invalid. It is the reserved version 2 map, now populated by adoption, automatic imports, and explicit checkpoints with the Git object closure described below. Earlier format 2 views may carry an empty map and remain readable, but they are not retroactively completed. A format 2 view does not yet prove restore is possible.
+
+### Retained Git object map
+
+Roots are derived from the *saved* metadata only, not from live refs:
+
+- every physical loose ref and every value in the saved `packed-refs`, including values shadowed by a newer loose ref and peeled OIDs recorded in `packed-refs`;
+- the object named by HEAD when it resolves directly, while a valid unborn `refs/heads/` HEAD contributes no object;
+- concrete stage-zero index entries (regular, executable, and symlink modes), while intent-to-add placeholder IDs contribute no object;
+- valid cache-tree entries (`TREE` extensions that carry an entry count).
+
+Traversal follows tag → target, commit → tree and parents, and tree → subtrees and blobs. The view maps each Git SHA-1 ID to the SHA-256 CAS ID of its canonical bytes. A missing required object, a kind mismatch, or an over-limit object refuses the capture before the new view is published. Indexes with resolve-undo (`REUC`) records are refused, as are historical trees containing gitlink (submodule) entries. Each retained object payload is bounded to 128 MiB, the map to 1,000,000 distinct Git objects, packed delta chains to depth 64 with a 128 MiB aggregate inflated-instruction budget, and the encoded whole view to 64 MiB. Retention reads only local loose and indexed pack files without applying replacement refs. It does not write public refs or objects, and it does not touch Git's index or worktree. A failed capture may leave unreferenced private CAS data (or an incomplete store on first adoption), but it does not select a partial view.
 
 ### Captured absence
 
@@ -244,11 +257,11 @@ Operation kind codes:
 | --- | --- | --- |
 | `1` | Adoption baseline | None |
 | `2` | State imported from ordinary Git/external edits | None |
-| `3` | git2 command | One length-prefixed command byte string |
+| `3` | git2 command (`git2:checkpoint` today) | One length-prefixed command byte string |
 
 Timestamps are whole seconds relative to the Unix epoch. They are descriptive, not part of ordering; parent links define order. Times before the epoch are represented as negative values.
 
-An adoption operation has no parent and currently uses the same view ID for `before` and `after`. An external import points to the previous selected operation, uses its current view as `before`, and the newly captured view as `after`.
+An adoption operation has no parent and currently uses the same view ID for `before` and `after`. An external import points to the previous selected operation, uses its current view as `before`, and the newly captured view as `after`. An explicit checkpoint uses kind 3 with the command byte string `checkpoint`; when the state changed it points to the previous selected operation with the current view as `before` and the new view as `after`, while an unchanged checkpoint appends no operation and reuses the current operation and view.
 
 ## Atomicity and durability
 

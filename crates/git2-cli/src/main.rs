@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
-use git2_core::object::{GitOid, ObjectKind, RawObject, hash_object};
+use git2_core::object::{GitOid, ObjectKind, hash_object};
 #[cfg(unix)]
 use git2_core::recovery::{OperationKind, RecoveryStore};
 #[cfg(unix)]
@@ -34,6 +34,10 @@ enum Command {
         max_file_mib: u64,
     },
 
+    /// Save an explicit checkpoint of an adopted repository.
+    #[cfg(unix)]
+    Checkpoint,
+
     /// Show the immutable local operation history, newest first.
     #[cfg(unix)]
     Oplog,
@@ -58,12 +62,8 @@ struct DebugArgs {
 
 #[derive(Subcommand)]
 enum DebugCommand {
-    /// Hash a file as a blob, optionally writing it to the current repository.
+    /// Hash a file as a blob without modifying the repository.
     HashObject {
-        /// Write the object into the discovered repository.
-        #[arg(short = 'w', long)]
-        write: bool,
-
         /// Read object data from standard input.
         #[arg(long, conflicts_with = "path")]
         stdin: bool,
@@ -88,6 +88,8 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         #[cfg(unix)]
         Command::Adopt { max_file_mib } => run_adopt(max_file_mib),
+        #[cfg(unix)]
+        Command::Checkpoint => run_checkpoint(),
         #[cfg(unix)]
         Command::Oplog => run_oplog(),
         #[cfg(unix)]
@@ -116,6 +118,20 @@ fn run_adopt(max_file_mib: u64) -> anyhow::Result<()> {
             "warning: the baseline contains at least 5 GiB; git2 will not prune recovery data silently"
         );
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_checkpoint() -> anyhow::Result<()> {
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    let imported = repository
+        .checkpoint()
+        .context("could not save a checkpoint")?;
+    println!(
+        "checkpointed {} files ({} bytes) as view {}",
+        imported.file_count, imported.content_bytes, imported.view_id
+    );
     Ok(())
 }
 
@@ -170,20 +186,9 @@ fn run_oplog() -> anyhow::Result<()> {
 
 fn run_debug(command: DebugCommand) -> anyhow::Result<()> {
     match command {
-        DebugCommand::HashObject { write, stdin, path } => {
+        DebugCommand::HashObject { stdin, path } => {
             let data = read_input(stdin, path)?;
-            let object = RawObject {
-                kind: ObjectKind::Blob,
-                data,
-            };
-            let oid = if write {
-                ObjectStore::discover(".")
-                    .context("could not discover a Git repository")?
-                    .write(&object)
-                    .context("could not write the Git object")?
-            } else {
-                hash_object(object.kind, &object.data)
-            };
+            let oid = hash_object(ObjectKind::Blob, &data);
             println!("{oid}");
         }
         DebugCommand::CatObject { type_only, oid } => {

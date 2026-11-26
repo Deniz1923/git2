@@ -140,7 +140,7 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 
 **Decision:** Use format 2 with an immutable capture policy, symmetric encoder/decoder limits, owner-private access, and strict sync errors. Reserve a versioned map for retained Git objects. Refuse v1 without rewriting it.
 
-**Consequences:** Users of v1 must preserve their old store separately before adopting again. The format 2 capture alpha is still not a restore or backup tool; the object map is empty until retention is implemented.
+**Consequences:** Users of v1 must preserve their old store separately before adopting again. The object map is populated for new captures; views written before retention was implemented remain unchanged. The format 2 capture alpha is still not a restore or backup tool.
 
 ## Open decisions
 

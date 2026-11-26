@@ -85,3 +85,155 @@ fn adoption_and_auto_import_leave_legacy_store_untouched() {
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
     }
 }
+
+fn assert_full_view_id(id: &str) {
+    assert_eq!(id.len(), 64, "view id must be 64 characters: {id}");
+    assert!(
+        id.bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "view id must be lowercase hexadecimal: {id}"
+    );
+}
+
+#[test]
+fn checkpoint_refuses_unadopted_repository_and_saves_reusable_views() {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "--quiet"]);
+    let work = directory.path().join("work.txt");
+    std::fs::write(&work, b"before checkpoint\n").unwrap();
+
+    let refused = git2(directory.path(), &["checkpoint"]);
+    assert!(
+        !refused.status.success(),
+        "checkpoint must be refused before adoption"
+    );
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("git2 adopt"));
+    assert!(
+        !directory.path().join(".git/git2").exists(),
+        "a refused checkpoint must not create a recovery store"
+    );
+
+    let adopted = git2(directory.path(), &["adopt"]);
+    assert!(
+        adopted.status.success(),
+        "git2 adopt failed:\n{}",
+        String::from_utf8_lossy(&adopted.stderr)
+    );
+
+    std::fs::write(&work, b"explicit checkpoint\n").unwrap();
+    let checkpoint = git2(directory.path(), &["checkpoint"]);
+    assert!(
+        checkpoint.status.success(),
+        "git2 checkpoint failed:\n{}",
+        String::from_utf8_lossy(&checkpoint.stderr)
+    );
+    let stdout = String::from_utf8(checkpoint.stdout).unwrap();
+    let (_, id) = stdout
+        .trim_end()
+        .rsplit_once(" as view ")
+        .unwrap_or_else(|| panic!("checkpoint output must end with 'as view <id>': {stdout:?}"));
+    assert_full_view_id(id);
+    assert!(
+        directory
+            .path()
+            .join(".git/git2/views")
+            .join(&id[..2])
+            .join(&id[2..])
+            .is_file(),
+        "checkpoint ID must name a stored view"
+    );
+
+    let history = || {
+        let output = git2(directory.path(), &["oplog"]);
+        assert!(
+            output.status.success(),
+            "git2 oplog failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let after_save = history();
+    assert_eq!(
+        after_save
+            .lines()
+            .filter(|line| line.contains("git2:checkpoint"))
+            .count(),
+        1,
+        "a changed explicit save must append exactly one checkpoint operation:\n{after_save}"
+    );
+    let newest = after_save.lines().next().unwrap();
+    assert!(
+        newest.contains("git2:checkpoint"),
+        "the newest operation must be the explicit checkpoint:\n{after_save}"
+    );
+    assert_eq!(
+        newest.split_whitespace().last(),
+        Some(&id[..12]),
+        "the reusable view id must identify the saved view"
+    );
+
+    let repeated = git2(directory.path(), &["checkpoint"]);
+    assert!(
+        repeated.status.success(),
+        "an unchanged checkpoint must succeed:\n{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let repeated_stdout = String::from_utf8(repeated.stdout).unwrap();
+    let (_, repeated_id) = repeated_stdout
+        .trim_end()
+        .rsplit_once(" as view ")
+        .unwrap_or_else(|| {
+            panic!("checkpoint output must end with 'as view <id>': {repeated_stdout:?}")
+        });
+    assert_eq!(
+        repeated_id, id,
+        "an unchanged checkpoint must reuse the same view id"
+    );
+    assert_eq!(
+        history(),
+        after_save,
+        "an unchanged checkpoint must not append another operation"
+    );
+}
+
+#[test]
+fn debug_hash_object_write_is_rejected_without_creating_an_object() {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "--quiet"]);
+    std::fs::write(directory.path().join("input"), b"never written\0").unwrap();
+
+    let canonical = git(directory.path(), &["hash-object", "input"]);
+    let oid = String::from_utf8(canonical.stdout).unwrap();
+    let oid = oid.trim();
+    let objects = directory.path().join(".git").join("objects");
+    let object_path = objects.join(&oid[..2]).join(&oid[2..]);
+    assert!(!object_path.exists(), "the object must start absent");
+    let before = std::fs::read_dir(&objects).unwrap().count();
+
+    let rejected = git2(
+        directory.path(),
+        &["debug", "hash-object", "--write", "input"],
+    );
+    assert!(
+        !rejected.status.success(),
+        "debug hash-object --write must be rejected"
+    );
+    assert!(
+        rejected.stdout.is_empty(),
+        "a rejected write must not print an object id"
+    );
+    assert!(
+        !rejected.stderr.is_empty(),
+        "the rejection must explain why --write is not allowed"
+    );
+    assert!(
+        !object_path.exists(),
+        "--write must not create a Git object"
+    );
+    assert_eq!(
+        std::fs::read_dir(&objects).unwrap().count(),
+        before,
+        "the object database must be unchanged"
+    );
+}

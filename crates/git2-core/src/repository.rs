@@ -15,6 +15,8 @@ use crate::recovery::{
     CapturePolicy, ContentId, FileKind, FileRecord, MAX_CAS_BYTES, MAX_FIELD_BYTES, Operation,
     OperationKind, RecoveryStore, View, check_view_size,
 };
+use crate::retention::{self, Root};
+use crate::store::ObjectStore;
 use crate::{Error, Result};
 
 /// Safety limits persisted when adopting an existing repository.
@@ -182,7 +184,7 @@ impl LocalRepository {
         let draft = self.capture_draft(options)?;
         let store = RecoveryStore::initialize(&self.git_dir, options)?;
         let _lock = store.try_lock()?;
-        let persisted = persist_draft(&store, draft)?;
+        let persisted = self.persist_draft(&store, draft)?;
         let operation = Operation {
             parent: None,
             before: persisted.view_id,
@@ -207,12 +209,31 @@ impl LocalRepository {
     /// Returns an error if the repository has not been adopted, another writer holds the recovery
     /// lock, or the new state cannot be captured and persisted safely.
     pub fn import_external_changes(&self) -> Result<ExternalImport> {
+        self.record_view(OperationKind::ExternalGit)
+    }
+
+    /// Record an explicit checkpoint in an adopted repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a complete object graph cannot be captured, the store is
+    /// unavailable, or another git2 process holds the lock.
+    pub fn checkpoint(&self) -> Result<ExternalImport> {
+        if !RecoveryStore::exists(&self.git_dir)? {
+            return Err(Error::UnsupportedRepository(
+                "run `git2 adopt` before saving a checkpoint".to_owned(),
+            ));
+        }
+        self.record_view(OperationKind::Git2(BString::from("checkpoint")))
+    }
+
+    fn record_view(&self, kind: OperationKind) -> Result<ExternalImport> {
         let store = RecoveryStore::open(&self.git_dir)?;
         let _lock = store.try_lock()?;
         let parent = store.head()?;
         let before = store.current_view()?;
         let draft = self.capture_draft(store.policy()?)?;
-        let persisted = persist_draft(&store, draft)?;
+        let persisted = self.persist_draft(&store, draft)?;
         if persisted.view_id == before {
             return Ok(ExternalImport {
                 changed: false,
@@ -226,7 +247,7 @@ impl LocalRepository {
             parent: Some(parent),
             before,
             after: persisted.view_id,
-            kind: OperationKind::ExternalGit,
+            kind,
             timestamp_seconds: timestamp_seconds(),
         };
         let operation_id = store.put_operation(&operation)?;
@@ -250,9 +271,7 @@ impl LocalRepository {
         // Validate the same semantics that discovery checked, so the raw bytes about to
         // be persisted can only carry modeled index states even if Git changed them
         // after discovery.
-        if let Some(index) = &index {
-            validate_index(index)?;
-        }
+        let roots = retention::roots(&head, &refs, index.as_ref())?;
 
         let mut paths = BTreeSet::<Vec<u8>>::new();
         if let Some(index) = &index {
@@ -291,7 +310,21 @@ impl LocalRepository {
             refs,
             index: index_bytes,
             files,
+            roots,
         })
+    }
+
+    fn persist_draft(&self, store: &RecoveryStore, draft: ViewDraft) -> Result<PersistedDraft> {
+        let objects = ObjectStore::from_repository(self.inner.clone())?;
+        let retained = retention::retain_roots(store, &objects, draft.roots.iter().copied())?;
+        check_view_size(
+            draft.head.len(),
+            &draft.refs,
+            draft.index.is_some(),
+            draft.files.iter().map(|file| file.path.len()),
+            retained.len(),
+        )?;
+        persist_draft(store, draft, retained)
     }
 
     /// Enumerate non-ignored untracked worktree paths with a checked directory walk.
@@ -370,6 +403,7 @@ struct ViewDraft {
     refs: Vec<(BString, BString)>,
     index: Option<Vec<u8>>,
     files: Vec<FileDraft>,
+    roots: Vec<Root>,
 }
 
 struct FileDraft {
@@ -384,7 +418,11 @@ struct PersistedDraft {
     content_bytes: u64,
 }
 
-fn persist_draft(store: &RecoveryStore, draft: ViewDraft) -> Result<PersistedDraft> {
+fn persist_draft(
+    store: &RecoveryStore,
+    draft: ViewDraft,
+    retained_objects: Vec<crate::recovery::RetainedObject>,
+) -> Result<PersistedDraft> {
     let index = draft
         .index
         .as_deref()
@@ -406,7 +444,7 @@ fn persist_draft(store: &RecoveryStore, draft: ViewDraft) -> Result<PersistedDra
         refs: draft.refs,
         index,
         files,
-        retained_objects: Vec::new(),
+        retained_objects,
     };
     Ok(PersistedDraft {
         view_id: store.put_view(&view)?,
@@ -525,7 +563,7 @@ fn capture_ref_directory(
 ///
 /// Returns an error if the index bytes are shorter than a checksum, fail checksum
 /// verification, or cannot be decoded.
-fn decode_index(bytes: &[u8]) -> Result<gix::index::State> {
+pub(crate) fn decode_index(bytes: &[u8]) -> Result<gix::index::State> {
     let checksum_bytes = gix::hash::Kind::Sha1.len_in_bytes();
     if bytes.len() < checksum_bytes {
         return Err(Error::Gix(
@@ -565,7 +603,7 @@ fn decode_index(bytes: &[u8]) -> Result<gix::index::State> {
 ///
 /// Returns an error if the index is split, sparse by marker or skip-worktree flag, has
 /// unresolved conflict stages, or contains gitlink modes.
-fn validate_index(index: &gix::index::State) -> Result<()> {
+pub(crate) fn validate_index(index: &gix::index::State) -> Result<()> {
     if index.link().is_some() {
         return Err(Error::UnsupportedRepository(
             "split indexes are not supported".to_owned(),

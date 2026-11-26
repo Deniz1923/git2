@@ -172,10 +172,9 @@ pub struct FileRecord {
 
 /// One entry of a view's reserved object map.
 ///
-/// The map records which Git objects a future checkpoint retains, mapping each
+/// The map records which Git objects a checkpoint retains, mapping each
 /// object id to the content record holding its bytes. It is strictly sorted and
-/// free of duplicates; retention itself is not implemented yet, so capture-only
-/// views keep it empty.
+/// free of duplicates. Earlier capture-only format 2 views may have empty maps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetainedObject {
     /// The retained Git object id.
@@ -729,9 +728,13 @@ impl RecoveryStore {
     ///
     /// Returns an error if the content is absent, unsafe, unreadable, or corrupt.
     pub fn read_content(&self, id: ContentId) -> Result<Vec<u8>> {
+        self.read_content_bounded(id, MAX_CAS_BYTES)
+    }
+
+    pub(crate) fn read_content_bounded(&self, id: ContentId, limit: usize) -> Result<Vec<u8>> {
         let bytes = self
             .fanout_directory("cas", id, false)?
-            .read(&record_name(id), MAX_CAS_BYTES)?;
+            .read(&record_name(id), limit.min(MAX_CAS_BYTES))?;
         verify_id(id, &bytes, "content")?;
         Ok(bytes)
     }

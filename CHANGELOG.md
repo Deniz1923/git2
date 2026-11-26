@@ -18,6 +18,7 @@ All notable project changes are recorded here. The project has not made a suppor
 - Differential object/status tests and recovery refusal tests.
 - Descriptor-relative capture of worktree bytes and executable mode, without running configured content filters during adoption.
 - Format 2 recovery storage with persisted capture limits, owner-private access, and bounded record encoding and reads.
+- `git2 checkpoint`, and private retention of Git objects needed by new captured views.
 - Product, architecture, compatibility, CLI, format, roadmap, testing, development, contribution, and security documentation.
 
 ### Changed
@@ -34,6 +35,7 @@ All notable project changes are recorded here. The project has not made a suppor
 - Private development transcripts and obsolete planning artifacts.
 - Placeholder clone, pull, push, init, commit, log, and status modules.
 - Speculative backend and workflow crates.
+- Write mode from `git2 debug hash-object`; it now only computes the ID.
 
 ### Known limitations
 

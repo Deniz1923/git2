@@ -364,6 +364,7 @@ dependencies = [
  "flate2",
  "fs2",
  "gix",
+ "gix-pack",
  "rustix",
  "sha1",
  "sha2",

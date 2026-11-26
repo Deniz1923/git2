@@ -9,8 +9,11 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 
-use crate::object::{GitOid, ObjectKind, RawObject, parse_canonical_object};
+use crate::object::{GitOid, ObjectKind, RawObject, canonical_object_parts};
 use crate::{Error, Result};
+
+#[cfg(unix)]
+mod packed;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -42,7 +45,7 @@ impl ObjectStore {
         Self::from_repository(repository)
     }
 
-    fn from_repository(repository: gix::Repository) -> Result<Self> {
+    pub(crate) fn from_repository(repository: gix::Repository) -> Result<Self> {
         if repository.object_hash() != gix::hash::Kind::Sha1 {
             return Err(Error::UnsupportedRepository(
                 "only SHA-1 repositories are supported".to_owned(),
@@ -84,15 +87,26 @@ impl ObjectStore {
                     Error::Gix(error.to_string())
                 }
             })?;
-        let kind = match object.kind {
-            gix::objs::Kind::Blob => ObjectKind::Blob,
-            gix::objs::Kind::Tree => ObjectKind::Tree,
-            gix::objs::Kind::Commit => ObjectKind::Commit,
-            gix::objs::Kind::Tag => ObjectKind::Tag,
-        };
         Ok(RawObject {
-            kind,
+            kind: from_gix_kind(object.kind),
             data: object.data.clone(),
+        })
+    }
+
+    /// Use only local loose and indexed pack files, without replacement refs.
+    #[cfg(unix)]
+    pub(crate) fn bounded_reader(&self, limit: usize) -> Result<BoundedReader> {
+        let objects_dir = self.git_dir.join("objects");
+        if !fs::symlink_metadata(&objects_dir)?.is_dir() {
+            return Err(Error::UnsupportedRepository(
+                "Git objects must live in a real objects directory".to_owned(),
+            ));
+        }
+        Ok(BoundedReader {
+            root: crate::paths::CheckedRoot::open(&objects_dir)?,
+            objects_dir,
+            packs: None,
+            limit,
         })
     }
 
@@ -153,23 +167,131 @@ impl ObjectStore {
     }
 }
 
+pub(crate) fn from_gix_kind(kind: gix::objs::Kind) -> ObjectKind {
+    match kind {
+        gix::objs::Kind::Blob => ObjectKind::Blob,
+        gix::objs::Kind::Tree => ObjectKind::Tree,
+        gix::objs::Kind::Commit => ObjectKind::Commit,
+        gix::objs::Kind::Tag => ObjectKind::Tag,
+    }
+}
+
+#[cfg(unix)]
+pub(crate) struct BoundedReader {
+    root: crate::paths::CheckedRoot,
+    objects_dir: PathBuf,
+    packs: Option<packed::PackedObjects>,
+    limit: usize,
+}
+
+#[cfg(unix)]
+impl BoundedReader {
+    pub(crate) fn read(&mut self, id: GitOid) -> Result<RawObject> {
+        let hex = id.to_hex();
+        let path = format!("{}/{}", &hex[..2], &hex[2..]);
+        // Allow zlib framing/expansion overhead for incompressible payloads.
+        let compressed_limit = (self.limit + 1024 * 1024) as u64;
+        if let Some(entry) = self.root.read_entry(path.as_bytes(), compressed_limit)? {
+            if entry.kind == crate::recovery::FileKind::Symlink {
+                return Err(Error::CorruptObject(format!(
+                    "loose object {id} is a symlink"
+                )));
+            }
+            return decode_loose(entry.bytes.as_slice(), id, Some(self.limit));
+        }
+        if gix::hash::ObjectId::from(id.as_bytes()).is_empty_tree() {
+            return Ok(RawObject {
+                kind: ObjectKind::Tree,
+                data: Vec::new(),
+            });
+        }
+        if self.packs.is_none() {
+            self.packs = Some(packed::PackedObjects::open(&self.objects_dir, self.limit)?);
+        }
+        let object = self
+            .packs
+            .as_ref()
+            .ok_or(Error::ObjectNotFound(id))?
+            .read(id)?
+            .ok_or(Error::ObjectNotFound(id))?;
+        verify_object_id(&object, id)?;
+        Ok(object)
+    }
+}
+
 fn read_loose(path: &Path, expected: GitOid) -> Result<RawObject> {
     let file = File::open(path)?;
-    let mut decoder = ZlibDecoder::new(file);
+    decode_loose(file, expected, None)
+}
+
+fn decode_loose(input: impl Read, expected: GitOid, limit: Option<usize>) -> Result<RawObject> {
+    let mut decoder = ZlibDecoder::new(input);
     let mut canonical = Vec::new();
-    decoder.read_to_end(&mut canonical)?;
-    let object = parse_canonical_object(&canonical)?;
+    if let Some(limit) = limit {
+        let canonical_limit = limit + 32;
+        decoder
+            .take(canonical_limit as u64 + 1)
+            .read_to_end(&mut canonical)?;
+        if canonical.len() > canonical_limit {
+            return Err(object_too_large(expected, limit));
+        }
+    } else {
+        decoder.read_to_end(&mut canonical)?;
+    }
+    let (kind, data) = canonical_object_parts(&canonical)?;
+    if let Some(limit) = limit
+        && data.len() > limit
+    {
+        return Err(object_too_large(expected, limit));
+    }
+    let object = RawObject {
+        kind,
+        data: data.to_vec(),
+    };
+    verify_object_id(&object, expected)?;
+    Ok(object)
+}
+
+fn object_too_large(id: GitOid, limit: usize) -> Error {
+    Error::UnsupportedRepository(format!(
+        "Git object {id} exceeds the {limit} byte retention limit"
+    ))
+}
+
+fn verify_object_id(object: &RawObject, expected: GitOid) -> Result<()> {
     let actual = object.id();
     if actual != expected {
         return Err(Error::CorruptObject(format!(
-            "loose object path names {expected} but content hashes to {actual}"
+            "Git object {expected} has content that hashes to {actual}"
         )));
     }
-    Ok(object)
+    Ok(())
 }
 
 fn compress(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(bytes)?;
     Ok(encoder.finish()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loose_retention_refuses_payloads_over_its_budget() {
+        let object = RawObject {
+            kind: ObjectKind::Blob,
+            data: vec![b'x'; 256],
+        };
+        let compressed = compress(&object.canonical_bytes()).unwrap();
+        assert!(matches!(
+            decode_loose(compressed.as_slice(), object.id(), Some(16)),
+            Err(Error::UnsupportedRepository(_))
+        ));
+        assert_eq!(
+            decode_loose(compressed.as_slice(), object.id(), Some(256)).unwrap(),
+            object
+        );
+    }
 }

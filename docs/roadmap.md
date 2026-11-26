@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reconciled with the implementation: 2026-08-05.
+Last reconciled with the implementation: 2026-11-26.
 
 ## How to read this roadmap
 
@@ -30,14 +30,16 @@ At that pace, the remaining v0.1 work is roughly 22–32 focused weeks, or about
 | --- | --- | --- |
 | 0. Repository rescue | Done | Honest two-crate workspace, private artifacts removed, clean gates |
 | 1. Git object interoperability | Done | Loose round trips, packed reads, byte-safe commit/tree tests |
-| 2. Adoption and immutable history | Done | CAS, views, operations, lock, external import |
+| 2. Adoption and immutable history | Done | CAS, views, operations, lock, external import, object retention, explicit checkpoint |
 | 3. Status | Done | Differential two-column porcelain and `-z` output |
-| 4. Mutation transaction foundation | Planned | Required before staging |
+| 4. Mutation transaction foundation | Planned | Still next; required before staging |
 | 5. Staging | Planned | `git2 add` with Git-compatible index writes |
 | 6. Commit and history | Planned | `commit` and `log` |
 | 7. Reset and restore engine | Planned | General view restoration and reset |
 | 8. Non-destructive undo proof | Planned | `undo`, redo path, interruption tests |
 | 9. Experimental v0.1 release | Planned | Packaging, CI, demo, limitations, checksums |
+
+Explicit `git2 checkpoint` capture and Git object retention are already done under Milestone 2, alongside the earlier adoption/capture work. They do not complete a mutation transaction: Milestone 4 remains the next planned milestone, and no mutating command ships before its pending-transaction foundation passes.
 
 ## Milestone 0 — repository rescue
 
@@ -100,7 +102,9 @@ Delivered:
 - adoption baseline and atomic recovery HEAD;
 - external-change import without duplicate unchanged operations;
 - CLI operation log;
-- checked worktree capture, v2 bounded records, persisted limits, and owner-private storage.
+- checked worktree capture, v2 bounded records, persisted limits, and owner-private storage;
+- retention of the Git object closure from saved physical loose and packed refs (including shadowed values and peeled OIDs), HEAD, concrete index blobs, and valid cache-tree IDs, following tag/commit/tree edges without public refs or object writes;
+- explicit `git2 checkpoint` on an adopted repository, reporting the full 64-hex view ID, logging `git2:checkpoint` on a changed save and reusing the same view with no new operation when unchanged.
 
 Exit criteria met:
 
@@ -108,14 +112,15 @@ Exit criteria met:
 - oversized files refuse adoption before sidecar creation;
 - known in-progress Git state is refused;
 - imported external changes form a correct parent/before/after chain;
-- corrupt/truncated records and concurrent git2 lock acquisition are tested.
+- corrupt/truncated records and concurrent git2 lock acquisition are tested;
+- retained objects survive ordinary Git pruning of shadowed refs and staged blobs, and unchanged checkpoints reuse the current view.
 
 Known debt carried forward:
 
-- capture consistency against concurrently running ordinary Git is not proven;
-- capture does not yet retain the Git objects that saved refs and index entries need;
+- capture consistency against concurrently running ordinary Git is not proven; git2 does not monitor plain Git and checkpoints are explicit;
+- retention is bounded (128 MiB per object payload, 1,000,000 distinct objects, pack delta depth 64 with a 128 MiB aggregate instruction budget, plus the whole-view limit) and refuses REUC indexes and historical gitlink trees; earlier empty-map views are not retroactively completed;
 - no streaming capture or garbage collection;
-- no restore exists yet.
+- no restore or pending-transaction journal exists yet, and captures are not backups.
 
 ## Milestone 3 — status
 
@@ -145,6 +150,8 @@ Rename/copy detection is not enabled in the current command, and unresolved inde
 ## Milestone 4 — mutation transaction foundation
 
 **Status: Planned — next milestone**
+
+Explicit checkpoint capture and object retention were completed under Milestone 2; they do not provide a mutation transaction. This milestone is still the next planned work before staging.
 
 Estimated effort: 2–4 focused weeks.
 
