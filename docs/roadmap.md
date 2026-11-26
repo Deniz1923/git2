@@ -34,12 +34,12 @@ At that pace, the remaining v0.1 work is roughly 22–32 focused weeks, or about
 | 3. Status | Done | Differential two-column porcelain and `-z` output |
 | 4. Mutation transaction foundation | Done | 4-phase constrained-action journal, staged-inode lock attribution, and child process-kill proof |
 | 5. Restore planning, apply, and recovery | Done | `restore --view [--dry-run]`, `recover [--status \| --rollback]`, pending read-only full-hex `oplog`, dual ignore profiles, pruned-object rehydration, CLI crash tests |
-| 6. Native reset and non-destructive undo proof | Planned | Next milestone; `reset`, semantic-index `undo`/redo, interruption tests + **stop/review gate** |
-| 7. Git-style staging | Planned | `git2 add` (literal paths, `--all`, built-in EOL) after post-proof review gate |
+| 6. Native reset and non-destructive undo proof | Done | `reset [--soft\|--mixed\|--hard]`, semantic-index `undo [--dry-run]` / redo, full core & CLI crash proof (**at stop/review gate**) |
+| 7. Git-style staging | Planned | Next after review gate; `git2 add` (literal paths, `--all`, built-in EOL) |
 | 8. Commit and history | Planned | `commit -m` and bounded first-parent `log` |
 | 9. Status completion, docs, and experimental v0.1 release | Planned | Complete supported status matrix, Linux CI, mirror-push privacy check, demo, package, checksums |
 
-Explicit `git2 checkpoint` capture, Git object retention, zlib-compressed format 3 CAS, the 4-phase pending-transaction foundation, `git2 restore --view [--dry-run]`, and `git2 recover [--status | --rollback]` are implemented under Milestones 2, 4, and 5. Milestone 6 (`reset` and semantic-index `undo`) is the next planned milestone; after Milestone 6 proves `reset --hard` → `undo` → `redo` end to end under process-kill testing, the plan pauses at an explicit review gate before starting Milestones 7–9.
+Explicit `git2 checkpoint` capture, Git object retention, zlib-compressed format 3 CAS, the 4-phase pending-transaction foundation, `git2 restore --view [--dry-run]`, `git2 recover [--status | --rollback]`, native `git2 reset`, and semantic-index `git2 undo` / redo are implemented under Milestones 2, 4, 5, and 6. With Milestone 6's `reset --hard` → `undo` → `redo` proof complete across process-kill tests, the project is at the **post-Milestone 6 review gate** before starting Milestones 7–9.
 
 ## Milestone 0 — repository rescue
 
@@ -199,43 +199,32 @@ Exit criteria met:
 
 ## Milestone 6 — native reset and non-destructive undo proof (review gate)
 
-**Status: Planned — next milestone**
+**Status: Done — at stop/review gate**
 
 Estimated effort: 3–5 focused weeks after Milestone 5.
 
 Commands:
 
 ```text
-git2 reset [--soft|--mixed|--hard] <commit>
+git2 reset [--soft|--mixed|--hard] [<commit>]
 git2 undo [--dry-run]
 ```
 
-Deliverables:
+Delivered:
 
-- resolve full commit IDs, `HEAD`, and bounded `HEAD~N` (up to 10,000 first-parent steps);
-- implement soft, mixed (default), and hard reset semantics for supported repositories without touching `ORIG_HEAD` or reflogs;
-- preserve unrelated untracked paths and refuse out-of-scope obstructions;
-- undo the latest eligible completed git2 mutation by restoring its `before` view and appending a new `git2:undo` operation (undoing the undo to redo);
-- compare current index semantic entries (paths, stages, modes, OIDs, and flags) against the recorded after-view so plain `git status` stat-cache refreshes do not falsely block `git2 undo`, while real staged/ref/worktree divergence still refuses and restored pre-reset index bytes match exact raw bytes;
-- provide a complete recorded crash-recovery demonstration.
+- resolve `HEAD`, full 40-hex commit IDs, local branch names (`refs/heads/<name>`), and bounded `~N` (up to 10,000 first-parent steps), refusing unborn targets, unsupported syntax, non-commits, and submodule gitlinks;
+- implement soft, mixed (default), and hard reset semantics natively (`git2-core::reset`) without touching `ORIG_HEAD` or reflogs, overwriting colliding non-ignored untracked files recoverably while preserving unrelated untracked/ignored paths and refusing ignored obstructions;
+- undo the latest eligible completed git2 mutation (`git2-core::undo`) via `restore` without rewriting history, appending `git2:undo` (undoing an undo redoes), and refusing `adopt`, `checkpoint`, and semantic `external-git` entries with `git2 restore --view` guidance;
+- semantic index entry comparison across stat-cache refreshes (`git status` and stat-only `external-git` imports) while still detecting staged entry/mode/OID/flag divergence and restoring exact raw pre-operation `.git/index` bytes;
+- complete core differential/demo suite (`crates/git2-core/tests/reset_undo.rs`) and CLI crash-recovery proof (`crates/git2-cli/tests/reset_undo_cli.rs`).
 
-Core demonstration:
+Exit criteria met:
 
-1. Adopt a disposable repository containing tracked, staged, modified, deleted, executable, symlink, non-UTF-8, non-ignored untracked, and ignored state.
-2. Perform a destructive `git2 reset --hard`.
-3. Verify ordinary Git (`git status`, `git fsck --full`) accepts the reset state.
-4. Run `git2 undo`, then `git2 undo` again to redo.
-5. Verify HEAD, refs, raw index, all eligible bytes, modes, symlinks, and absences equal the expected views while ignored files remain untouched.
-6. Verify the reset, undo, and redo operations all remain in `oplog`.
-7. Repeat with forced termination at every transaction phase.
-
-Exit criteria:
-
-- soft/mixed/hard results match Git for the supported matrix;
-- the demonstration passes automatically and manually, including stat-only `git status` before `undo`;
+- soft/mixed/hard results match Git (`git ls-files --stage -z`, `git status --porcelain=v1 -z`, `git fsck --full`) for the supported matrix;
+- the release demonstration passes across worktree/index state, stat-only `git status` before `undo`, redo, and process-kill/rollback failpoints;
 - undo never deletes an operation or immutable record, and undo itself can be undone;
 - staged/ref/worktree divergence is detected rather than silently overwritten;
-- **Stop & Review Gate:** pause after this milestone passes to review the recovery proof before starting Milestones 7–9.
+- **Stop & Review Gate:** pause here to review the Milestone 6 proof before starting Milestones 7–9.
 
 ## Milestone 7 — Git-style staging
 

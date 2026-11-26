@@ -155,11 +155,50 @@ Kinds currently include:
 - `external-git`;
 - `git2:checkpoint`, emitted by `git2 checkpoint`;
 - `git2:restore --view <64-hex-view-id>`, emitted by `git2 restore --view <id>`;
+- `git2:reset --<mode> <rev>`, emitted by `git2 reset`;
+- `git2:undo`, emitted by `git2 undo`;
 - other `git2:<command>` values in the format, reserved for future mutating commands.
 
 An unchanged `checkpoint` does not append a new operation, so repeated identical saves leave `oplog` unchanged.
 
 Output is intentionally simple and not yet declared a stable porcelain format.
+
+## `git2 reset`
+
+```text
+git2 reset [--soft | --mixed | --hard] [<commit>]
+```
+
+Requires an adopted repository and moves `HEAD` (or its current local branch ref when symbolic) to `<commit>`, leaving `ORIG_HEAD` and reflogs unchanged.
+
+Modes:
+
+- `--soft`: moves only `HEAD` or its target branch ref; leaves the index and working tree untouched;
+- `--mixed` (default): moves `HEAD` or its branch and rebuilds `.git/index` from the target commit tree; leaves the working tree untouched;
+- `--hard`: moves `HEAD` or its branch, rebuilds `.git/index`, and resets tracked working tree paths (overwriting colliding non-ignored untracked files cleanly so `undo` can recover them, preserving unrelated non-ignored untracked and ignored paths, and refusing ignored obstructions or nested repositories before mutation).
+
+Target revisions:
+
+- defaults to `HEAD` when `<commit>` is omitted;
+- accepts `HEAD`, full 40-character SHA-1 commit IDs, local branch names (`refs/heads/<name>`), and optional `<target>~N` suffixes up to `10,000` first-parent steps;
+- refuses unborn targets, `^` / `@{...}` / `..` syntax, non-commit objects, and trees containing submodule gitlinks before mutating state.
+
+## `git2 undo`
+
+```text
+git2 undo [--dry-run]
+```
+
+Non-destructively undoes the latest eligible completed `git2` mutation (`reset`, `restore`, `undo`, and future mutations) by restoring its durable `before` view through the 4-phase pending journal and appending one `git2:undo` operation. Running `git2 undo` again undoes that undo (redo), keeping the full history intact.
+
+Options:
+
+- `--dry-run`: verifies eligibility and displays single-line byte-safe preview changes without modifying Git state or sidecar history.
+
+Behavior:
+
+- plain read-only Git checks such as `git status` that only refresh `.git/index` stat-cache fields or `TREE` extensions (including when imported as a stat-only `external-git` entry by `status` or `oplog`) do not block `undo`, while `undo` still restores the exact captured raw pre-operation `.git/index` bytes;
+- refuses any staged entry path, stage, mode, OID, flag, worktree, ref, or `HEAD` divergence, and refuses `adopt`, `checkpoint`, or semantic `external-git` entries at recovery `HEAD` with an explicit `git2 restore --view <id>` suggestion.
 
 ## `git2 debug hash-object`
 
@@ -190,8 +229,6 @@ Only full 40-character object IDs are accepted.
 The following names are roadmap commitments, not current CLI features:
 
 ```text
-git2 reset
-git2 undo
 git2 add
 git2 commit
 git2 log

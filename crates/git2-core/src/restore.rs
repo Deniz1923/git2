@@ -18,7 +18,7 @@ use crate::store::ObjectStore;
 use crate::transaction::{self, Action, EntryState, Failpoint, MutationPlan, escape_path_bytes};
 use crate::{Error, Result};
 
-const MAX_SYMLINK_TARGET_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SYMLINK_TARGET_BYTES: usize = 64 * 1024;
 
 /// Plan a verified, ignore-aware restore from the current live state to `target`.
 ///
@@ -30,6 +30,18 @@ const MAX_SYMLINK_TARGET_BYTES: usize = 64 * 1024;
 /// required target object fails verification, ignore-rule changes leave an uncaptured entry
 /// ambiguous, or an ignored entry blocks replacement or directory creation.
 pub fn plan(repo: &LocalRepository, target: ContentId) -> Result<MutationPlan> {
+    plan_with_command(
+        repo,
+        target,
+        BString::from(format!("restore --view {target}")),
+    )
+}
+
+pub(crate) fn plan_with_command(
+    repo: &LocalRepository,
+    target: ContentId,
+    command: BString,
+) -> Result<MutationPlan> {
     let store = RecoveryStore::open(repo.git_dir())?;
     if store.has_pending()? {
         return Err(Error::UnsupportedRepository(
@@ -100,7 +112,7 @@ pub fn plan(repo: &LocalRepository, target: ContentId) -> Result<MutationPlan> {
         expected_head,
         before_view: live_view_id,
         target_view: target,
-        command: BString::from(format!("restore --view {target}")),
+        command,
         actions,
         changes,
     })
@@ -122,13 +134,27 @@ pub fn apply_with_hook(
     target: ContentId,
     hook: impl FnMut(Failpoint) -> Result<()>,
 ) -> Result<ContentId> {
+    apply_with_command_and_hook(
+        repo,
+        target,
+        BString::from(format!("restore --view {target}")),
+        hook,
+    )
+}
+
+pub(crate) fn apply_with_command_and_hook(
+    repo: &LocalRepository,
+    target: ContentId,
+    command: BString,
+    hook: impl FnMut(Failpoint) -> Result<()>,
+) -> Result<ContentId> {
     repo.import_external_changes()?;
-    let mutation_plan = plan(repo, target)?;
+    let mutation_plan = plan_with_command(repo, target, command)?;
     ensure_no_foreign_locks(repo.git_dir(), &mutation_plan.actions)?;
     transaction::run_with_hook(repo, &mutation_plan, hook)
 }
 
-fn ensure_no_foreign_locks(git_dir: &Path, actions: &[Action]) -> Result<()> {
+pub(crate) fn ensure_no_foreign_locks(git_dir: &Path, actions: &[Action]) -> Result<()> {
     let git_meta = CheckedRoot::open(git_dir)?;
     for action in actions {
         let lock_path: Option<BString> = match action {
@@ -214,7 +240,10 @@ fn verify_target_view(
     Ok(decoded)
 }
 
-fn decode_view_index_readonly(git_dir: &Path, view: &View) -> Result<Option<gix::index::State>> {
+pub(crate) fn decode_view_index_readonly(
+    git_dir: &Path,
+    view: &View,
+) -> Result<Option<gix::index::State>> {
     let Some(expected_id) = view.index else {
         return Ok(None);
     };
@@ -245,7 +274,7 @@ fn verify_target_files_eligible(
     Ok(())
 }
 
-struct IgnoreProfile {
+pub(crate) struct IgnoreProfile {
     search: gix::ignore::Search,
     tracked: BTreeSet<BString>,
     case: Case,
@@ -253,37 +282,24 @@ struct IgnoreProfile {
 
 impl IgnoreProfile {
     #[allow(clippy::too_many_arguments)]
-    fn for_target(
+    pub(crate) fn from_gitignore_blobs(
         git_dir: &Path,
         workdir: &Path,
         excludes_file: Option<std::path::PathBuf>,
         case: Case,
         index: Option<&gix::index::State>,
-        view: &View,
-        store: &RecoveryStore,
-        policy: CapturePolicy,
+        mut gitignores: Vec<(BString, Vec<u8>)>,
     ) -> Result<Self> {
         let mut buf = Vec::new();
         let mut search =
             gix::ignore::Search::from_git_dir(git_dir, excludes_file, &mut buf, Ignore::default())?;
-        let max_bytes = usize::try_from(policy.max_file_bytes)
-            .unwrap_or(usize::MAX)
-            .min(MAX_CAS_BYTES);
-        let mut gitignores: Vec<&crate::recovery::FileRecord> = view
-            .files
-            .iter()
-            .filter(|file| {
-                file.kind != FileKind::Symlink && is_gitignore_path(file.path.as_slice())
-            })
-            .collect();
         gitignores.sort_by(|left, right| {
-            component_count(left.path.as_slice())
-                .cmp(&component_count(right.path.as_slice()))
-                .then_with(|| left.path.cmp(&right.path))
+            component_count(left.0.as_slice())
+                .cmp(&component_count(right.0.as_slice()))
+                .then_with(|| left.0.cmp(&right.0))
         });
-        for file in gitignores {
-            let bytes = store.read_content_bounded(file.content, max_bytes)?;
-            let source = workdir.join(OsStr::from_bytes(file.path.as_slice()));
+        for (path, bytes) in gitignores {
+            let source = workdir.join(OsStr::from_bytes(path.as_slice()));
             search.add_patterns_buffer(&bytes, source, Some(workdir), Ignore::default());
         }
         Ok(Self {
@@ -294,7 +310,31 @@ impl IgnoreProfile {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn for_live(
+    pub(crate) fn for_target(
+        git_dir: &Path,
+        workdir: &Path,
+        excludes_file: Option<std::path::PathBuf>,
+        case: Case,
+        index: Option<&gix::index::State>,
+        view: &View,
+        store: &RecoveryStore,
+        policy: CapturePolicy,
+    ) -> Result<Self> {
+        let max_bytes = usize::try_from(policy.max_file_bytes)
+            .unwrap_or(usize::MAX)
+            .min(MAX_CAS_BYTES);
+        let mut gitignores = Vec::new();
+        for file in &view.files {
+            if file.kind != FileKind::Symlink && is_gitignore_path(file.path.as_slice()) {
+                let bytes = store.read_content_bounded(file.content, max_bytes)?;
+                gitignores.push((file.path.clone(), bytes));
+            }
+        }
+        Self::from_gitignore_blobs(git_dir, workdir, excludes_file, case, index, gitignores)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_live(
         git_dir: &Path,
         workdir: &Path,
         worktree: &CheckedRoot,
@@ -352,7 +392,7 @@ impl IgnoreProfile {
         Ok(profile)
     }
 
-    fn is_ignored(&self, path: &[u8], is_dir: bool) -> bool {
+    pub(crate) fn is_ignored(&self, path: &[u8], is_dir: bool) -> bool {
         if !is_dir && self.tracked.contains(path.as_bstr()) {
             return false;
         }
@@ -731,7 +771,7 @@ fn append_metadata_actions(actions: &mut Vec<Action>, live_view: &View, target_v
     }
 }
 
-fn file_map(view: &View) -> BTreeMap<BString, EntryState> {
+pub(crate) fn file_map(view: &View) -> BTreeMap<BString, EntryState> {
     view.files
         .iter()
         .map(|file| {
@@ -746,7 +786,9 @@ fn file_map(view: &View) -> BTreeMap<BString, EntryState> {
         .collect()
 }
 
-fn split_refs(refs: &[(BString, BString)]) -> (Option<BString>, BTreeMap<BString, BString>) {
+pub(crate) fn split_refs(
+    refs: &[(BString, BString)],
+) -> (Option<BString>, BTreeMap<BString, BString>) {
     let mut packed = None;
     let mut loose = BTreeMap::new();
     for (name, val) in refs {
@@ -759,7 +801,7 @@ fn split_refs(refs: &[(BString, BString)]) -> (Option<BString>, BTreeMap<BString
     (packed, loose)
 }
 
-fn tracked_set(index: Option<&gix::index::State>) -> BTreeSet<BString> {
+pub(crate) fn tracked_set(index: Option<&gix::index::State>) -> BTreeSet<BString> {
     let Some(index) = index else {
         return BTreeSet::new();
     };
@@ -782,7 +824,7 @@ fn tracked_ancestor_dirs(index: Option<&gix::index::State>) -> BTreeSet<BString>
     )
 }
 
-fn ancestor_dir_set<'a>(paths: impl IntoIterator<Item = &'a [u8]>) -> BTreeSet<BString> {
+pub(crate) fn ancestor_dir_set<'a>(paths: impl IntoIterator<Item = &'a [u8]>) -> BTreeSet<BString> {
     let mut dirs = BTreeSet::new();
     for path in paths {
         mark_ancestors(path, &mut dirs);
@@ -790,7 +832,7 @@ fn ancestor_dir_set<'a>(paths: impl IntoIterator<Item = &'a [u8]>) -> BTreeSet<B
     dirs
 }
 
-fn mark_ancestors(path: &[u8], out: &mut BTreeSet<BString>) {
+pub(crate) fn mark_ancestors(path: &[u8], out: &mut BTreeSet<BString>) {
     let mut cur = path;
     while let Some(slash) = cur.rfind_byte(b'/') {
         cur = &cur[..slash];
@@ -800,7 +842,7 @@ fn mark_ancestors(path: &[u8], out: &mut BTreeSet<BString>) {
     }
 }
 
-fn has_ancestor_in(path: &[u8], set: &BTreeSet<&[u8]>) -> bool {
+pub(crate) fn has_ancestor_in(path: &[u8], set: &BTreeSet<&[u8]>) -> bool {
     let mut cur = path;
     while let Some(slash) = cur.rfind_byte(b'/') {
         cur = &cur[..slash];
@@ -811,11 +853,11 @@ fn has_ancestor_in(path: &[u8], set: &BTreeSet<&[u8]>) -> bool {
     false
 }
 
-fn is_gitignore_path(path: &[u8]) -> bool {
+pub(crate) fn is_gitignore_path(path: &[u8]) -> bool {
     path == b".gitignore" || path.ends_with(b"/.gitignore")
 }
 
-fn join_rel(dir: &[u8], name: &[u8]) -> BString {
+pub(crate) fn join_rel(dir: &[u8], name: &[u8]) -> BString {
     if dir.is_empty() {
         BString::from(name)
     } else {
@@ -827,7 +869,7 @@ fn join_rel(dir: &[u8], name: &[u8]) -> BString {
     }
 }
 
-fn component_count(path: &[u8]) -> usize {
+pub(crate) fn component_count(path: &[u8]) -> usize {
     if path.is_empty() {
         0
     } else {

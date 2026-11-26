@@ -109,6 +109,17 @@ The fixture combines:
 - read-only `git2 recover --status` and pending `git2 oplog` on an interrupted layout without mutating `.git/git2/`;
 - pre-existing foreign `.git/index.lock` refusal and pending `--dry-run` reporting without writes.
 
+### Native reset and undo tests
+
+`crates/git2-core/tests/reset_undo.rs` verifies `reset` and `undo` against ordinary Git:
+
+- differential comparison against `git reset --soft|--mixed|--hard` (branch ref, detached `HEAD`, `HEAD~N`, local branches, and 40-hex commit IDs), verifying `git ls-files --stage -z`, `git status --porcelain=v1 -z`, `git fsck --full`, and unchanged `ORIG_HEAD` / reflogs;
+- Option A non-ignored untracked collision overwrite + `undo` recovery vs refusal of ignored obstructions and invalid revisions / submodule gitlinks / unborn branches;
+- full Milestone 6 recovery demo (staged vs worktree edit, deletion, executable bit, symlink, non-UTF-8 path, untracked file, ignored file → `reset --hard` → `git status` stat refresh + `git fsck --full` → `undo --dry-run` → `undo` restoring exact raw pre-reset index and bytes → `undo` redo);
+- semantic divergence checks plus refusal of `adopt`, `checkpoint`, and real `external-git` operations with `git2 restore --view` guidance.
+
+`crates/git2-cli/tests/reset_undo_cli.rs` verifies end-to-end CLI workflows and debug-only `GIT2_TEST_FAILPOINT` process kills and I/O rollback for both `git2 reset --hard` and `git2 undo`.
+
 ## Rules for new tests
 
 ### Use Git as the oracle

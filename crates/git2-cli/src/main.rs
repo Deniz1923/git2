@@ -12,12 +12,16 @@ use git2_core::recovery::{ContentId, OperationKind, RecoveryStore};
 #[cfg(unix)]
 use git2_core::repository::{AdoptOptions, LocalRepository};
 #[cfg(unix)]
+use git2_core::reset::{self, ResetMode, ResetOutcome};
+#[cfg(unix)]
 use git2_core::restore;
 use git2_core::store::ObjectStore;
 #[cfg(unix)]
 use git2_core::transaction::{
-    self, PendingPhase, RecoveryOutcome, RecoveryRepository, format_change_line,
+    self, Change, PendingPhase, RecoveryOutcome, RecoveryRepository, format_change_line,
 };
+#[cfg(unix)]
+use git2_core::undo::{self, UndoOutcome};
 #[cfg(all(unix, debug_assertions))]
 use git2_core::{Error, transaction::Failpoint};
 
@@ -53,6 +57,34 @@ enum Command {
         #[arg(long)]
         view: ContentId,
 
+        /// Preview changes without modifying Git state or recovery history.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Move HEAD (or the current branch), optionally resetting index and worktree paths.
+    #[cfg(unix)]
+    Reset {
+        /// Move only HEAD or the current branch without changing index or working tree.
+        #[arg(long, group = "mode")]
+        soft: bool,
+
+        /// Reset HEAD (or its branch) and the index without changing working tree (default).
+        #[arg(long, group = "mode")]
+        mixed: bool,
+
+        /// Reset HEAD (or its branch), index, and tracked working tree paths.
+        #[arg(long, group = "mode")]
+        hard: bool,
+
+        /// Commit target (`HEAD`, local branch, full commit ID, and optional `~N`).
+        #[arg(default_value = "HEAD")]
+        commit: String,
+    },
+
+    /// Undo the latest eligible completed git2 mutation (or undo an undo to redo).
+    #[cfg(unix)]
+    Undo {
         /// Preview changes without modifying Git state or recovery history.
         #[arg(long)]
         dry_run: bool,
@@ -125,6 +157,15 @@ fn main() -> anyhow::Result<()> {
         #[cfg(unix)]
         Command::Restore { view, dry_run } => run_restore(view, dry_run),
         #[cfg(unix)]
+        Command::Reset {
+            soft,
+            mixed,
+            hard,
+            commit,
+        } => run_reset(soft, mixed, hard, &commit),
+        #[cfg(unix)]
+        Command::Undo { dry_run } => run_undo(dry_run),
+        #[cfg(unix)]
         Command::Recover { status, rollback } => run_recover(status, rollback),
         #[cfg(unix)]
         Command::Oplog => run_oplog(),
@@ -188,7 +229,7 @@ fn run_status(nul: bool) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn run_restore(view: ContentId, dry_run: bool) -> anyhow::Result<()> {
+fn ensure_no_pending() -> anyhow::Result<()> {
     if let Ok(recovery) = RecoveryRepository::open(".")
         && let Some(summary) =
             transaction::pending(&recovery).context("could not inspect pending transaction")?
@@ -200,24 +241,77 @@ fn run_restore(view: ContentId, dry_run: bool) -> anyhow::Result<()> {
             String::from_utf8_lossy(summary.command.as_ref()),
         );
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn print_preview_changes(changes: &[Change]) {
+    if changes.is_empty() {
+        println!("no changes");
+    } else {
+        for change in changes {
+            println!("{}", format_change_line(change));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_restore(view: ContentId, dry_run: bool) -> anyhow::Result<()> {
+    ensure_no_pending()?;
     let repository =
         LocalRepository::discover(".").context("could not open this supported Git repository")?;
     if dry_run {
         let plan = restore::plan(&repository, view)
             .with_context(|| format!("could not plan restore to view {view}"))?;
-        if plan.changes().is_empty() {
-            println!("no changes");
-        } else {
-            for change in plan.changes() {
-                println!("{}", format_change_line(change));
-            }
-        }
+        print_preview_changes(plan.changes());
         return Ok(());
     }
 
     let operation_id = run_restore_apply(&repository, view)
         .with_context(|| format!("could not restore view {view}"))?;
     println!("restored view {view} as operation {operation_id}");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_reset(soft: bool, _mixed: bool, hard: bool, commit: &str) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let mode = if soft {
+        ResetMode::Soft
+    } else if hard {
+        ResetMode::Hard
+    } else {
+        ResetMode::Mixed
+    };
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    let outcome = run_reset_apply(&repository, mode, commit)
+        .with_context(|| format!("could not reset ({}) to {commit}", mode.as_str()))?;
+    println!(
+        "reset ({}) to {} at view {} as operation {}",
+        mode.as_str(),
+        outcome.target_commit,
+        outcome.after_view,
+        outcome.operation_id
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_undo(dry_run: bool) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    if dry_run {
+        let plan = undo::plan(&repository).context("could not plan undo")?;
+        print_preview_changes(plan.changes());
+        return Ok(());
+    }
+    let outcome = run_undo_apply(&repository).context("could not undo latest operation")?;
+    println!(
+        "undid operation to view {} as operation {}",
+        outcome.restored_view, outcome.operation_id
+    );
     Ok(())
 }
 
@@ -235,6 +329,34 @@ fn run_restore_apply(
     view: ContentId,
 ) -> git2_core::Result<ContentId> {
     restore::apply(repository, view)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_reset_apply(
+    repository: &LocalRepository,
+    mode: ResetMode,
+    commit: &str,
+) -> git2_core::Result<ResetOutcome> {
+    reset::apply_with_hook(repository, mode, commit, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_reset_apply(
+    repository: &LocalRepository,
+    mode: ResetMode,
+    commit: &str,
+) -> git2_core::Result<ResetOutcome> {
+    reset::apply(repository, mode, commit)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_undo_apply(repository: &LocalRepository) -> git2_core::Result<UndoOutcome> {
+    undo::apply_with_hook(repository, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_undo_apply(repository: &LocalRepository) -> git2_core::Result<UndoOutcome> {
+    undo::apply(repository)
 }
 
 #[cfg(unix)]

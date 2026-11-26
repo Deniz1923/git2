@@ -21,6 +21,7 @@ All notable project changes are recorded here. The project has not made a suppor
 - `git2 checkpoint`, and private retention of Git objects needed by new captured views.
 - Internal 4-phase pending-transaction journal (`Prepared`, `Applying`, `Finalizing`, `Committed`), 11 checked primitive worktree/metadata actions, staged-inode Git lock attribution, idempotent startup reconciliation/rollback, and real child process-kill crash tests.
 - `git2 restore --view <id> [--dry-run]`, `git2 recover [--status | --rollback]`, pending-aware full-64-hex `git2 oplog`, dual current/target ignore-profile planning, pruned Git object rehydration, file/directory and ref D/F swap support, and core/CLI restore crash-recovery test suites.
+- Native `git2 reset [--soft | --mixed | --hard]` (resolving `HEAD`, local branches, full 40-hex commit IDs, and bounded `~N` up to 10,000 steps) and `git2 undo [--dry-run]` / redo with semantic index comparison across stat-cache refreshes, plus full core and CLI crash-recovery tests.
 - Product, architecture, compatibility, CLI, format, roadmap, testing, development, contribution, and security documentation.
 
 ### Changed
@@ -41,6 +42,6 @@ All notable project changes are recorded here. The project has not made a suppor
 
 ### Known limitations
 
-- No native `reset`, `undo`, `add`, `commit`, or `log` CLI command yet.
+- No native `add`, `commit`, or `log` CLI command yet.
 - No networking or cross-platform recovery support.
 - Still experimental and not recommended for important repositories.

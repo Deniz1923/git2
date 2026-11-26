@@ -2,7 +2,8 @@
 //!
 //! The crate is private to the git2 workspace. Its interfaces can evolve before 1.0, but its
 //! on-disk Git writes must always remain compatible with ordinary Git. Recovery views can be
-//! captured, inspected, and restored, while native `add`/`commit`/`reset`/`undo` follow next.
+//! captured, inspected, and restored, with native `reset` and `undo` building on the same
+//! verified journal before `add` and `commit`.
 
 pub mod object;
 #[cfg(unix)]
@@ -12,6 +13,8 @@ pub mod recovery;
 #[cfg(unix)]
 pub mod repository;
 #[cfg(unix)]
+pub mod reset;
+#[cfg(unix)]
 pub mod restore;
 #[cfg(unix)]
 pub mod retention;
@@ -20,6 +23,8 @@ pub mod status;
 pub mod store;
 #[cfg(unix)]
 pub mod transaction;
+#[cfg(unix)]
+pub mod undo;
 
 /// Errors returned by the local repository core.
 #[derive(Debug, thiserror::Error)]
