@@ -40,11 +40,26 @@ pub(crate) fn retain_roots(
     objects: &ObjectStore,
     roots: impl IntoIterator<Item = Root>,
 ) -> Result<Vec<RetainedObject>> {
+    walk_objects(objects, roots, |bytes| store.put_content(bytes))
+}
+
+pub(crate) fn compute_roots_readonly(
+    objects: &ObjectStore,
+    roots: impl IntoIterator<Item = Root>,
+) -> Result<Vec<RetainedObject>> {
+    walk_objects(objects, roots, |bytes| Ok(ContentId::for_bytes(bytes)))
+}
+
+fn walk_objects(
+    objects: &ObjectStore,
+    roots: impl IntoIterator<Item = Root>,
+    mut persist: impl FnMut(&[u8]) -> Result<ContentId>,
+) -> Result<Vec<RetainedObject>> {
     let mut reader = objects.bounded_reader(MAX_OBJECT_BYTES)?;
     walk(roots, |id, graph| {
         let object = reader.read(id)?;
         graph.visit(id, object.kind, &object.data)?;
-        let content = store.put_content(&object.canonical_bytes())?;
+        let content = persist(&object.canonical_bytes())?;
         Ok((object.kind, content))
     })
 }

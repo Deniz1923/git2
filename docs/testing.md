@@ -82,14 +82,32 @@ The fixture combines:
 - pruned Git object rehydration, checked directory/worktree/index/ref mutations, `git fsck --full`, and clean `pending/` / lock cleanup;
 - injected `Error::Io` rollback verification and corrupt/truncated/missing `pending` refusal tests.
 
-### CLI integration tests
+### Restore planning and execution tests
+
+`crates/git2-core/tests/restore.rs` tests verified view restoration against ordinary Git:
+
+- read-only `--dry-run` planning with single-line byte-safe path escaping (including newlines and invalid UTF-8) and zero writes or history changes;
+- refusal without writes on ignored children blocking directory replacement, missing/corrupt CAS payloads, differing ignored files, and ambiguous ignored-to-untracked rule transitions;
+- dual current/target ignore-profile evaluation across `.gitignore` changes and force-tracked-to-ignored / identical-ignored-to-tracked reclassifications;
+- end-to-end byte-level round trips after `git gc --prune=now` deletes staged-only blobs, packed-ref targets, and loose branch targets, verifying `git fsck --full` and intact ignored files;
+- file ↔ directory worktree swaps and loose-ref directory/file (`topic` ↔ `topic/sub`) swaps.
+
+### CLI integration and crash-recovery tests
 
 `crates/git2-cli/tests/cli.rs` launches the built binary and verifies:
 
-- adoption creates a baseline;
-- operation history imports an external edit;
-- repeat adoption is refused;
+- adoption creates a baseline and `oplog` emits full 64-character view IDs;
+- `restore --dry-run`, `restore`, and clean `recover --status` work end to end;
+- repeat adoption and legacy format 1/2 stores are refused;
 - debug object hashing matches Git.
+
+`crates/git2-cli/tests/crash_recovery.rs` exercises the built `git2` binary with debug-only `GIT2_TEST_FAILPOINT` (`abort:*` and `io:*`) injection:
+
+- interruption mid-swap during directory replacement recovered via `git2 recover` and verified with `git fsck --full`;
+- double crash (`after_head_selection` and `recover_after_head_selection`) resolving idempotently with one `oplog` restore entry;
+- injected post-mutation I/O error rolled back cleanly via `git2 recover --rollback`;
+- read-only `git2 recover --status` and pending `git2 oplog` on an interrupted layout without mutating `.git/git2/`;
+- pre-existing foreign `.git/index.lock` refusal and pending `--dry-run` reporting without writes.
 
 ## Rules for new tests
 

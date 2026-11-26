@@ -271,6 +271,66 @@ impl LocalRepository {
         Ok(self.persist_draft(store, draft)?.view_id)
     }
 
+    /// Compute the canonical [`ContentId`] of the current live repository view without
+    /// acquiring the recovery lock or writing to `.git/git2/`.
+    pub(crate) fn compute_live_view_readonly(&self, policy: AdoptOptions) -> Result<ContentId> {
+        Ok(self.capture_live_view_readonly(policy)?.0)
+    }
+
+    /// Compute both the canonical [`ContentId`] and in-memory [`View`] of the current live
+    /// repository without acquiring the recovery lock or writing to `.git/git2/`.
+    pub(crate) fn capture_live_view_readonly(
+        &self,
+        policy: AdoptOptions,
+    ) -> Result<(ContentId, View)> {
+        let draft = self.capture_draft(policy)?;
+        let objects = ObjectStore::from_repository(self.inner.clone())?;
+        let retained = retention::compute_roots_readonly(&objects, draft.roots.iter().copied())?;
+        check_view_size(
+            draft.head.len(),
+            &draft.refs,
+            draft.index.is_some(),
+            draft.files.iter().map(|file| file.path.len()),
+            retained.len(),
+        )?;
+        let (view, _, _) = draft_to_view(draft, retained, |bytes| Ok(ContentId::for_bytes(bytes)))?;
+        let id = ContentId::for_bytes(&view.encode()?);
+        Ok((id, view))
+    }
+
+    pub(crate) fn global_excludes_file(&self) -> Result<Option<std::path::PathBuf>> {
+        let config = self.inner.config_snapshot();
+        if let Some(configured) = config.trusted_path("core.excludesFile") {
+            let path = configured.map_err(|error| Error::Gix(error.to_string()))?;
+            return Ok(Some(path.into_owned()));
+        }
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+            && !xdg.is_empty()
+        {
+            return Ok(Some(
+                std::path::PathBuf::from(xdg).join("git").join("ignore"),
+            ));
+        }
+        if let Some(home) = std::env::var_os("HOME")
+            && !home.is_empty()
+        {
+            return Ok(Some(
+                std::path::PathBuf::from(home)
+                    .join(".config")
+                    .join("git")
+                    .join("ignore"),
+            ));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn ignore_case(&self) -> bool {
+        self.inner
+            .config_snapshot()
+            .boolean("core.ignoreCase")
+            .unwrap_or(false)
+    }
+
     fn capture_draft(&self, options: AdoptOptions) -> Result<ViewDraft> {
         let metadata = CheckedRoot::open(&self.git_dir)?;
         let head = read_metadata(&metadata, b"HEAD", MAX_FIELD_BYTES)?
@@ -433,11 +493,21 @@ fn persist_draft(
     draft: ViewDraft,
     retained_objects: Vec<crate::recovery::RetainedObject>,
 ) -> Result<PersistedDraft> {
-    let index = draft
-        .index
-        .as_deref()
-        .map(|bytes| store.put_content(bytes))
-        .transpose()?;
+    let (view, file_count, content_bytes) =
+        draft_to_view(draft, retained_objects, |bytes| store.put_content(bytes))?;
+    Ok(PersistedDraft {
+        view_id: store.put_view(&view)?,
+        file_count,
+        content_bytes,
+    })
+}
+
+fn draft_to_view(
+    draft: ViewDraft,
+    retained_objects: Vec<crate::recovery::RetainedObject>,
+    mut persist: impl FnMut(&[u8]) -> Result<ContentId>,
+) -> Result<(View, usize, u64)> {
+    let index = draft.index.as_deref().map(&mut persist).transpose()?;
     let mut files = Vec::with_capacity(draft.files.len());
     let mut content_bytes = 0_u64;
     for file in draft.files {
@@ -445,7 +515,7 @@ fn persist_draft(
         files.push(FileRecord {
             path: file.path,
             kind: file.kind,
-            content: store.put_content(&file.bytes)?,
+            content: persist(&file.bytes)?,
         });
     }
     let file_count = files.len();
@@ -456,11 +526,7 @@ fn persist_draft(
         files,
         retained_objects,
     };
-    Ok(PersistedDraft {
-        view_id: store.put_view(&view)?,
-        file_count,
-        content_bytes,
-    })
+    Ok((view, file_count, content_bytes))
 }
 
 pub(crate) fn current_timestamp_seconds() -> i64 {

@@ -8,10 +8,18 @@ use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use git2_core::object::{GitOid, ObjectKind, hash_object};
 #[cfg(unix)]
-use git2_core::recovery::{OperationKind, RecoveryStore};
+use git2_core::recovery::{ContentId, OperationKind, RecoveryStore};
 #[cfg(unix)]
 use git2_core::repository::{AdoptOptions, LocalRepository};
+#[cfg(unix)]
+use git2_core::restore;
 use git2_core::store::ObjectStore;
+#[cfg(unix)]
+use git2_core::transaction::{
+    self, PendingPhase, RecoveryOutcome, RecoveryRepository, format_change_line,
+};
+#[cfg(all(unix, debug_assertions))]
+use git2_core::{Error, transaction::Failpoint};
 
 #[cfg(unix)]
 const WARN_STORE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -37,6 +45,30 @@ enum Command {
     /// Save an explicit checkpoint of an adopted repository.
     #[cfg(unix)]
     Checkpoint,
+
+    /// Preview or restore a previously recorded recovery view.
+    #[cfg(unix)]
+    Restore {
+        /// Full 64-character recovery view identifier.
+        #[arg(long)]
+        view: ContentId,
+
+        /// Preview changes without modifying Git state or recovery history.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Inspect, reconcile, or roll back an interrupted pending transaction.
+    #[cfg(unix)]
+    Recover {
+        /// Inspect pending transaction status without modifying anything.
+        #[arg(long, conflicts_with = "rollback")]
+        status: bool,
+
+        /// Roll back an un-selected pending transaction to its pre-operation view.
+        #[arg(long, conflicts_with = "status")]
+        rollback: bool,
+    },
 
     /// Show the immutable local operation history, newest first.
     #[cfg(unix)]
@@ -90,6 +122,10 @@ fn main() -> anyhow::Result<()> {
         Command::Adopt { max_file_mib } => run_adopt(max_file_mib),
         #[cfg(unix)]
         Command::Checkpoint => run_checkpoint(),
+        #[cfg(unix)]
+        Command::Restore { view, dry_run } => run_restore(view, dry_run),
+        #[cfg(unix)]
+        Command::Recover { status, rollback } => run_recover(status, rollback),
         #[cfg(unix)]
         Command::Oplog => run_oplog(),
         #[cfg(unix)]
@@ -152,13 +188,144 @@ fn run_status(nul: bool) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn run_oplog() -> anyhow::Result<()> {
+fn run_restore(view: ContentId, dry_run: bool) -> anyhow::Result<()> {
+    if let Ok(recovery) = RecoveryRepository::open(".")
+        && let Some(summary) =
+            transaction::pending(&recovery).context("could not inspect pending transaction")?
+    {
+        bail!(
+            "a pending transaction {} ({}) exists for {}; run `git2 recover --status`, `git2 recover`, or `git2 recover --rollback` first",
+            summary.tx_id,
+            phase_label(summary.phase),
+            String::from_utf8_lossy(summary.command.as_ref()),
+        );
+    }
     let repository =
         LocalRepository::discover(".").context("could not open this supported Git repository")?;
-    repository
-        .import_external_changes()
-        .context("could not import changes made outside git2")?;
-    let store = RecoveryStore::open(repository.git_dir()).context("repository is not adopted")?;
+    if dry_run {
+        let plan = restore::plan(&repository, view)
+            .with_context(|| format!("could not plan restore to view {view}"))?;
+        if plan.changes().is_empty() {
+            println!("no changes");
+        } else {
+            for change in plan.changes() {
+                println!("{}", format_change_line(change));
+            }
+        }
+        return Ok(());
+    }
+
+    let operation_id = run_restore_apply(&repository, view)
+        .with_context(|| format!("could not restore view {view}"))?;
+    println!("restored view {view} as operation {operation_id}");
+    Ok(())
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_restore_apply(
+    repository: &LocalRepository,
+    view: ContentId,
+) -> git2_core::Result<ContentId> {
+    restore::apply_with_hook(repository, view, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_restore_apply(
+    repository: &LocalRepository,
+    view: ContentId,
+) -> git2_core::Result<ContentId> {
+    restore::apply(repository, view)
+}
+
+#[cfg(unix)]
+fn run_recover(status: bool, rollback: bool) -> anyhow::Result<()> {
+    let recovery = RecoveryRepository::open(".").context("repository is not adopted")?;
+    if status {
+        let Some(summary) =
+            transaction::pending(&recovery).context("could not inspect pending transaction")?
+        else {
+            println!("no pending transaction");
+            return Ok(());
+        };
+        println!("pending transaction {}", summary.tx_id);
+        println!("phase: {}", phase_label(summary.phase));
+        println!(
+            "command: {}",
+            String::from_utf8_lossy(summary.command.as_ref())
+        );
+        println!("before view: {}", summary.before_view);
+        println!("target view: {}", summary.target_view);
+        println!(
+            "progress: {}/{}",
+            summary.next_action, summary.total_actions
+        );
+        println!("operation: {}", summary.operation_id);
+        return Ok(());
+    }
+
+    let outcome = if rollback {
+        transaction::rollback(&recovery).context("could not roll back pending transaction")?
+    } else {
+        run_transaction_recover(&recovery).context("could not recover pending transaction")?
+    };
+    match outcome {
+        RecoveryOutcome::Clean => println!("no pending transaction"),
+        RecoveryOutcome::Aborted { before_view } => {
+            println!("aborted unapplied transaction; pre-operation view {before_view} intact");
+        }
+        RecoveryOutcome::RolledBack { before_view } => {
+            println!("rolled back pending transaction to pre-operation view {before_view}");
+        }
+        RecoveryOutcome::Finalized {
+            operation_id,
+            after_view,
+        } => {
+            println!("recovered operation {operation_id} at view {after_view}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_transaction_recover(recovery: &RecoveryRepository) -> git2_core::Result<RecoveryOutcome> {
+    transaction::recover_with_hook(recovery, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_transaction_recover(recovery: &RecoveryRepository) -> git2_core::Result<RecoveryOutcome> {
+    transaction::recover(recovery)
+}
+
+#[cfg(unix)]
+const fn phase_label(phase: PendingPhase) -> &'static str {
+    match phase {
+        PendingPhase::Prepared => "prepared",
+        PendingPhase::Applying => "applying",
+        PendingPhase::Finalizing => "finalizing",
+        PendingPhase::Committed => "committed",
+    }
+}
+
+#[cfg(unix)]
+fn run_oplog() -> anyhow::Result<()> {
+    let recovery = RecoveryRepository::open(".").context("repository is not adopted")?;
+    let store = if let Some(summary) =
+        transaction::pending(&recovery).context("could not inspect pending transaction")?
+    {
+        eprintln!(
+            "warning: pending transaction {} ({}); showing last durable history",
+            summary.tx_id,
+            phase_label(summary.phase)
+        );
+        recovery.store().clone()
+    } else {
+        let repository = LocalRepository::discover(".")
+            .context("could not open this supported Git repository")?;
+        repository
+            .import_external_changes()
+            .context("could not import changes made outside git2")?;
+        RecoveryStore::open(repository.git_dir()).context("repository is not adopted")?
+    };
     let mut id = Some(store.head().context("recovery history has no HEAD")?);
     while let Some(operation_id) = id {
         let operation = store
@@ -172,16 +339,67 @@ fn run_oplog() -> anyhow::Result<()> {
             }
         };
         println!(
-            "{} {} {} {} -> {}",
-            &operation_id.to_hex()[..12],
-            operation.timestamp_seconds,
-            kind,
-            &operation.before.to_hex()[..12],
-            &operation.after.to_hex()[..12]
+            "{operation_id} {} {kind} {} -> {}",
+            operation.timestamp_seconds, operation.before, operation.after
         );
         id = operation.parent;
     }
     Ok(())
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn test_failpoint_hook() -> impl FnMut(Failpoint) -> git2_core::Result<()> {
+    let spec = std::env::var("GIT2_TEST_FAILPOINT").ok();
+    move |fp| {
+        let Some(raw) = spec.as_deref() else {
+            return Ok(());
+        };
+        let (mode, tag) = if let Some(tag) = raw.strip_prefix("abort:") {
+            ("abort", tag)
+        } else if let Some(tag) = raw.strip_prefix("io:") {
+            ("io", tag)
+        } else {
+            return Ok(());
+        };
+        if failpoint_matches(tag, fp) {
+            match mode {
+                "abort" => std::process::abort(),
+                "io" => {
+                    return Err(Error::Io(io::Error::other(format!(
+                        "injected failpoint {tag}"
+                    ))));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn failpoint_matches(tag: &str, fp: Failpoint) -> bool {
+    match fp {
+        Failpoint::BeforePendingWrite => tag == "before_pending_write",
+        Failpoint::AfterPrepare => tag == "after_prepare",
+        Failpoint::BeforeLockPublish(idx) => {
+            tag.strip_prefix("before_lock_publish:") == Some(idx.to_string().as_str())
+        }
+        Failpoint::AfterLockPublish(idx) => {
+            tag.strip_prefix("after_lock_publish:") == Some(idx.to_string().as_str())
+        }
+        Failpoint::BeforeAction(idx) => {
+            tag.strip_prefix("before_action:") == Some(idx.to_string().as_str())
+        }
+        Failpoint::AfterAction(idx) => {
+            tag.strip_prefix("after_action:") == Some(idx.to_string().as_str())
+        }
+        Failpoint::BeforeFinalize => tag == "before_finalize",
+        Failpoint::AfterOperationWrite => tag == "after_operation_write",
+        Failpoint::AfterHeadSelection => tag == "after_head_selection",
+        Failpoint::BeforePendingCleanup => tag == "before_pending_cleanup",
+        Failpoint::RecoverAfterOperationWrite => tag == "recover_after_operation_write",
+        Failpoint::RecoverAfterHeadSelection => tag == "recover_after_head_selection",
+    }
 }
 
 fn run_debug(command: DebugCommand) -> anyhow::Result<()> {

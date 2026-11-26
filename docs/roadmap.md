@@ -33,13 +33,13 @@ At that pace, the remaining v0.1 work is roughly 22–32 focused weeks, or about
 | 2. Adoption and immutable history | Done | Zlib-compressed format 3 CAS, views, operations, lock, external import, object retention, explicit checkpoint |
 | 3. Status | Done | Differential two-column porcelain and `-z` output |
 | 4. Mutation transaction foundation | Done | 4-phase constrained-action journal, staged-inode lock attribution, and child process-kill proof |
-| 5. Restore planning, apply, and recovery | Planned | Next milestone; `restore --view [--dry-run]`, `recover [--status]`, read-only pending `oplog` |
-| 6. Native reset and non-destructive undo proof | Planned | `reset`, semantic-index `undo`/redo, interruption tests + **stop/review gate** |
+| 5. Restore planning, apply, and recovery | Done | `restore --view [--dry-run]`, `recover [--status \| --rollback]`, pending read-only full-hex `oplog`, dual ignore profiles, pruned-object rehydration, CLI crash tests |
+| 6. Native reset and non-destructive undo proof | Planned | Next milestone; `reset`, semantic-index `undo`/redo, interruption tests + **stop/review gate** |
 | 7. Git-style staging | Planned | `git2 add` (literal paths, `--all`, built-in EOL) after post-proof review gate |
 | 8. Commit and history | Planned | `commit -m` and bounded first-parent `log` |
 | 9. Status completion, docs, and experimental v0.1 release | Planned | Complete supported status matrix, Linux CI, mirror-push privacy check, demo, package, checksums |
 
-Explicit `git2 checkpoint` capture, Git object retention, and zlib-compressed format 3 CAS are done under Milestone 2, and the internal 4-phase pending-transaction foundation is done under Milestone 4. No user-facing mutating CLI commands (`restore`, `reset`, `undo`, `add`, `commit`) ship yet: Milestone 5 is the next planned milestone. After Milestone 6 proves `reset --hard` → `undo` → `redo` end to end under process-kill testing, the plan pauses at an explicit review gate before starting Milestones 7–9.
+Explicit `git2 checkpoint` capture, Git object retention, zlib-compressed format 3 CAS, the 4-phase pending-transaction foundation, `git2 restore --view [--dry-run]`, and `git2 recover [--status | --rollback]` are implemented under Milestones 2, 4, and 5. Milestone 6 (`reset` and semantic-index `undo`) is the next planned milestone; after Milestone 6 proves `reset --hard` → `undo` → `redo` end to end under process-kill testing, the plan pauses at an explicit review gate before starting Milestones 7–9.
 
 ## Milestone 0 — repository rescue
 
@@ -171,40 +171,35 @@ Exit criteria met:
 
 ## Milestone 5 — restore planning, apply, and recovery
 
-**Status: Planned — next milestone**
-
-Estimated effort: 3–5 focused weeks after Milestone 4.
+**Status: Done**
 
 Commands:
 
 ```text
 git2 restore --view <recovery-id> --dry-run
 git2 restore --view <recovery-id>
-git2 recover [--status]
+git2 recover [--status | --rollback]
 ```
 
-Deliverables:
+Delivered:
 
-- verify every target operation/view/CAS record and retained Git object before mutation;
-- rehydrate missing required Git objects before publishing refs or index;
-- evaluate both current and target ignore rules (including planned `.gitignore` changes) and refuse ignored-child directory obstructions before writing;
-- display a byte-safe `--dry-run` plan for HEAD, refs, index, and worktree creates/replacements/removals without modifying Git state or sidecar history;
-- snapshot current state before restore and write files without following symlinks or escaping the worktree;
-- preserve ignored files and make multi-path restore restartable through pending phases;
-- expose `git2 recover [--status]` and read-only `git2 oplog` when a transaction is pending;
-- append `git2:restore` operations.
+- read-only verified restore planner (`restore::plan`, `MutationPlan::changes`) with single-line byte-safe `--dry-run` preview and zero sidecar writes or lock acquisition;
+- full target view, CAS payload, and retained Git object closure verification up front, rehydrating pruned objects before publishing refs or index;
+- dual current/target ignore-profile evaluation (`gix::ignore::Search` over global/XDG excludes, `.git/info/exclude`, and live/target `.gitignore`) refusing ignored-child directory obstructions and ambiguous ignored-to-untracked transitions before writes while allowing safe non-destructive reclassifications;
+- file ↔ directory worktree swaps, loose-ref D/F swaps with empty ancestor ref directory pruning, and pre-existing foreign lock refusal;
+- `git2 recover [--status | --rollback]` and pending-aware read-only `git2 oplog` emitting full 64-hex IDs, plus `crates/git2-core/tests/restore.rs` and `crates/git2-cli/tests/crash_recovery.rs`.
 
-Exit criteria:
+Exit criteria met:
 
-- restoring a captured view after `git gc` rehydrates staged-only and shadowed objects and reproduces modeled bytes, modes, symlinks, refs, HEAD, and raw index exactly;
+- restoring a captured view after `git gc --prune=now` rehydrates staged-only and shadowed objects and reproduces modeled bytes, modes, symlinks, refs, HEAD, and raw index exactly;
 - extra eligible files are removed while ignored files remain untouched;
 - non-UTF-8 paths, symlinks, executable bits, and deleted tracked paths round-trip;
-- restore interruption at every durable or destructive boundary reconciles cleanly without manual repair;
+- restore interruption at durable and destructive boundaries reconciles cleanly without manual repair;
 - traversal and symlink-attack tests cannot write outside the worktree.
 
 ## Milestone 6 — native reset and non-destructive undo proof (review gate)
 
-**Status: Planned**
+**Status: Planned — next milestone**
 
 Estimated effort: 3–5 focused weeks after Milestone 5.
 

@@ -5,7 +5,7 @@
 The project uses ordinary Git repositories as its interchange format. It adds a private, clone-local operation history under `.git/git2/` and is being developed as a learning-first, portfolio-grade implementation of Git’s local mechanics.
 
 > [!WARNING]
-> git2 is not ready for important repositories. It can capture and inspect recovery history, including explicit checkpoints, but restore and undo are not implemented yet. A snapshot that cannot yet be restored is not a backup.
+> git2 is experimental and not ready for important repositories. It can capture baselines and checkpoints, preview and apply verified view restores (`restore --view`), and reconcile or roll back interrupted transactions (`recover`), while native `reset`, `undo`, `add`, and `commit` are not implemented yet.
 
 ## Current status
 
@@ -17,7 +17,8 @@ The project uses ordinary Git repositories as its interchange format. It adds a 
 | Recovery storage | Implemented | Immutable SHA-256 zlib-compressed CAS (format 3), views, operations, integrity checks, and advisory lock |
 | External Git import | Implemented | `status` and `oplog` record changed state as `external-git` operations |
 | Status | Implemented | Two-column porcelain output; `-z` is byte-safe |
-| Transaction journal & restore/undo | Not implemented | Next milestones (`recover`, `restore`, `reset`, `undo`) |
+| Transaction journal & restore | Implemented | 4-phase pending journal, `restore --view [--dry-run]`, and `recover [--status \| --rollback]` |
+| Reset and undo | Not implemented | Next milestone (`reset`, semantic-index `undo`/redo + review gate) |
 | Staging and commits | Not implemented | Follows the verified recovery proof (`add`, `commit`, `log`) |
 | Networking | Not implemented | Deferred until the local safety model works |
 
@@ -32,7 +33,7 @@ Git already has reflogs and recoverable objects, but recovery is fragmented acro
 3. Record the before/after transition in an immutable local operation log.
 4. Let the user restore an earlier view without rewriting or deleting that history.
 
-The current build proves steps of the storage and observation model. It does not yet prove steps 2–4 end to end.
+The current build implements the storage, observation, pending-transaction journal, verified `restore --view`, and `recover` flows; native `reset` and `undo` follow next.
 
 ## Supported environment
 
@@ -81,12 +82,13 @@ printf 'changed\n' > hello.txt
 
 `status` or `oplog` notices the change made outside git2 and appends one `external-git` operation. Repeating the command without another state change does not append duplicate history.
 
-`checkpoint` explicitly saves the current state of an adopted repository and prints the full 64-hex recovery view ID. A changed state appends one `git2:checkpoint` operation; an unchanged state returns the same view and appends nothing. git2 does not monitor ordinary Git in the background, so a checkpoint captures the state at the moment you run it. Captures retain the Git objects currently reachable from the saved refs, HEAD, and index, but this is not a backup and does not make restore available.
+`checkpoint` explicitly saves the current state of an adopted repository and prints the full 64-hex recovery view ID. A changed state appends one `git2:checkpoint` operation; an unchanged state returns the same view and appends nothing. git2 does not monitor ordinary Git in the background, so a checkpoint captures the state at the moment you run it. Captures retain the Git objects currently reachable from the saved refs, HEAD, and index, and saved views can be previewed with `git2 restore --view <id> --dry-run` and applied with `git2 restore --view <id>`.
 
 ```sh
 printf 'checked point\n' > hello.txt
 /path/to/git2 checkpoint
 /path/to/git2 oplog
+/path/to/git2 restore --view <64-hex-view-id> --dry-run
 ```
 
 ## Implemented commands
@@ -94,6 +96,8 @@ printf 'checked point\n' > hello.txt
 ```text
 git2 adopt [--max-file-mib <MiB>]
 git2 checkpoint
+git2 restore --view <64-hex-view-id> [--dry-run]
+git2 recover [--status | --rollback]
 git2 status [-z|--nul]
 git2 oplog
 git2 debug hash-object [--stdin | <path>]

@@ -20,6 +20,7 @@ All notable project changes are recorded here. The project has not made a suppor
 - Format 3 recovery storage with zlib-compressed CAS payloads, persisted capture limits, owner-private access, and bounded record encoding and reads.
 - `git2 checkpoint`, and private retention of Git objects needed by new captured views.
 - Internal 4-phase pending-transaction journal (`Prepared`, `Applying`, `Finalizing`, `Committed`), 11 checked primitive worktree/metadata actions, staged-inode Git lock attribution, idempotent startup reconciliation/rollback, and real child process-kill crash tests.
+- `git2 restore --view <id> [--dry-run]`, `git2 recover [--status | --rollback]`, pending-aware full-64-hex `git2 oplog`, dual current/target ignore-profile planning, pruned Git object rehydration, file/directory and ref D/F swap support, and core/CLI restore crash-recovery test suites.
 - Product, architecture, compatibility, CLI, format, roadmap, testing, development, contribution, and security documentation.
 
 ### Changed
@@ -40,6 +41,6 @@ All notable project changes are recorded here. The project has not made a suppor
 
 ### Known limitations
 
-- No staging, commit, reset, restore, recover, or undo CLI command yet.
+- No native `reset`, `undo`, `add`, `commit`, or `log` CLI command yet.
 - No networking or cross-platform recovery support.
-- Captured recovery views are not yet restorable via CLI.
+- Still experimental and not recommended for important repositories.

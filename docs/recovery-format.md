@@ -2,7 +2,7 @@
 
 ## Status and compatibility
 
-The recovery sidecar format is currently version 3 and is experimental. Format 1 and format 2 stores are refused in place; git2 does not migrate, delete, or overwrite them. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. Neither old snapshots nor current captures are a backup or restorable via CLI yet. `git2 checkpoint` is an explicit capture, not a restore or backup operation; the internal 4-phase pending-transaction journal exists and is crash-tested, while user-facing mutating CLI commands (`restore`, `recover`, `reset`, `undo`) remain unexposed until Milestone 5+.
+The recovery sidecar format is currently version 3 and is experimental. Format 1 and format 2 stores are refused in place; git2 does not migrate, delete, or overwrite them. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. `git2 restore --view <id>` (with `--dry-run` preview) and `git2 recover [--status | --rollback]` execute restore and pending-journal reconciliation over format 3 stores, while `git2 reset` and `git2 undo` remain unexposed until Milestone 6+.
 
 The reader also refuses unknown top-level versions. Any incompatible change must increment that version and update this document and fixtures. Format 3 keeps the format 2 binary view, operation, and policy record layouts intact and adds RFC 1950 zlib compression to on-disk `cas/` entries. git2 does not monitor ordinary Git in the background.
 
@@ -199,7 +199,7 @@ Ref records contain paths relative to the Git directory, such as `refs/heads/mai
 
 File records are generated from a path-sorted map. Paths use `/` separators in Git/index form and are interpreted as Unix bytes by the current repository implementation.
 
-The retained-object map is ordered by strictly increasing Git object ID, so duplicates are invalid. It is populated by adoption, automatic imports, and explicit checkpoints with the Git object closure described below. A format 3 view does not yet prove restore is possible.
+The retained-object map is ordered by strictly increasing Git object ID, so duplicates are invalid. It is populated by adoption, automatic imports, and explicit checkpoints with the Git object closure described below, and verified before `restore` mutates repository state.
 
 ### Retained Git object map
 
@@ -214,7 +214,7 @@ Traversal follows tag → target, commit → tree and parents, and tree → subt
 
 ### Captured absence
 
-A missing tracked worktree path is omitted from `files`; the captured raw index still describes its staged/tracked state. A future restore must compare the target view with the current eligible namespace and remove current paths absent from the target. That restore logic is not implemented yet.
+A missing tracked worktree path is omitted from `files`; the captured raw index still describes its staged/tracked state. `git2 restore` compares the target view with the current eligible namespace and removes current eligible paths absent from the target while preserving ignored files.
 
 ## Operation records
 
@@ -368,23 +368,23 @@ Action tags:
 4. **Idempotent reconciliation (`recover`) and rollback (`rollback`):**
    - No `pending/active`: clean up any orphan `pending/plan` or `stage_*` debris and return `Clean`.
    - `HEAD` already equals deterministic `operation_id`: release any verified owned lock, clean temp/pending files, and return `Finalized` without appending duplicate operations.
-   - `phase == Prepared`: probe all reversible actions at `expected_before` (refusing unexpected divergence), clean pending files, and return `Aborted`.
-   - `phase == Applying | Finalizing | Committed` (with `HEAD == parent`): `recover` probes outcomes per action (resuming owned locks/unfinished actions and refusing foreign locks or divergence), verifies live state matches `target_view`, writes the deterministic `Operation`, publishes `HEAD`, cleans pending state, and returns `Finalized`. Alternatively, `rollback` walks reversible actions in reverse (skipping append-only `RehydrateObject`), verifies `before_view`, cleans pending state, and returns `RolledBack`.
+   - `phase == Prepared`: recompute the current live view read-only without writes and verify it matches `before_view` (refusing unexpected divergence), clean pending files, and return `Aborted` (or `RolledBack` under `rollback`).
+   - `phase == Applying | Finalizing | Committed` (with `HEAD == parent`): `recover` probes outcomes per action (resuming owned locks/unfinished actions, pruning empty ancestor directories under `refs/` on `RemoveRef`, and refusing foreign locks or divergence), verifies live state matches `target_view`, writes the deterministic `Operation`, publishes `HEAD`, cleans pending state, and returns `Finalized`. Alternatively, `rollback` walks reversible actions in reverse up to `next_action` (skipping append-only `RehydrateObject`), verifies `before_view`, cleans pending state, and returns `RolledBack`.
 
-## Restore requirements
+## Restore contract and recovery runbook
 
-The format contains enough modeled data for a supported restore, but restore is not implemented or proven. A correct implementation must:
+The `restore` planner and executor implement the modeled restoration checks:
 
-- verify every operation, view, and CAS digest before mutation;
-- validate every path component;
-- avoid following worktree symlinks;
-- snapshot the current state first;
-- write refs and index transactionally;
-- restore file/symlink type and executable semantics;
-- remove eligible current paths absent from the target;
-- preserve ignored files;
-- append a new restore/undo operation;
-- remain recoverable after interruption at each boundary.
+- verify the target view, every target CAS payload digest, and the full retained Git object closure before touching `.git/` or the worktree;
+- refuse pre-existing foreign Git locks on planned metadata targets before mutating worktree files;
+- evaluate both current and target ignore profiles (`core.excludesFile` / XDG ignore, `.git/info/exclude`, and captured/live `.gitignore` rules) and refuse ignored-child directory obstructions or ambiguous ignored-to-untracked transitions without writes;
+- rehydrate missing required Git objects before publishing refs or index, execute swaps without following symlinks or escaping the worktree, preserve ignored files, and append `git2:restore --view <id>`.
+
+Operator recovery guidance:
+
+- **Pending transaction (`pending/active` exists):** run `git2 recover --status` (read-only) or `git2 oplog` (read-only warning mode), then run `git2 recover` to finish cleanly or `git2 recover --rollback` to return to `before_view` if recovery `HEAD` has not yet moved.
+- **Unknown Git lock (`*.lock` mismatch):** inspect or stop any concurrent Git/editor process holding `.git/*.lock` before re-running `git2 recover`; git2 never deletes an unattributed lock.
+- **Corrupted or legacy sidecar:** do not hand-edit `.git/git2/`; preserve `.git/git2/` externally for diagnosis (format 1/2 stores are never auto-migrated or removed).
 
 ## Format-change checklist
 

@@ -7,6 +7,7 @@
 //! never modifies an unknown lock.
 
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use bstr::{BString, ByteSlice};
 use rustix::fs::{AtFlags, fsync, renameat, unlinkat};
+use rustix::io::Errno;
 
 use crate::object::{GitOid, parse_canonical_object};
 use crate::paths::{CheckedRoot, PathEntryKind, checked_split};
@@ -150,6 +152,87 @@ pub enum Action {
     },
 }
 
+/// Target scope of a single planned change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChangeScope {
+    Object,
+    Worktree,
+    Directory,
+    Index,
+    Ref,
+    PackedRefs,
+    Head,
+}
+
+/// Effect kind of a single planned change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChangeKind {
+    Rehydrate,
+    Add,
+    Replace,
+    Remove,
+}
+
+/// Human- and script-readable preview item for a planned mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub scope: ChangeScope,
+    pub kind: ChangeKind,
+    pub path: BString,
+}
+
+/// Escape raw path bytes into a single-line printable ASCII string.
+#[must_use]
+pub fn escape_path_bytes(bytes: &[u8]) -> String {
+    let needs_quotes = bytes
+        .iter()
+        .any(|&b| b < 0x20 || b == 0x7f || b >= 0x80 || b == b'\\' || b == b'"');
+    if !needs_quotes && let Ok(valid) = std::str::from_utf8(bytes) {
+        return valid.to_owned();
+    }
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+    for &byte in bytes {
+        match byte {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            0x20..=0x7e => out.push(char::from(byte)),
+            other => {
+                let _ = write!(out, "\\x{other:02x}");
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Format a [`Change`] into one single-line byte-safe preview line.
+#[must_use]
+pub fn format_change_line(change: &Change) -> String {
+    let kind = match change.kind {
+        ChangeKind::Rehydrate => "rehydrate",
+        ChangeKind::Add => "add",
+        ChangeKind::Replace => "replace",
+        ChangeKind::Remove => "remove",
+    };
+    let scope = match change.scope {
+        ChangeScope::Object => "object",
+        ChangeScope::Worktree => "worktree",
+        ChangeScope::Directory => "dir",
+        ChangeScope::Index => "index",
+        ChangeScope::Ref => "ref",
+        ChangeScope::PackedRefs => "packed-refs",
+        ChangeScope::Head => "head",
+    };
+    format!(
+        "{kind} {scope} {}",
+        escape_path_bytes(change.path.as_slice())
+    )
+}
+
 /// A self-contained mutation plan bound to observed recovery and live-repository views.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutationPlan {
@@ -158,6 +241,100 @@ pub struct MutationPlan {
     pub target_view: ContentId,
     pub command: BString,
     pub actions: Vec<Action>,
+    pub changes: Vec<Change>,
+}
+
+impl MutationPlan {
+    /// Return the planned human/script preview items for this mutation plan.
+    #[must_use]
+    pub fn changes(&self) -> &[Change] {
+        &self.changes
+    }
+
+    /// Derive semantic preview changes from an ordered list of primitive actions.
+    #[must_use]
+    pub fn changes_for_actions(actions: &[Action]) -> Vec<Change> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::RehydrateObject { oid, .. } => Some(Change {
+                    scope: ChangeScope::Object,
+                    kind: ChangeKind::Rehydrate,
+                    path: BString::from(oid.to_string()),
+                }),
+                Action::WriteWorktreeEntry {
+                    path,
+                    expected_before,
+                    ..
+                } => Some(Change {
+                    scope: ChangeScope::Worktree,
+                    kind: if expected_before.is_some() {
+                        ChangeKind::Replace
+                    } else {
+                        ChangeKind::Add
+                    },
+                    path: path.clone(),
+                }),
+                Action::RemoveWorktreeEntry { path, .. } => Some(Change {
+                    scope: ChangeScope::Worktree,
+                    kind: ChangeKind::Remove,
+                    path: path.clone(),
+                }),
+                Action::EnsureDir { .. } | Action::RemoveEmptyDir { .. } => None,
+                Action::WriteIndex {
+                    expected_before, ..
+                } => Some(Change {
+                    scope: ChangeScope::Index,
+                    kind: if expected_before.is_some() {
+                        ChangeKind::Replace
+                    } else {
+                        ChangeKind::Add
+                    },
+                    path: BString::from("index"),
+                }),
+                Action::RemoveIndex { .. } => Some(Change {
+                    scope: ChangeScope::Index,
+                    kind: ChangeKind::Remove,
+                    path: BString::from("index"),
+                }),
+                Action::WriteRef {
+                    name,
+                    expected_before,
+                    ..
+                } => Some(Change {
+                    scope: ChangeScope::Ref,
+                    kind: if expected_before.is_some() {
+                        ChangeKind::Replace
+                    } else {
+                        ChangeKind::Add
+                    },
+                    path: name.clone(),
+                }),
+                Action::RemoveRef { name, .. } => Some(Change {
+                    scope: ChangeScope::Ref,
+                    kind: ChangeKind::Remove,
+                    path: name.clone(),
+                }),
+                Action::WritePackedRefs {
+                    expected_before,
+                    target,
+                } => Some(Change {
+                    scope: ChangeScope::PackedRefs,
+                    kind: match (expected_before.is_some(), target.is_some()) {
+                        (false, true) => ChangeKind::Add,
+                        (true, false) => ChangeKind::Remove,
+                        _ => ChangeKind::Replace,
+                    },
+                    path: BString::from("packed-refs"),
+                }),
+                Action::WriteHead { .. } => Some(Change {
+                    scope: ChangeScope::Head,
+                    kind: ChangeKind::Replace,
+                    path: BString::from("HEAD"),
+                }),
+            })
+            .collect()
+    }
 }
 
 /// The four persisted phases of a pending transaction.
@@ -938,7 +1115,14 @@ pub fn recover_with_hook(
     }
 
     if record.phase == PendingPhase::Prepared {
-        verify_all_at_before(&context, &actions)?;
+        let live_repo = LocalRepository::discover(repo.workdir())?;
+        let actual_before = live_repo.compute_live_view_readonly(policy)?;
+        if actual_before != record.before_view {
+            return Err(Error::CorruptRecovery(format!(
+                "prepared state hashes to view {actual_before}, expected {}",
+                record.before_view
+            )));
+        }
         cleanup_pending_state(&context, &actions)?;
         return Ok(RecoveryOutcome::Aborted {
             before_view: record.before_view,
@@ -1011,13 +1195,30 @@ pub fn rollback(repo: &RecoveryRepository) -> Result<RecoveryOutcome> {
             record.parent
         )));
     }
+    if record.phase == PendingPhase::Prepared {
+        let live_repo = LocalRepository::discover(repo.workdir())?;
+        let actual_before = live_repo.compute_live_view_readonly(policy)?;
+        if actual_before != record.before_view {
+            return Err(Error::CorruptRecovery(format!(
+                "prepared state hashes to view {actual_before}, expected {}",
+                record.before_view
+            )));
+        }
+        cleanup_pending_state(&context, &actions)?;
+        return Ok(RecoveryOutcome::RolledBack {
+            before_view: record.before_view,
+        });
+    }
     if let Some(owner) = &record.lock_owner {
         release_owned_lock(&context, owner)?;
     }
     cleanup_worktree_temps(&context, &actions)?;
 
-    for (idx, action) in actions.iter().enumerate().rev() {
-        rollback_action(&context, idx, action)?;
+    if !actions.is_empty() {
+        let last = record.next_action.min(actions.len() - 1);
+        for (idx, action) in actions.iter().enumerate().take(last + 1).rev() {
+            rollback_action(&context, idx, action)?;
+        }
     }
 
     let live_repo = LocalRepository::discover(repo.workdir())?;
@@ -1428,6 +1629,31 @@ fn commit_locked_metadata(git_dir: &Path, spec: &MetadataActionSpec) -> Result<(
             Err(error) => return Err(std::io::Error::from(error).into()),
         }
         fsync(parent.as_fd()).map_err(std::io::Error::from)?;
+        if spec.rel_path.starts_with(b"refs/") {
+            prune_empty_ref_ancestors(&git_meta, spec.rel_path.as_slice())?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_empty_ref_ancestors(git_meta: &CheckedRoot, ref_path: &[u8]) -> Result<()> {
+    let mut current = ref_path;
+    while let Some(slash) = current.rfind_byte(b'/') {
+        current = &current[..slash];
+        if current == b"refs" || current == b"refs/heads" || current == b"refs/tags" {
+            break;
+        }
+        match git_meta.remove_empty_dir(current) {
+            Ok(()) => {}
+            Err(Error::Io(error))
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    || error.raw_os_error() == Some(Errno::NOTEMPTY.raw_os_error())
+                    || error.raw_os_error() == Some(Errno::EXIST.raw_os_error()) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -1581,7 +1807,9 @@ fn rollback_action(ctx: &TxContext<'_>, idx: usize, action: &Action) -> Result<(
             }
         }
         _ => {
-            let spec = metadata_spec(ctx.store, action)?.expect("metadata variant");
+            let mut spec = metadata_spec(ctx.store, action)?.expect("metadata variant");
+            spec.create_parents = spec.create_parents
+                || (spec.expected_before.is_some() && spec.rel_path.starts_with(b"refs/"));
             let reversed = MetadataActionSpec {
                 rel_path: spec.rel_path,
                 lock_rel_path: spec.lock_rel_path,
@@ -1624,59 +1852,6 @@ fn rollback_locked_metadata(
     fsync(parent.as_fd()).map_err(std::io::Error::from)?;
     commit_locked_metadata(ctx.git_dir, spec)?;
     pending_dir.remove_if_exists(&stage_name)?;
-    Ok(())
-}
-
-fn verify_all_at_before(ctx: &TxContext<'_>, actions: &[Action]) -> Result<()> {
-    let worktree = CheckedRoot::open(ctx.workdir)?;
-    let git_meta = CheckedRoot::open(ctx.git_dir)?;
-    for action in actions {
-        match action {
-            Action::RehydrateObject { .. } => {}
-            Action::WriteWorktreeEntry {
-                path,
-                expected_before,
-                ..
-            } => {
-                if read_entry_state(&worktree, path.as_slice(), ctx.policy.max_file_bytes)?
-                    != *expected_before
-                {
-                    return Err(divergence_error(path.as_slice()));
-                }
-            }
-            Action::RemoveWorktreeEntry {
-                path,
-                expected_before,
-            } => {
-                if read_entry_state(&worktree, path.as_slice(), ctx.policy.max_file_bytes)?
-                    != Some(*expected_before)
-                {
-                    return Err(divergence_error(path.as_slice()));
-                }
-            }
-            Action::EnsureDir { path } => {
-                if matches!(
-                    worktree.entry_kind(path.as_slice())?,
-                    Some(k) if k != PathEntryKind::Directory
-                ) {
-                    return Err(divergence_error(path.as_slice()));
-                }
-            }
-            Action::RemoveEmptyDir { path } => {
-                if worktree.entry_kind(path.as_slice())? != Some(PathEntryKind::Directory) {
-                    return Err(divergence_error(path.as_slice()));
-                }
-            }
-            _ => {
-                let spec = metadata_spec(ctx.store, action)?.expect("metadata variant");
-                if git_meta.read_file_raw(spec.rel_path.as_slice(), MAX_CAS_BYTES as u64)?
-                    != spec.expected_before
-                {
-                    return Err(divergence_error(spec.rel_path.as_slice()));
-                }
-            }
-        }
-    }
     Ok(())
 }
 

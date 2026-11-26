@@ -60,18 +60,18 @@ Detection is conservative but not yet exhaustive. Unknown extensions or concurre
 
 | State | Captured | Restorable today |
 | --- | --- | --- |
-| Raw HEAD | Yes | No |
-| Loose refs under `refs/` | Yes | No |
-| Raw `packed-refs` | Yes | No |
-| Raw index | Yes, checksum-verified with a size-bounded decode and semantic validation at capture too | No |
-| Present tracked regular files | Yes, with the on-disk mode | No |
-| Present tracked executable files | Yes, with the on-disk mode even when the index disagrees | No |
-| Present tracked symlinks | Yes, as the raw target without dereference | No |
-| Non-ignored untracked files | Yes, through a checked walk that never applies filters | No |
-| Git object closure reachable from saved refs/HEAD/index | Yes, on adoption, automatic imports, and explicit checkpoints, in the private CAS | No |
-| Ignored files | No | No |
-| Deleted tracked path absence | Represented by omission plus captured index | No |
-| Empty directories | No | No |
+| Raw HEAD | Yes | Yes (`restore --view`) |
+| Loose refs under `refs/` | Yes | Yes (`restore --view`, including D/F swaps) |
+| Raw `packed-refs` | Yes | Yes (`restore --view`) |
+| Raw index | Yes, checksum-verified with a size-bounded decode and semantic validation at capture too | Yes (`restore --view`) |
+| Present tracked regular files | Yes, with the on-disk mode | Yes (`restore --view`) |
+| Present tracked executable files | Yes, with the on-disk mode even when the index disagrees | Yes (`restore --view`) |
+| Present tracked symlinks | Yes, as the raw target without dereference | Yes (`restore --view`) |
+| Non-ignored untracked files | Yes, through a checked walk that never applies filters | Yes (`restore --view`) |
+| Git object closure reachable from saved refs/HEAD/index | Yes, on adoption, automatic imports, and explicit checkpoints, in the private CAS | Yes (verified and rehydrated before publishing refs/index) |
+| Ignored files | No | No (preserved untouched; obstructing ignored children refuse restore) |
+| Deleted tracked path absence | Represented by omission plus captured index | Yes (extra eligible files removed by `restore --view`) |
+| Empty directories | No | No (pruned on file removal unless holding kept ignored entries) |
 | Git config/hooks/reflogs | No | No |
 | File ownership/ACL/xattrs/timestamps | No | No |
 

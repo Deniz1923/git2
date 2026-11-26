@@ -186,6 +186,7 @@ fn setup_multi_fixture(path: &Path) -> MultiFixture {
             before_view: before_cp.view_id,
             target_view: target_cp.view_id,
             command: BString::from("synthetic-multi"),
+            changes: MutationPlan::changes_for_actions(&actions),
             actions,
         },
         pruned_oid: staged_oid,
@@ -482,6 +483,7 @@ fn read_plan_fixture(file: &Path) -> MutationPlan {
         before_view,
         target_view,
         command,
+        changes: MutationPlan::changes_for_actions(&actions),
         actions,
     }
 }
@@ -574,6 +576,7 @@ fn noop_synthetic_mutation_produces_valid_operation() {
         before_view: adoption.view_id,
         target_view: adoption.view_id,
         command: BString::from("synthetic-noop"),
+        changes: Vec::new(),
         actions: Vec::new(),
     };
     let op_id = run(&repo, &plan).unwrap();
@@ -607,6 +610,7 @@ fn stale_plan_and_lock_contention_refuse_without_partial_mutation() {
         before_view: adoption.view_id,
         target_view: adoption.view_id,
         command: BString::from("synthetic-noop"),
+        changes: Vec::new(),
         actions: Vec::new(),
     };
     assert!(run(&repo, &stale_head_plan).is_err());
@@ -619,6 +623,7 @@ fn stale_plan_and_lock_contention_refuse_without_partial_mutation() {
         before_view: adoption.view_id,
         target_view: adoption.view_id,
         command: BString::from("synthetic-noop"),
+        changes: Vec::new(),
         actions: Vec::new(),
     };
     assert!(run(&repo, &valid_plan).is_err());
@@ -657,6 +662,7 @@ fn stale_plan_and_lock_contention_refuse_without_partial_mutation() {
         before_view: next_view_id,
         target_view: next_view_id,
         command: BString::from("synthetic-after-external"),
+        changes: Vec::new(),
         actions: Vec::new(),
     };
     let head_before = store.head().unwrap();
@@ -766,6 +772,7 @@ fn unknown_lock_remains_byte_identical() {
         before_view: adoption.view_id,
         target_view: adoption.view_id,
         command: BString::from("synthetic-lock"),
+        changes: Vec::new(),
         actions: vec![Action::WriteIndex {
             expected_before: Some(idx_id),
             target: idx_id,

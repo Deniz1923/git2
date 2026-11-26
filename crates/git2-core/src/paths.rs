@@ -16,8 +16,8 @@ use std::path::Path;
 
 use bstr::BString;
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, fstat, fsync, mkdirat, open, openat, readlinkat, renameat,
-    statat, symlinkat, unlinkat,
+    AtFlags, Dir, FileType, Mode, OFlags, fstat, fsync, mkdirat, open, openat, readlinkat,
+    renameat, statat, symlinkat, unlinkat,
 };
 use rustix::io::{Errno, read};
 
@@ -144,21 +144,7 @@ impl CheckedRoot {
             Err(Errno::NOENT) => return Ok(None),
             Err(error) => return Err(io::Error::from(error).into()),
         };
-        let file_type = FileType::from_raw_mode(stat.st_mode);
-        let kind = if file_type.is_symlink() {
-            PathEntryKind::Symlink
-        } else if file_type.is_dir() {
-            PathEntryKind::Directory
-        } else if file_type.is_file() {
-            if stat.st_mode & 0o111 == 0 {
-                PathEntryKind::Regular
-            } else {
-                PathEntryKind::Executable
-            }
-        } else {
-            PathEntryKind::Other
-        };
-        Ok(Some(kind))
+        Ok(Some(entry_kind_from_mode(stat.st_mode)))
     }
 
     /// Inspect `(st_dev, st_ino)` for `path` without following symlinks, refusing non-regular files.
@@ -356,6 +342,54 @@ impl CheckedRoot {
             Err(error) => return Err(io::Error::from(error).into()),
         }
         Ok(())
+    }
+
+    /// List direct children of directory `path` (or the root when `path` is empty) without following symlinks.
+    pub(crate) fn list_dir_entries(&self, path: &[u8]) -> Result<Vec<(BString, PathEntryKind)>> {
+        let dir_fd = if path.is_empty() || path == b"." {
+            open_dot_rw(self.fd.as_fd())?
+        } else {
+            let (parents, leaf) = checked_split(path)?;
+            let Some(parent) = traverse_parents_rw(self.fd.as_fd(), path, &parents, false)? else {
+                return Ok(Vec::new());
+            };
+            let Some(dir_fd) = open_or_create_dir(parent.as_fd(), path, leaf, false)? else {
+                return Ok(Vec::new());
+            };
+            dir_fd
+        };
+        let mut dir = Dir::read_from(dir_fd.as_fd()).map_err(io::Error::from)?;
+        let mut entries = Vec::new();
+        while let Some(entry) = dir.read() {
+            let entry = entry.map_err(io::Error::from)?;
+            let name_c = entry.file_name();
+            let name = name_c.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let stat = statat(dir_fd.as_fd(), name_c, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(io::Error::from)?;
+            entries.push((BString::from(name), entry_kind_from_mode(stat.st_mode)));
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(entries)
+    }
+}
+
+fn entry_kind_from_mode(st_mode: u32) -> PathEntryKind {
+    let file_type = FileType::from_raw_mode(st_mode);
+    if file_type.is_symlink() {
+        PathEntryKind::Symlink
+    } else if file_type.is_dir() {
+        PathEntryKind::Directory
+    } else if file_type.is_file() {
+        if st_mode & 0o111 == 0 {
+            PathEntryKind::Regular
+        } else {
+            PathEntryKind::Executable
+        }
+    } else {
+        PathEntryKind::Other
     }
 }
 

@@ -174,8 +174,8 @@ fn checkpoint_refuses_unadopted_repository_and_saves_reusable_views() {
     );
     assert_eq!(
         newest.split_whitespace().last(),
-        Some(&id[..12]),
-        "the reusable view id must identify the saved view"
+        Some(id),
+        "the full 64-char view id must appear in oplog:\n{after_save}"
     );
 
     let repeated = git2(directory.path(), &["checkpoint"]);
@@ -240,5 +240,61 @@ fn debug_hash_object_write_is_rejected_without_creating_an_object() {
         std::fs::read_dir(&objects).unwrap().count(),
         before,
         "the object database must be unchanged"
+    );
+}
+
+#[test]
+fn restore_dry_run_apply_and_clean_recover_status() {
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "--quiet", "-b", "main"]);
+    std::fs::write(directory.path().join("file.txt"), b"v1\n").unwrap();
+    git(directory.path(), &["add", "file.txt"]);
+    git(
+        directory.path(),
+        &[
+            "-c",
+            "user.name=git2",
+            "-c",
+            "user.email=git2@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "v1",
+        ],
+    );
+
+    let adopt = git2(directory.path(), &["adopt"]);
+    assert!(adopt.status.success());
+    let adopt_stdout = String::from_utf8(adopt.stdout).unwrap();
+    let (_, v1) = adopt_stdout.trim_end().rsplit_once(" as view ").unwrap();
+    assert_full_view_id(v1);
+
+    std::fs::write(directory.path().join("file.txt"), b"v2\n").unwrap();
+    let cp = git2(directory.path(), &["checkpoint"]);
+    assert!(cp.status.success());
+
+    let dry = git2(directory.path(), &["restore", "--view", v1, "--dry-run"]);
+    assert!(dry.status.success());
+    let dry_stdout = String::from_utf8(dry.stdout).unwrap();
+    assert!(dry_stdout.contains("replace worktree file.txt"));
+    assert_eq!(
+        std::fs::read(directory.path().join("file.txt")).unwrap(),
+        b"v2\n"
+    );
+
+    let apply = git2(directory.path(), &["restore", "--view", v1]);
+    assert!(apply.status.success());
+    let apply_stdout = String::from_utf8(apply.stdout).unwrap();
+    assert!(apply_stdout.contains(&format!("restored view {v1} as operation ")));
+    assert_eq!(
+        std::fs::read(directory.path().join("file.txt")).unwrap(),
+        b"v1\n"
+    );
+
+    let rec_status = git2(directory.path(), &["recover", "--status"]);
+    assert!(rec_status.status.success());
+    assert_eq!(
+        String::from_utf8(rec_status.stdout).unwrap().trim(),
+        "no pending transaction"
     );
 }

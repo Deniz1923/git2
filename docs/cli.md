@@ -41,7 +41,7 @@ The selected size limit is stored in `.git/git2/policy`. Later checkpoints and a
 
 Format 1 and format 2 sidecars are refused, not upgraded or removed. To start a new format 3 store, first preserve the old directory separately; see the [format notes](recovery-format.md#status-and-compatibility).
 
-The command does not make restore available; adoption is currently useful for format and capture testing only.
+Captured baseline and checkpoint views can be previewed and applied with `git2 restore --view <id> [--dry-run]`.
 
 ## `git2 checkpoint`
 
@@ -66,7 +66,7 @@ Like adoption and automatic imports, a checkpoint also retains the current Git o
 
 Scope and limits: checkpoint refuses indexes with resolve-undo (REUC) records and historical trees containing gitlink entries. Each retained object payload is bounded to 128 MiB, the map to 1,000,000 distinct Git objects, packed delta chains to depth 64 with a 128 MiB aggregate instruction budget, and the whole view to 64 MiB. A required object that is missing or over a limit refuses the checkpoint before a new view is exposed.
 
-Earlier format 1 and format 2 stores are refused untouched; format 3 keeps the version 2 view/operation layout and stores CAS entries zlib-compressed on disk. Checkpoint is a capture, not a backup: there is no restore command or pending-transaction journal yet.
+Earlier format 1 and format 2 stores are refused untouched; format 3 keeps the version 2 view/operation layout and stores CAS entries zlib-compressed on disk. Saved views can be restored later with `git2 restore --view <id>`, which rehydrates missing objects from the private CAS and runs through the 4-phase pending-transaction journal.
 
 ## `git2 status`
 
@@ -102,18 +102,51 @@ On an adopted repository, `status` first imports a changed current state as one 
 
 The newline-delimited form also emits raw path bytes. A path containing a newline therefore makes that form ambiguous; use `-z`.
 
+## `git2 restore`
+
+```text
+git2 restore --view <64-hex-view-id> [--dry-run]
+```
+
+Requires an adopted repository and full 64-character lowercase-hex view ID from `adopt`, `checkpoint`, or `oplog`.
+
+Options:
+
+- `--view <64-hex-view-id>`: target recovery view to preview or apply;
+- `--dry-run`: validate the target view, object closure, ignore rules, and obstructions without acquiring the recovery lock, importing external changes, or modifying Git/sidecar state. Emits one single-line byte-safe (`\"...\"`-escaped when needed) change line per affected object, worktree path, index, ref, `packed-refs`, or `HEAD`.
+
+Behavior:
+
+- refuses before writes if a pending transaction exists, any required target view/CAS payload/retained Git object is missing or corrupt, a pre-existing foreign Git `.lock` exists for a touched metadata path, an ignored child blocks directory replacement, or an ignore-rule change creates an ambiguous or unverified entry transition;
+- allows non-destructive path reclassification (such as a captured entry becoming ignored in the target, or an on-disk ignored file already matching a target tracked file byte-for-byte and mode-for-mode) without unnecessary worktree writes, while refusing differing obstructing ignored files;
+- on apply, imports outside changes if needed, runs through the 4-phase pending-transaction journal, rehydrates missing Git objects into `.git/objects/` before publishing refs or index, swaps files/directories and D/F loose refs safely, leaves ignored files untouched, and appends one `git2:restore --view <id>` operation.
+
+## `git2 recover`
+
+```text
+git2 recover [--status | --rollback]
+```
+
+Operates on `.git/git2/pending/` even when an interrupted mutation leaves the working tree or Git metadata in a partial layout.
+
+Modes:
+
+- `--status`: read-only inspection of any active pending transaction (`tx_id`, phase, command, before/target views, progress, and deterministic operation ID), leaving sidecar state untouched;
+- `--rollback`: rolls back an un-selected (`Prepared`, `Applying`, or `Finalizing`) transaction to its durable `before` view by verifying the pre-state (`Prepared`) or reversing applied actions in reverse order up to `next_action`, refusing after recovery `HEAD` has already moved;
+- default (no flags): idempotently reconciles any interrupted transaction—aborting cleanly if `Prepared`, resuming and finalizing if `Applying`/`Finalizing`, or cleaning pending state without duplicating history if recovery `HEAD` already selected the deterministic operation ID. Foreign Git locks, live divergence, or sidecar corruption are refused untouched.
+
 ## `git2 oplog`
 
 ```text
 git2 oplog
 ```
 
-Requires an adopted repository. It imports external changes if needed (retaining the current Git object closure, like `status` and `checkpoint`), then prints immutable operations newest first.
+Requires an adopted repository. When no transaction is pending, it imports external changes if needed (retaining the current Git object closure, like `status` and `checkpoint`), then prints immutable operations newest first. When a pending transaction exists, it prints a warning to standard error, skips external-change import, and displays the last durable history read-only.
 
 Current output fields:
 
 ```text
-<12-char-operation-id> <unix-seconds> <kind> <12-char-before-view> -> <12-char-after-view>
+<64-char-operation-id> <unix-seconds> <kind> <64-char-before-view> -> <64-char-after-view>
 ```
 
 Kinds currently include:
@@ -121,6 +154,7 @@ Kinds currently include:
 - `adopt`;
 - `external-git`;
 - `git2:checkpoint`, emitted by `git2 checkpoint`;
+- `git2:restore --view <64-hex-view-id>`, emitted by `git2 restore --view <id>`;
 - other `git2:<command>` values in the format, reserved for future mutating commands.
 
 An unchanged `checkpoint` does not append a new operation, so repeated identical saves leave `oplog` unchanged.
@@ -156,8 +190,6 @@ Only full 40-character object IDs are accepted.
 The following names are roadmap commitments, not current CLI features:
 
 ```text
-git2 restore
-git2 recover
 git2 reset
 git2 undo
 git2 add
