@@ -884,13 +884,14 @@ impl RecoveryStore {
             .map(|operation| operation.after)
     }
 
-    /// Report whether an active pending transaction record exists.
+    /// Report whether an active or delegated pending transaction record exists.
     ///
     /// # Errors
     ///
     /// Returns an error if the `pending` directory or entry cannot be inspected.
     pub fn has_pending(&self) -> Result<bool> {
-        self.pending_dir()?.exists("active")
+        let dir = self.pending_dir()?;
+        Ok(dir.exists("active")? || dir.exists("delegated")?)
     }
 
     pub(crate) fn pending_dir(&self) -> Result<Directory> {

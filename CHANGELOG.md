@@ -26,6 +26,7 @@ All notable project changes are recorded here. The project has not made a suppor
 - Native `git2 commit -m <message>` (canonical bottom-up tree builder with Git directory-`/` sorting, Git identity/date resolution, active hook/`commit.gpgSign`/encoding/empty/ITA/lock refusals, root & single-parent transactional commits reversible via `git2 undo`, empty-tree physical object persistence, and process-kill crash suites) and bounded `git2 log [-n|--max-count <n>]`.
 - Expanded Milestone 3 status parity coverage (executable bits, symlink & type transitions, non-UTF-8/tab/newline `-z` paths, nested/global excludes, unborn and detached `HEAD`, tracked-before-untracked porcelain ordering), `git push --mirror` privacy test, and `PATH=""` zero-runtime-`git` smoke test.
 - Reproducible `scripts/demo.sh`, `scripts/package-release.sh` (tarball + `.sha256`), [operations & recovery runbook](docs/runbook.md), [experimental v0.1 release notes](docs/release-v0.1.md), and expanded CI workflow (`.github/workflows/ci.yml`).
+- Delegated network and remote commands (`clone` with auto-adoption, `remote`, undoable `fetch`, `--ff-only` default + conflict-recoverable `--merge`/`--rebase` `pull`, and non-undoable `push`) built on `.git/git2/pending/delegated`, conflict-safe `git2 recover --rollback`, `REUC` index stripping on manual conflict recovery, `-c protocol.ext.allow=never` / `refs/git2/*` / `-`-flag guards, URL credential redaction, and core + CLI integration/crash tests.
 - Product, architecture, compatibility, CLI, format, roadmap, testing, development, contribution, and security documentation.
 
 ### Changed
@@ -48,5 +49,5 @@ All notable project changes are recorded here. The project has not made a suppor
 
 ### Known limitations
 
-- No networking (`clone`, `fetch`, `pull`, `push`) or cross-platform recovery support (`v0.2+`).
+- Cross-platform recovery support (`macOS`/`Windows`), recovery GC/pruning, and multi-step merge/rebase/branch commands remain planned (`v0.2+`).
 - Still experimental and not recommended for important repositories (`publish = false`, awaiting separate authorization before any public tag/release).

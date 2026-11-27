@@ -42,7 +42,7 @@ This prints the transaction ID, phase (`prepared`, `applying`, `finalizing`, `co
   - If the transaction died in `prepared` (before any Git mutation started), `git2 recover` removes the pending state and leaves the repository untouched at `before_view`.
   - If it died in `applying` or `finalizing`, `git2 recover` verifies locks/live state and finishes the remaining actions, selects the operation ID in `.git/git2/HEAD`, and cleans `pending/`.
   - If it died in `committed` (after `.git/git2/HEAD` moved), `git2 recover` simply finishes cleaning `pending/` without duplicating history.
-- **To undo an unfinished transaction back to `before_view`** (only allowed before `.git/git2/HEAD` moved, i.e., `prepared`, `applying`, or `finalizing`):
+- **To undo an unfinished transaction back to `before_view`** (allowed for un-selected native `prepared`/`applying`/`finalizing` states or `delegated` pull/fetch states, including unresolved merge or rebase conflicts):
   ```sh
   git2 recover --rollback
   ```
@@ -50,6 +50,22 @@ This prints the transaction ID, phase (`prepared`, `applying`, `finalizing`, `co
   ```sh
   git fsck --full --strict
   ```
+
+### Recovering conflicted `git2 pull --merge` or `--rebase`
+
+If `git2 pull --merge` or `git2 pull --rebase` hits a merge/rebase conflict, `.git/git2/pending/delegated` remains active (`git2 recover --status` shows `phase: delegated` and `conflict state: present`):
+
+- **Option A — Abort the conflicted merge/rebase and restore exact pre-pull files, index, and `HEAD`:**
+  ```sh
+  git2 recover --rollback
+  ```
+- **Option B — Finish resolving conflicts manually in Git and record the result:**
+  1. Resolve conflict markers, run `git add <files>`, and complete the merge (`git commit`) or rebase (`git rebase --continue`).
+  2. Run `git2 recover`. Note: Git may add an optional `REUC` (resolve-undo) index extension when committing conflict resolutions; `git2 recover` strips `REUC` cleanly while preserving all stage-0 entries so the resulting view stays self-contained and undoable via `git2 undo`.
+
+### Remote `git2 push` notice
+
+`git2 push` cannot undo changes already published to a remote repository; `git2 undo` explicitly refuses `git2:push` operations. Use `git2 restore --view <id>` only when you intentionally want to revert local state independently of the remote.
 
 ### Step 3: Resolve foreign locks or manual divergence
 

@@ -22,7 +22,7 @@ The project uses ordinary Git repositories as its interchange format. It adds a 
 | Staging | Implemented | `add [--all] [--] [<path>...]` with built-in EOL conversion, ignore rules, and atomic index lock |
 | Commits and log | Implemented | `commit -m <message>` via transactional tree/commit/ref writes (`undo`-capable) and bounded `log [-n <n>]` |
 | Release readiness & CI | Implemented | Mirror-push privacy test, `PATH=""` smoke test, `scripts/demo.sh`, `scripts/package-release.sh`, [runbook](docs/runbook.md), and [v0.1 release notes](docs/release-v0.1.md) |
-| Networking | Deferred to v0.2 | Deferred until local recovery workflows stabilize |
+| Networking & remotes | Implemented | `clone`, `fetch`, `pull` (`--ff-only` default + conflict-recoverable `--merge`/`--rebase`), `push`, and `remote` via strict `git` argv delegation (local commands keep zero `git` runtime dependency) |
 
 See the [full roadmap](docs/roadmap.md) for milestones and exit criteria.
 
@@ -113,6 +113,11 @@ git2 restore --view <64-hex-view-id> [--dry-run]
 git2 recover [--status | --rollback]
 git2 status [-z|--nul]
 git2 oplog
+git2 remote [-v] | add | remove | rename | get-url | set-url
+git2 clone [--branch <name>] [--origin <name>] [--no-adopt] [--max-file-mib <MiB>] [--] <url> [<dir>]
+git2 fetch [--all] [-p|--prune] [-t|--tags] [--] [<remote>] [<refspec>...]
+git2 pull [--ff-only | --merge | --rebase] [-p|--prune] [--] [<remote>] [<refspec>...]
+git2 push [-u|--set-upstream] [--tags] [-d|--delete] [--force-with-lease | -f|--force] [-n|--dry-run] [--] [<remote>] [<refspec>...]
 git2 debug hash-object [--stdin | <path>]
 git2 debug cat-object [-t|--type-only] <full-sha1>
 ```
@@ -128,7 +133,7 @@ The workspace deliberately contains two crates:
 | `git2-core` | Git object model, repository validation, recovery store, snapshots, object retention, operation history, and status |
 | `git2-cli` | Argument parsing, output, and command orchestration |
 
-git2 owns its local semantics. `gix` supplies difficult plumbing such as packed-object reads, index parsing, ignore/path traversal, and status machinery. Future networking will initially call the installed Git executable with argument vectors rather than reimplementing the wire protocol.
+`git2` owns its local semantics (with zero runtime `git` binary dependency for local operations). `gix` supplies difficult plumbing such as packed-object reads, index parsing, ignores/path traversal, and status machinery. Network and remote commands (`clone`, `fetch`, `pull`, `push`, `remote`) delegate transport and credentials to the installed `git` executable via strict argument vectors (`-c protocol.ext.allow=never`) while `git2` owns recovery snapshots, `pending/delegated` conflict rollback, `oplog`, and privacy guarantees.
 
 Read the [architecture](docs/design.md) and [recovery format](docs/recovery-format.md) for details.
 

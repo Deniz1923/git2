@@ -48,10 +48,19 @@ pub(crate) fn plan_with_command(
             "a pending transaction exists; reconcile or inspect it with `recover` first".to_owned(),
         ));
     }
+    plan_with_store(repo, &store, target, command)
+}
+
+pub(crate) fn plan_with_store(
+    repo: &LocalRepository,
+    store: &RecoveryStore,
+    target: ContentId,
+    command: BString,
+) -> Result<MutationPlan> {
     let expected_head = store.head()?;
     let policy = store.policy()?;
     let target_view = store.read_view(target)?;
-    let target_index = verify_target_view(&store, &target_view, policy)?;
+    let target_index = verify_target_view(store, &target_view, policy)?;
 
     let (live_view_id, live_view) = repo.capture_live_view_readonly(policy)?;
     let live_index = decode_view_index_readonly(repo.git_dir(), &live_view)?;
@@ -69,7 +78,7 @@ pub(crate) fn plan_with_command(
         case,
         target_index.as_ref(),
         &target_view,
-        &store,
+        store,
         policy,
     )?;
 
@@ -188,7 +197,7 @@ pub(crate) fn ensure_no_foreign_locks(git_dir: &Path, actions: &[Action]) -> Res
     Ok(())
 }
 
-fn verify_target_view(
+pub(crate) fn verify_target_view(
     store: &RecoveryStore,
     view: &View,
     policy: CapturePolicy,

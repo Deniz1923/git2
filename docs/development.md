@@ -27,10 +27,12 @@ git --version
 │   │   │   ├── lib.rs
 │   │   │   ├── commit.rs
 │   │   │   ├── log.rs
+│   │   │   ├── network.rs
 │   │   │   ├── object.rs
 │   │   │   ├── paths.rs
 │   │   │   ├── recovery.rs
 │   │   │   ├── recovery/disk.rs
+│   │   │   ├── remote.rs
 │   │   │   ├── repository.rs
 │   │   │   ├── reset.rs
 │   │   │   ├── restore.rs
@@ -55,6 +57,8 @@ Module responsibilities:
 
 - `commit`: native `commit -m` tree/commit/ref construction over the 4-phase pending journal;
 - `log`: bounded first-parent history traversal from `HEAD`;
+- `network`: `clone`, `fetch`, `pull`, and `push` via strict `git` argv delegation, credential redaction, and `pending/delegated` transactions;
+- `remote`: `remote` management (`list`, `add`, `remove`, `rename`, `get-url`, `set-url`) over strict argv delegation;
 - `object`: byte-safe Git object model and codecs;
 - `paths`: descriptor-relative, no-follow worktree & metadata path operations;
 - `recovery` / `recovery::disk`: owner-private SHA-256 zlib CAS store and binary records;

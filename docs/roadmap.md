@@ -298,10 +298,12 @@ Release gate:
 
 ## Deferred v0.2 themes
 
-These are sequenced after the local undo proof:
+Implemented from v0.2 themes:
 
-- clone/fetch/push through the installed Git executable;
-- proof that recovery data never crosses network operations;
+- `remote`, `clone` (with auto-adoption), `fetch`, `pull` (`--ff-only` default plus conflict-recoverable `--merge`/`--rebase`), and `push` (non-undoable `git2:push`, `refs/git2/*` block, credential redaction, and mirror-push/bare-remote privacy proofs), delegating transport via strict `git` argv (`-c protocol.ext.allow=never`).
+
+Remaining v0.2+ themes:
+
 - native macOS tests and filesystem semantics;
 - Windows path/mode/recovery design and native CI;
 - recovery storage inspection and explicit garbage collection;

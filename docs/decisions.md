@@ -23,6 +23,7 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 | D015 | Refuse legacy recovery stores and enforce private v2 storage | Accepted |
 | D016 | Compress recovery CAS payloads with zlib in format 3 | Accepted |
 | D017 | Sequence recovery proof before native add/commit, constrain journal, and check semantic index for undo | Accepted |
+| D018 | Track delegated remote/network commands with `pending/delegated`, conflict-safe rollback, and non-undoable push | Accepted |
 
 ## D001 — ordinary Git remains the repository format
 
@@ -159,6 +160,14 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 **Decision:** Sequence v0.1 recovery-first: build the pending-transaction journal (constrained to 4 phases — `Prepared`, `Applying`, `Finalizing`, `Committed` — over a fixed set of primitive checked actions), restore/recover, native `reset`, and append-only `undo`/redo first, pause at an explicit review gate, then build native `add`, `commit`, and `log`. For `git2 undo` divergence checks, ignore stat-cache-only index refreshes while still requiring exact staged paths, stages, modes, OIDs, and flags, and still restoring exact captured raw index bytes.
 
 **Consequences:** Crash-recovery guarantees remain complete with a small, auditable state machine, ordinary `git status` inspection does not break `git2 undo`, and staging/commit complexity stays gated behind the verified recovery proof.
+
+## D018 — delegated pending transactions and conflict-safe network recovery
+
+**Context:** Per D013, `clone`, `fetch`, `pull`, `push`, and `remote` delegate transport to installed `git` via strict argv. Unlike native local commands (`add`, `commit`, `reset`), `fetch` and `pull` cannot compute exact target views beforehand, and `pull --merge` / `pull --rebase` can halt midway with `MERGE_HEAD`, `rebase-merge/`, or multi-stage index conflicts. At the same time, pushing commits to a remote cannot be retracted locally.
+
+**Decision:** Persist a separate format-3 `.git/git2/pending/delegated` record before delegating mutable remote operations (`fetch`, `pull`, `push`, `remote remove`, `remote rename`). Redact embedded URL credentials (`https://user:pass@host`) before persisting command text. Clean up failed `--ff-only` pulls that leave zero conflicts cleanly (recording any fetched tracking-ref changes as `external-git`). On conflicted `pull --merge`/`--rebase` or process kills, keep `pending/delegated` so `git2 recover --rollback` removes transient Git conflict state and restores `before_view`, while `git2 recover` (stripping optional `REUC` index extensions left by manual Git conflict resolution) finalizes resolved work as an undoable `oplog` entry. Refuse `git2 undo` on `git2:push` operations explicitly.
+
+**Consequences:** Format `3\n` sidecar schemas remain backward-compatible, local commands keep zero runtime dependency on `git`, and users get conflict-safe `pull` recovery plus honest push warnings without reimplementing Git wire protocols.
 
 ## Open decisions
 

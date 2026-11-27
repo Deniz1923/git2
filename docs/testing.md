@@ -149,6 +149,17 @@ Current proofs:
 - `git push --mirror` to a bare remote never transfers `.git/git2/`, `refs/git2/*`, or staged-only/recovery-only objects, and the remote passes `git fsck --full --strict`;
 - executing the compiled `git2` binary with `PATH=""` across `adopt`, `status -z`, `add --all`, `commit -m`, `log -n`, `checkpoint`, `reset --hard`, `undo`, `restore --dry-run`, `oplog`, and `recover --status` succeeds with zero runtime dependency on `git`.
 
+### Remote & network tests
+
+`crates/git2-core/tests/network.rs` and `crates/git2-cli/tests/network_cli.rs` test all delegated remote/network commands against temporary local bare repositories (with `GIT_TERMINAL_PROMPT=0` and isolated Git config):
+
+- `git2 clone` auto-adoption (`--branch`, `--origin`, `--no-adopt`) plus `-`-flag and `ext::` URL refusals;
+- `git2 remote` (`-v`, `add`, `get-url`, `set-url`, `rename`, `remove` with undoable tracking-ref capture);
+- `git2 fetch` (`--prune`, `--tags`, no-op fetch, `git2 undo`/redo, and clean offline failure without stuck pending state);
+- `git2 pull` (`--ff-only` default + non-FF cleanup, clean `--merge`/`--rebase` + `undo`, conflicted `--merge` & `--rebase` rollback via `git2 recover --rollback`, and manual conflict resolution + `REUC` stripping via `git2 recover`);
+- `git2 push` (`-u`, `--dry-run`, non-undoable `git2:push` refusal in `git2 undo`, `refs/git2/*` refspec refusal, bare-remote privacy & staged-secret non-leakage, and `git fsck --full --strict`);
+- credential redaction (`https://user:secret@host` -> `https://***@host`) and `GIT2_TEST_FAILPOINT` process-kill crash recovery on delegated transactions.
+
 ## Rules for new tests
 
 ### Use Git as the oracle

@@ -158,6 +158,8 @@ Kinds currently include:
 - `git2:reset --<mode> <rev>`, emitted by `git2 reset`;
 - `git2:add ...`, emitted by `git2 add`;
 - `git2:commit`, emitted by `git2 commit`;
+- `git2:fetch ...`, `git2:pull ...`, `git2:remote remove|rename ...` (undoable via `git2 undo`), with any embedded URL credentials (`scheme://user:pass@host`) redacted as `***`;
+- `git2:push ...`, emitted when local tracking refs move during `git2 push` (explicitly refused by `git2 undo`);
 - `git2:undo`, emitted by `git2 undo`;
 - other `git2:<command>` values in the format, reserved for future mutating commands.
 
@@ -268,6 +270,55 @@ Options:
 
 Only full 40-character object IDs are accepted.
 
-## Deferred commands (`v0.2+`)
+## Remote & network commands (delegated to `git`)
 
-Remote/networking commands (`clone`, `fetch`, `pull`, `push`) are intentionally absent in experimental v0.1 and deferred to post-v0.1 milestones once local recovery flows stabilize.
+All remote/network commands invoke installed `git` using strict argument vectors (`-c protocol.ext.allow=never` and `--` argument barriers), never a shell, while rejecting `-`-prefixed values, `ext::` URLs, and `refs/git2/` refspecs. Unlike local commands, these commands require `git` on `PATH`.
+
+### `git2 remote`
+
+```text
+git2 remote [-v|--verbose]
+git2 remote add <name> <url>
+git2 remote remove <name>
+git2 remote rename <old> <new>
+git2 remote get-url [--push] [--all] <name>
+git2 remote set-url [--push] <name> <newurl> [<oldurl>]
+```
+
+Manages configured remotes in `.git/config`. On adopted repositories, `remove` and `rename` execute inside a delegated pending transaction so any deleted or renamed `refs/remotes/<name>/*` tracking refs are captured in `oplog` (`.git/config` itself stays outside v0.1 recovery views).
+
+### `git2 clone`
+
+```text
+git2 clone [--branch <name>] [--origin <name>] [--no-adopt] [--max-file-mib <MiB>] [--] <url> [<directory>]
+```
+
+Clones `<url>` and automatically runs `git2 adopt --max-file-mib <MiB>` (default `100`) unless `--no-adopt` is passed. If the cloned repository uses an unsupported layout (such as submodules or files above the limit), the valid Git clone remains intact on disk while adoption explains why recovery storage was not created.
+
+### `git2 fetch`
+
+```text
+git2 fetch [--all] [-p|--prune] [-t|--tags] [--] [<remote>] [<refspec>...]
+```
+
+Requires an adopted repository and delegates `git fetch` inside a delegated pending transaction. Updated tracking refs and tags are recorded as an undoable `git2:fetch` operation; an up-to-date fetch appends no operation, and clean offline/auth failures clear pending state automatically.
+
+### `git2 pull`
+
+```text
+git2 pull [--ff-only | --merge | --rebase] [-p|--prune] [--] [<remote>] [<refspec>...]
+```
+
+Requires an adopted repository and defaults to `--ff-only`. Optional `--merge` (passes `--no-rebase --no-edit`) and `--rebase` wrap the pull in a conflict-recoverable delegated transaction:
+
+- clean updates append an undoable `git2:pull` operation;
+- non-fast-forward `--ff-only` refusals cleanly record any fetched tracking refs without leaving pending state stuck;
+- merge or rebase conflicts (or interruptions) keep `.git/git2/pending/delegated` active so you can either resolve conflicts manually in Git and run `git2 recover` (stripping optional `REUC` resolve-undo extensions cleanly) or abort everything back to the pre-pull snapshot with `git2 recover --rollback`.
+
+### `git2 push`
+
+```text
+git2 push [-u|--set-upstream] [--tags] [-d|--delete] [--force-with-lease | -f|--force] [-n|--dry-run] [--] [<remote>] [<refspec>...]
+```
+
+Refuses any pending transaction or refspec naming `refs/git2/`. Prints a clear notice on standard error (and stronger warning on `--force`) because commits already sent to a remote cannot be retracted by local `git2 undo`. On adopted repositories, any local tracking refs moved by the push record a `git2:push` operation explicitly marked non-undoable by `git2 undo`.

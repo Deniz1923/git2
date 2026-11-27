@@ -9,11 +9,15 @@
 pub mod commit;
 #[cfg(unix)]
 pub mod log;
+#[cfg(unix)]
+pub mod network;
 pub mod object;
 #[cfg(unix)]
 pub mod paths;
 #[cfg(unix)]
 pub mod recovery;
+#[cfg(unix)]
+pub mod remote;
 #[cfg(unix)]
 pub mod repository;
 #[cfg(unix)]

@@ -139,4 +139,10 @@ These risks are reasons for the repository-wide experimental warning, not merely
 
 ## Networking
 
-Clone, fetch, pull, and push are absent. The planned first networking implementation delegates to the installed Git executable and verifies that `.git/git2/` remains private. Native protocol work is not on the v0.1 critical path.
+`clone`, `fetch`, `pull`, `push`, and `remote` are implemented by delegating transport, authentication, and protocol handling to the installed `git` executable via strict argument vectors (`-c protocol.ext.allow=never` and `--` separators; ADR D013). `git2` retains local recovery ownership:
+
+- all local commands remain 100% independent of installed `git` (verified with `PATH=""`);
+- `.git/git2/` recovery metadata and staged-only objects never leave the clone via `push` or `git push --mirror`, and `refs/git2/*` refspecs are blocked;
+- `clone` auto-adopts supported repositories (`--no-adopt` opts out); `fetch` and `pull` capture pre-operation views in `pending/delegated` so even conflicted `pull --merge` / `--rebase` states can roll back cleanly via `git2 recover --rollback` (while manual Git conflict resolution strips optional `REUC` index extensions during `git2 recover`);
+- `remote` configuration lives in `.git/config` outside recovery views, though `remote remove`/`rename` record local tracking-ref updates in `oplog`;
+- `git2:push` entries are explicitly refused by `git2 undo`.

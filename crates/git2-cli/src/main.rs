@@ -11,9 +11,16 @@ use clap::{Args, Parser, Subcommand};
 use git2_core::commit::{self, CommitOutcome};
 #[cfg(unix)]
 use git2_core::log::{self, DEFAULT_LOG_COUNT, LogOptions};
+#[cfg(unix)]
+use git2_core::network::{
+    self, CloneOptions, FetchOptions, FetchOutcome, PullMode, PullOptions, PullOutcome,
+    PushOptions, PushOutcome,
+};
 use git2_core::object::{GitOid, ObjectKind, hash_object};
 #[cfg(unix)]
 use git2_core::recovery::{ContentId, OperationKind, RecoveryStore};
+#[cfg(unix)]
+use git2_core::remote::{self, RemoteAction, RemoteOutput};
 #[cfg(unix)]
 use git2_core::repository::{AdoptOptions, LocalRepository};
 #[cfg(unix)]
@@ -149,8 +156,176 @@ enum Command {
         nul: bool,
     },
 
+    /// Manage configured remote repositories (`list`, `add`, `remove`, `rename`, `get-url`, `set-url`).
+    #[cfg(unix)]
+    Remote(RemoteArgs),
+
+    /// Clone a repository and adopt it into local `.git/git2/` recovery storage.
+    #[cfg(unix)]
+    Clone {
+        /// Check out this branch instead of the remote's HEAD branch.
+        #[arg(short = 'b', long)]
+        branch: Option<String>,
+
+        /// Name to assign the upstream remote instead of `origin`.
+        #[arg(short = 'o', long, value_name = "NAME")]
+        origin: Option<String>,
+
+        /// Skip automatic `.git/git2/` recovery adoption after cloning.
+        #[arg(long)]
+        no_adopt: bool,
+
+        /// Refuse eligible files larger than this many MiB when auto-adopting.
+        #[arg(long, default_value_t = 100)]
+        max_file_mib: u64,
+
+        /// Source repository URL or path.
+        #[arg(value_name = "URL")]
+        url: String,
+
+        /// Destination working directory.
+        #[arg(value_name = "DIRECTORY")]
+        directory: Option<PathBuf>,
+    },
+
+    /// Fetch objects and refs from a remote into an adopted repository.
+    #[cfg(unix)]
+    Fetch {
+        /// Fetch from all configured remotes.
+        #[arg(long)]
+        all: bool,
+
+        /// Prune deleted remote-tracking branches.
+        #[arg(short = 'p', long)]
+        prune: bool,
+
+        /// Fetch all tags from the remote.
+        #[arg(short = 't', long)]
+        tags: bool,
+
+        /// Remote name or URL to fetch from.
+        #[arg(value_name = "REMOTE")]
+        remote: Option<String>,
+
+        /// Explicit refspecs to fetch.
+        #[arg(value_name = "REFSPEC")]
+        refspecs: Vec<String>,
+    },
+
+    /// Fetch and update the current branch (`--ff-only` by default; `--merge`/`--rebase` are conflict-recoverable).
+    #[cfg(unix)]
+    Pull(PullArgs),
+
+    /// Push local refs to a remote repository (not undoable by local `git2 undo`).
+    #[cfg(unix)]
+    Push(PushArgs),
+
     /// Inspect the object layer while the user-facing commands are built.
     Debug(DebugArgs),
+}
+
+#[cfg(unix)]
+#[derive(Args)]
+#[allow(clippy::struct_excessive_bools)]
+struct PullArgs {
+    /// Only allow fast-forward updates (default).
+    #[arg(long, group = "pull_mode")]
+    ff_only: bool,
+
+    /// Allow non-fast-forward merge commits (conflict-recoverable).
+    #[arg(long, group = "pull_mode")]
+    merge: bool,
+
+    /// Rebase local commits onto upstream (conflict-recoverable).
+    #[arg(long, group = "pull_mode")]
+    rebase: bool,
+
+    /// Prune deleted remote-tracking branches during fetch.
+    #[arg(short = 'p', long)]
+    prune: bool,
+
+    /// Remote name or URL to pull from.
+    #[arg(value_name = "REMOTE")]
+    remote: Option<String>,
+
+    /// Explicit refspecs to pull.
+    #[arg(value_name = "REFSPEC")]
+    refspecs: Vec<String>,
+}
+
+#[cfg(unix)]
+#[derive(Args)]
+#[allow(clippy::struct_excessive_bools)]
+struct PushArgs {
+    /// Set upstream tracking reference for pushed branches.
+    #[arg(short = 'u', long)]
+    set_upstream: bool,
+
+    /// Push all local tags.
+    #[arg(long)]
+    tags: bool,
+
+    /// Delete the named remote refs.
+    #[arg(short = 'd', long)]
+    delete: bool,
+
+    /// Protect remote branch tips with `--force-with-lease`.
+    #[arg(long, conflicts_with = "force")]
+    force_with_lease: bool,
+
+    /// Force-update remote refs without lease protection.
+    #[arg(short = 'f', long, conflicts_with = "force_with_lease")]
+    force: bool,
+
+    /// Preview push updates without sending refs to the remote.
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+
+    /// Remote name or URL to push to.
+    #[arg(value_name = "REMOTE")]
+    remote: Option<String>,
+
+    /// Explicit refspecs to push.
+    #[arg(value_name = "REFSPEC")]
+    refspecs: Vec<String>,
+}
+
+#[cfg(unix)]
+#[derive(Args)]
+struct RemoteArgs {
+    /// Show URLs alongside remote names when listing remotes.
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    #[command(subcommand)]
+    command: Option<RemoteCommand>,
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// Add a new remote repository.
+    Add { name: String, url: String },
+    /// Remove a configured remote repository.
+    Remove { name: String },
+    /// Rename a configured remote repository.
+    Rename { old: String, new: String },
+    /// Print configured URLs for a remote repository.
+    GetUrl {
+        #[arg(long)]
+        push: bool,
+        #[arg(long)]
+        all: bool,
+        name: String,
+    },
+    /// Change the URL of an existing remote repository.
+    SetUrl {
+        #[arg(long)]
+        push: bool,
+        name: String,
+        new_url: String,
+        old_url: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -212,6 +387,29 @@ fn main() -> anyhow::Result<()> {
         Command::Oplog => run_oplog(),
         #[cfg(unix)]
         Command::Status { nul } => run_status(nul),
+        #[cfg(unix)]
+        Command::Remote(args) => run_remote(args),
+        #[cfg(unix)]
+        Command::Clone {
+            branch,
+            origin,
+            no_adopt,
+            max_file_mib,
+            url,
+            directory,
+        } => run_clone(branch, origin, no_adopt, max_file_mib, url, directory),
+        #[cfg(unix)]
+        Command::Fetch {
+            all,
+            prune,
+            tags,
+            remote,
+            refspecs,
+        } => run_fetch(all, prune, tags, remote, refspecs),
+        #[cfg(unix)]
+        Command::Pull(args) => run_pull(args),
+        #[cfg(unix)]
+        Command::Push(args) => run_push(args),
         Command::Debug(args) => run_debug(args.command),
     }
 }
@@ -505,6 +703,11 @@ fn run_recover(status: bool, rollback: bool) -> anyhow::Result<()> {
             summary.next_action, summary.total_actions
         );
         println!("operation: {}", summary.operation_id);
+        if summary.conflict_state {
+            println!(
+                "conflict state: present (resolve in Git and run `git2 recover`, or abort with `git2 recover --rollback`)"
+            );
+        }
         return Ok(());
     }
 
@@ -548,7 +751,250 @@ const fn phase_label(phase: PendingPhase) -> &'static str {
         PendingPhase::Applying => "applying",
         PendingPhase::Finalizing => "finalizing",
         PendingPhase::Committed => "committed",
+        PendingPhase::Delegated => "delegated",
     }
+}
+
+#[cfg(unix)]
+fn run_remote(args: RemoteArgs) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    let action = match args.command {
+        None => RemoteAction::List {
+            verbose: args.verbose,
+        },
+        Some(RemoteCommand::Add { name, url }) => RemoteAction::Add { name, url },
+        Some(RemoteCommand::Remove { name }) => RemoteAction::Remove { name },
+        Some(RemoteCommand::Rename { old, new }) => RemoteAction::Rename { old, new },
+        Some(RemoteCommand::GetUrl { push, all, name }) => RemoteAction::GetUrl { name, push, all },
+        Some(RemoteCommand::SetUrl {
+            push,
+            name,
+            new_url,
+            old_url,
+        }) => RemoteAction::SetUrl {
+            name,
+            new_url,
+            old_url,
+            push,
+        },
+    };
+    let output = run_remote_apply(&repository, &action).context("remote command failed")?;
+    if !output.stdout.is_empty() {
+        io::stdout()
+            .lock()
+            .write_all(&output.stdout)
+            .context("could not write remote output to standard output")?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_clone(
+    branch: Option<String>,
+    origin: Option<String>,
+    no_adopt: bool,
+    max_file_mib: u64,
+    url: String,
+    directory: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let max_file_bytes = max_file_mib
+        .checked_mul(1024 * 1024)
+        .context("--max-file-mib is too large")?;
+    let cwd = std::env::current_dir().context("could not determine current working directory")?;
+    let outcome = network::clone_repo(
+        &cwd,
+        &CloneOptions {
+            url,
+            directory,
+            branch,
+            origin,
+            adopt: !no_adopt,
+            max_file_bytes,
+        },
+    )
+    .context("could not clone repository")?;
+    if let Some(adoption) = outcome.adoption {
+        println!(
+            "cloned {} and adopted {} files ({} bytes) as view {}",
+            outcome.workdir.display(),
+            adoption.file_count,
+            adoption.content_bytes,
+            adoption.view_id
+        );
+    } else {
+        println!("cloned {} without adoption", outcome.workdir.display());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_fetch(
+    all: bool,
+    prune: bool,
+    tags: bool,
+    remote: Option<String>,
+    refspecs: Vec<String>,
+) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    let outcome = run_fetch_apply(
+        &repository,
+        &FetchOptions {
+            remote,
+            refspecs,
+            all,
+            prune,
+            tags,
+        },
+    )
+    .context("could not fetch from remote")?;
+    if let Some(op_id) = outcome.operation_id {
+        println!(
+            "fetched at view {} as operation {}",
+            outcome.after_view, op_id
+        );
+    } else {
+        println!(
+            "fetch complete; already up to date at view {}",
+            outcome.after_view
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_pull(args: PullArgs) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let mode = if args.merge {
+        PullMode::Merge
+    } else if args.rebase {
+        PullMode::Rebase
+    } else {
+        PullMode::FfOnly
+    };
+    let _ = args.ff_only;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    let outcome = run_pull_apply(
+        &repository,
+        &PullOptions {
+            mode,
+            prune: args.prune,
+            remote: args.remote,
+            refspecs: args.refspecs,
+        },
+    )
+    .context("could not pull from remote")?;
+    if let Some(op_id) = outcome.operation_id {
+        println!(
+            "pulled at view {} as operation {}",
+            outcome.after_view, op_id
+        );
+    } else {
+        println!("already up to date at view {}", outcome.after_view);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_push(args: PushArgs) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    if !args.dry_run {
+        if args.force {
+            eprintln!(
+                "warning: force-pushing rewrites remote history and cannot be undone by local `git2 undo`"
+            );
+        } else {
+            eprintln!("note: remote pushes cannot be undone by local `git2 undo`");
+        }
+    }
+    let outcome = run_push_apply(
+        &repository,
+        &PushOptions {
+            remote: args.remote,
+            refspecs: args.refspecs,
+            set_upstream: args.set_upstream,
+            tags: args.tags,
+            delete: args.delete,
+            force_with_lease: args.force_with_lease,
+            force: args.force,
+            dry_run: args.dry_run,
+        },
+    )
+    .context("could not push to remote")?;
+    if let (Some(op_id), Some(after_view)) = (outcome.operation_id, outcome.after_view) {
+        println!("pushed at view {after_view} as operation {op_id}");
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_remote_apply(
+    repository: &LocalRepository,
+    action: &RemoteAction,
+) -> git2_core::Result<RemoteOutput> {
+    remote::run_with_hook(repository, action, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_remote_apply(
+    repository: &LocalRepository,
+    action: &RemoteAction,
+) -> git2_core::Result<RemoteOutput> {
+    remote::run(repository, action)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_fetch_apply(
+    repository: &LocalRepository,
+    options: &FetchOptions,
+) -> git2_core::Result<FetchOutcome> {
+    network::fetch_with_hook(repository, options, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_fetch_apply(
+    repository: &LocalRepository,
+    options: &FetchOptions,
+) -> git2_core::Result<FetchOutcome> {
+    network::fetch(repository, options)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_pull_apply(
+    repository: &LocalRepository,
+    options: &PullOptions,
+) -> git2_core::Result<PullOutcome> {
+    network::pull_with_hook(repository, options, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_pull_apply(
+    repository: &LocalRepository,
+    options: &PullOptions,
+) -> git2_core::Result<PullOutcome> {
+    network::pull(repository, options)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_push_apply(
+    repository: &LocalRepository,
+    options: &PushOptions,
+) -> git2_core::Result<PushOutcome> {
+    network::push_with_hook(repository, options, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_push_apply(
+    repository: &LocalRepository,
+    options: &PushOptions,
+) -> git2_core::Result<PushOutcome> {
+    network::push(repository, options)
 }
 
 #[cfg(unix)]

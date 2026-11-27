@@ -25,14 +25,18 @@ use crate::recovery::{
     checked_field, read_bytes, read_content_id, read_count, read_fixed, read_u64, take_byte,
     take_exact, write_bytes, write_count,
 };
-use crate::repository::{LocalRepository, current_timestamp_seconds, known_cas_for_view};
+use crate::repository::{
+    LocalRepository, current_timestamp_seconds, decode_index, known_cas_for_view, validate_index,
+};
 use crate::retention::MAX_OBJECT_BYTES;
 use crate::store::{BoundedReader, ObjectStore};
 use crate::{Error, Result};
 
 const PLAN_MAGIC: &[u8] = b"git2-plan\0\x01";
 const PENDING_MAGIC: &[u8] = b"git2-pending\0\x01";
+const DELEGATED_MAGIC: &[u8] = b"git2-delegated\0\x01";
 const ACTIVE_RECORD: &str = "active";
+const DELEGATED_RECORD: &str = "delegated";
 const PLAN_RECORD: &str = "plan";
 const OID_LEN: usize = 20;
 
@@ -337,13 +341,14 @@ impl MutationPlan {
     }
 }
 
-/// The four persisted phases of a pending transaction.
+/// The persisted phases of a pending transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingPhase {
     Prepared = 1,
     Applying = 2,
     Finalizing = 3,
     Committed = 4,
+    Delegated = 5,
 }
 
 impl PendingPhase {
@@ -357,6 +362,7 @@ impl PendingPhase {
             2 => Ok(Self::Applying),
             3 => Ok(Self::Finalizing),
             4 => Ok(Self::Committed),
+            5 => Ok(Self::Delegated),
             _ => Err(Error::CorruptRecovery(format!(
                 "unknown pending transaction phase {code}"
             ))),
@@ -377,6 +383,7 @@ pub struct PendingSummary {
     pub next_action: usize,
     pub total_actions: usize,
     pub operation_id: ContentId,
+    pub conflict_state: bool,
 }
 
 /// Result of reconciling or rolling back a pending transaction.
@@ -419,6 +426,85 @@ struct LockOwner {
     ino: u64,
     lock_rel_path: BString,
     stage_name: BString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DelegatedRecord {
+    tx_id: ContentId,
+    parent: ContentId,
+    before_view: ContentId,
+    timestamp_seconds: i64,
+    command: BString,
+    allow_conflict_rollback: bool,
+}
+
+impl DelegatedRecord {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let total = DELEGATED_MAGIC.len()
+            + DIGEST_LEN * 3
+            + size_of::<i64>()
+            + size_of::<u64>()
+            + checked_field(self.command.len(), "delegated command")?
+            + 1;
+        if total > MAX_OPERATION_BYTES {
+            return Err(Error::CorruptRecovery(format!(
+                "delegated pending record is {total} bytes, above the {MAX_OPERATION_BYTES} byte limit"
+            )));
+        }
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(DELEGATED_MAGIC);
+        out.extend_from_slice(self.tx_id.as_bytes());
+        out.extend_from_slice(self.parent.as_bytes());
+        out.extend_from_slice(self.before_view.as_bytes());
+        out.extend_from_slice(&self.timestamp_seconds.to_le_bytes());
+        write_bytes(&mut out, self.command.as_ref());
+        out.push(u8::from(self.allow_conflict_rollback));
+        debug_assert_eq!(out.len(), total);
+        Ok(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_OPERATION_BYTES {
+            return Err(Error::CorruptRecovery(format!(
+                "delegated pending record of {} bytes exceeds the {MAX_OPERATION_BYTES} byte limit",
+                bytes.len()
+            )));
+        }
+        let mut input = bytes;
+        take_exact(&mut input, DELEGATED_MAGIC.len())
+            .filter(|magic| *magic == DELEGATED_MAGIC)
+            .ok_or_else(|| {
+                Error::CorruptRecovery("invalid delegated pending record header".to_owned())
+            })?;
+        let tx_id = read_content_id(&mut input, "delegated transaction id")?;
+        let parent = read_content_id(&mut input, "delegated parent operation")?;
+        let before_view = read_content_id(&mut input, "delegated before view")?;
+        let ts_bytes = read_fixed::<8>(&mut input, "delegated timestamp")?;
+        let timestamp_seconds = i64::from_le_bytes(ts_bytes);
+        let command = read_bytes(&mut input)?;
+        let allow_conflict_rollback = match take_byte(&mut input)? {
+            0 => false,
+            1 => true,
+            marker => {
+                return Err(Error::CorruptRecovery(format!(
+                    "invalid delegated conflict marker {marker}"
+                )));
+            }
+        };
+        if !input.is_empty() {
+            return Err(Error::CorruptRecovery(
+                "trailing bytes after delegated pending record".to_owned(),
+            ));
+        }
+        Ok(Self {
+            tx_id,
+            parent,
+            before_view,
+            timestamp_seconds,
+            command,
+            allow_conflict_rollback,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -913,7 +999,24 @@ fn decode_opt_bytes(input: &mut &[u8], noun: &str) -> Result<Option<BString>> {
 pub fn pending(repo: &RecoveryRepository) -> Result<Option<PendingSummary>> {
     let dir = repo.store().pending_dir()?;
     if !dir.exists(ACTIVE_RECORD)? {
-        return Ok(None);
+        if !dir.exists(DELEGATED_RECORD)? {
+            return Ok(None);
+        }
+        let record = DelegatedRecord::decode(&dir.read(DELEGATED_RECORD, MAX_OPERATION_BYTES)?)?;
+        let conflict_state = has_git_conflict_state(repo.git_dir())?;
+        return Ok(Some(PendingSummary {
+            tx_id: record.tx_id,
+            parent: record.parent,
+            before_view: record.before_view,
+            target_view: record.before_view,
+            plan_id: record.tx_id,
+            command: record.command,
+            phase: PendingPhase::Delegated,
+            next_action: 0,
+            total_actions: 0,
+            operation_id: record.tx_id,
+            conflict_state,
+        }));
     }
     let record = PendingRecord::decode(&dir.read(ACTIVE_RECORD, MAX_OPERATION_BYTES)?)?;
     let plan_bytes = dir.read(PLAN_RECORD, MAX_VIEW_BYTES).map_err(|error| {
@@ -946,7 +1049,170 @@ pub fn pending(repo: &RecoveryRepository) -> Result<Option<PendingSummary>> {
         next_action: record.next_action,
         total_actions: actions.len(),
         operation_id,
+        conflict_state: false,
     }))
+}
+
+/// Outcome returned by a caller-supplied delegated Git subprocess inside [`run_delegated_with_hook`].
+pub(crate) enum DelegatedExit {
+    Success,
+    Failed(String),
+}
+
+/// Summary returned after completing a delegated transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DelegatedOutcome {
+    pub(crate) operation_id: Option<ContentId>,
+    pub(crate) before_view: ContentId,
+    pub(crate) after_view: ContentId,
+}
+
+/// Run a delegated external Git mutation (such as `fetch`, `pull`, `push`, or `remote remove`)
+/// inside a durable `pending/delegated` record so interruption or conflicts stay recoverable.
+pub(crate) fn run_delegated_with_hook(
+    repo: &LocalRepository,
+    command: BString,
+    allow_conflict_rollback: bool,
+    mut hook: impl FnMut(Failpoint) -> Result<()>,
+    op: impl FnOnce() -> Result<DelegatedExit>,
+) -> Result<DelegatedOutcome> {
+    let store = RecoveryStore::open(repo.git_dir())?;
+    let lock = store.try_lock()?;
+    if store.has_pending()? {
+        return Err(Error::UnsupportedRepository(
+            "a pending transaction exists; reconcile or inspect it with `recover` first".to_owned(),
+        ));
+    }
+
+    repo.import_external_changes_locked(&store, &lock)?;
+    let parent = store.head()?;
+    let before_view = store.current_view()?;
+    let before = store.read_view(before_view)?;
+    let known_cas = known_cas_for_view(&before);
+    let timestamp_seconds = current_timestamp_seconds();
+
+    let mut tx_input = Vec::new();
+    tx_input.extend_from_slice(parent.as_bytes());
+    tx_input.extend_from_slice(before_view.as_bytes());
+    tx_input.extend_from_slice(&timestamp_seconds.to_le_bytes());
+    tx_input.extend_from_slice(command.as_ref());
+    let tx_id = ContentId::for_bytes(&tx_input);
+
+    let pending_dir = store.pending_dir()?;
+    cleanup_orphan_pending(&store, &pending_dir)?;
+    let record = DelegatedRecord {
+        tx_id,
+        parent,
+        before_view,
+        timestamp_seconds,
+        command,
+        allow_conflict_rollback,
+    };
+    hook(Failpoint::BeforePendingWrite)?;
+    pending_dir.write_pointer(DELEGATED_RECORD, &record.encode()?)?;
+    hook(Failpoint::AfterPrepare)?;
+
+    match op() {
+        Ok(DelegatedExit::Success) => {
+            finalize_delegated_success(repo, &store, &record, &known_cas, &mut hook)
+        }
+        Ok(DelegatedExit::Failed(reason)) => {
+            handle_delegated_failure(repo, &store, &record, &Error::UnsupportedRepository(reason))
+        }
+        Err(error) => handle_delegated_failure(repo, &store, &record, &error),
+    }
+}
+
+fn finalize_delegated_success(
+    repo: &LocalRepository,
+    store: &RecoveryStore,
+    record: &DelegatedRecord,
+    known_cas: &std::collections::BTreeSet<ContentId>,
+    hook: &mut impl FnMut(Failpoint) -> Result<()>,
+) -> Result<DelegatedOutcome> {
+    hook(Failpoint::BeforeFinalize)?;
+    let Ok(live_repo) = LocalRepository::discover(repo.workdir()) else {
+        return Err(Error::UnsupportedRepository(format!(
+            "`{}` left the repository in a state git2 cannot adopt automatically; run `git2 recover --rollback` to restore the pre-operation view {}",
+            String::from_utf8_lossy(record.command.as_slice()),
+            record.before_view
+        )));
+    };
+    let after_view = live_repo.capture_and_persist_view_with_known(store, known_cas)?;
+    if after_view == record.before_view {
+        store.pending_dir()?.remove_if_exists(DELEGATED_RECORD)?;
+        return Ok(DelegatedOutcome {
+            operation_id: None,
+            before_view: record.before_view,
+            after_view,
+        });
+    }
+    let operation = Operation {
+        parent: Some(record.parent),
+        before: record.before_view,
+        after: after_view,
+        kind: OperationKind::Git2(record.command.clone()),
+        timestamp_seconds: record.timestamp_seconds,
+    };
+    let operation_id = store.put_operation(&operation)?;
+    hook(Failpoint::AfterOperationWrite)?;
+    store.set_head(operation_id)?;
+    hook(Failpoint::AfterHeadSelection)?;
+    hook(Failpoint::BeforePendingCleanup)?;
+    store.pending_dir()?.remove_if_exists(DELEGATED_RECORD)?;
+    Ok(DelegatedOutcome {
+        operation_id: Some(operation_id),
+        before_view: record.before_view,
+        after_view,
+    })
+}
+
+fn handle_delegated_failure(
+    repo: &LocalRepository,
+    store: &RecoveryStore,
+    record: &DelegatedRecord,
+    error: &Error,
+) -> Result<DelegatedOutcome> {
+    let policy = store.policy()?;
+    if !has_git_conflict_state(repo.git_dir())?
+        && let Ok(live) = LocalRepository::discover(repo.workdir())
+    {
+        if live
+            .compute_live_view_readonly(policy)
+            .is_ok_and(|live_id| live_id == record.before_view)
+        {
+            store.pending_dir()?.remove_if_exists(DELEGATED_RECORD)?;
+            return Err(Error::UnsupportedRepository(error.to_string()));
+        }
+        if !record.allow_conflict_rollback && record.command.starts_with(b"pull --ff-only") {
+            let before = store.read_view(record.before_view)?;
+            let known = known_cas_for_view(&before);
+            let after_view = live.capture_and_persist_view_with_known(store, &known)?;
+            let ext = Operation {
+                parent: Some(record.parent),
+                before: record.before_view,
+                after: after_view,
+                kind: OperationKind::ExternalGit,
+                timestamp_seconds: current_timestamp_seconds(),
+            };
+            let ext_id = store.put_operation(&ext)?;
+            store.set_head(ext_id)?;
+            store.pending_dir()?.remove_if_exists(DELEGATED_RECORD)?;
+            return Err(Error::UnsupportedRepository(error.to_string()));
+        }
+    }
+    let cmd = String::from_utf8_lossy(record.command.as_slice());
+    if record.allow_conflict_rollback || has_git_conflict_state(repo.git_dir())? {
+        Err(Error::UnsupportedRepository(format!(
+            "{error}\n`{cmd}` modified or conflicted the working tree; finish resolving in Git and run `git2 recover`, or run `git2 recover --rollback` to restore view {}",
+            record.before_view
+        )))
+    } else {
+        Err(Error::UnsupportedRepository(format!(
+            "{error}\n`{cmd}` exited after partial local changes; run `git2 recover` to record them or `git2 recover --rollback` to restore view {}",
+            record.before_view
+        )))
+    }
 }
 
 /// Execute a validated mutation plan atomically and record one new recovery operation.
@@ -1085,6 +1351,9 @@ pub fn recover_with_hook(
     let _lock = store.try_lock()?;
     let pending_dir = store.pending_dir()?;
     if !pending_dir.exists(ACTIVE_RECORD)? {
+        if pending_dir.exists(DELEGATED_RECORD)? {
+            return recover_delegated(repo, store, &pending_dir, &mut hook);
+        }
         cleanup_orphan_pending(store, &pending_dir)?;
         return Ok(RecoveryOutcome::Clean);
     }
@@ -1170,6 +1439,9 @@ pub fn rollback(repo: &RecoveryRepository) -> Result<RecoveryOutcome> {
     let _lock = store.try_lock()?;
     let pending_dir = store.pending_dir()?;
     if !pending_dir.exists(ACTIVE_RECORD)? {
+        if pending_dir.exists(DELEGATED_RECORD)? {
+            return rollback_delegated(repo, store, &pending_dir);
+        }
         cleanup_orphan_pending(store, &pending_dir)?;
         return Ok(RecoveryOutcome::Clean);
     }
@@ -1985,6 +2257,267 @@ fn divergence_error(path: &[u8]) -> Error {
     ))
 }
 
+const TRANSIENT_GIT_FILES: [&[u8]; 9] = [
+    b"MERGE_HEAD",
+    b"MERGE_MSG",
+    b"MERGE_MODE",
+    b"AUTO_MERGE",
+    b"ORIG_HEAD",
+    b"FETCH_HEAD",
+    b"CHERRY_PICK_HEAD",
+    b"REVERT_HEAD",
+    b"BISECT_LOG",
+];
+
+const CONFLICT_GIT_FILES: [&[u8]; 3] = [b"MERGE_HEAD", b"CHERRY_PICK_HEAD", b"REVERT_HEAD"];
+
+const TRANSIENT_GIT_DIRS: [&[u8]; 3] = [b"rebase-merge", b"rebase-apply", b"sequencer"];
+
+/// Report whether `.git/` currently holds in-progress merge/rebase state or unmerged index stages.
+pub(crate) fn has_git_conflict_state(git_dir: &Path) -> Result<bool> {
+    let git_meta = CheckedRoot::open(git_dir)?;
+    for rel in CONFLICT_GIT_FILES {
+        if git_meta.entry_kind(rel)?.is_some() {
+            return Ok(true);
+        }
+    }
+    for rel in TRANSIENT_GIT_DIRS {
+        if git_meta.entry_kind(rel)?.is_some() {
+            return Ok(true);
+        }
+    }
+    if let Some(index_bytes) = git_meta.read_file_raw(b"index", MAX_CAS_BYTES as u64)? {
+        match decode_index(&index_bytes) {
+            Ok(index) => {
+                if index.entries().iter().any(|entry| entry.stage_raw() != 0) {
+                    return Ok(true);
+                }
+            }
+            Err(_) => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+fn recover_delegated(
+    repo: &RecoveryRepository,
+    store: &RecoveryStore,
+    pending_dir: &crate::recovery::disk::Directory,
+    hook: &mut impl FnMut(Failpoint) -> Result<()>,
+) -> Result<RecoveryOutcome> {
+    let record =
+        DelegatedRecord::decode(&pending_dir.read(DELEGATED_RECORD, MAX_OPERATION_BYTES)?)?;
+    let current_head = store.head()?;
+    if current_head != record.parent {
+        let head_op = store.read_operation(current_head)?;
+        if head_op.parent == Some(record.parent)
+            && head_op.before == record.before_view
+            && head_op.timestamp_seconds == record.timestamp_seconds
+            && matches!(&head_op.kind, OperationKind::Git2(cmd) if cmd == &record.command)
+        {
+            pending_dir.remove_if_exists(DELEGATED_RECORD)?;
+            return Ok(RecoveryOutcome::Finalized {
+                operation_id: current_head,
+                after_view: head_op.after,
+            });
+        }
+        return Err(Error::CorruptRecovery(format!(
+            "recovery HEAD {current_head} matches neither delegated parent {} nor its operation",
+            record.parent
+        )));
+    }
+    if has_git_conflict_state(repo.git_dir())? {
+        return Err(Error::UnsupportedRepository(format!(
+            "repository has unresolved merge/rebase conflicts from `{}`; resolve them in Git and re-run `git2 recover`, or abort and restore view {} with `git2 recover --rollback`",
+            String::from_utf8_lossy(record.command.as_slice()),
+            record.before_view
+        )));
+    }
+    strip_reuc_extension_if_present(repo.git_dir(), record.tx_id)?;
+    let live_repo = LocalRepository::discover(repo.workdir())?;
+    let before = store.read_view(record.before_view)?;
+    let known = known_cas_for_view(&before);
+    let after_view = live_repo.capture_and_persist_view_with_known(store, &known)?;
+    if after_view == record.before_view {
+        pending_dir.remove_if_exists(DELEGATED_RECORD)?;
+        return Ok(RecoveryOutcome::Aborted {
+            before_view: record.before_view,
+        });
+    }
+    let operation = Operation {
+        parent: Some(record.parent),
+        before: record.before_view,
+        after: after_view,
+        kind: OperationKind::Git2(record.command),
+        timestamp_seconds: record.timestamp_seconds,
+    };
+    let operation_id = store.put_operation(&operation)?;
+    hook(Failpoint::RecoverAfterOperationWrite)?;
+    store.set_head(operation_id)?;
+    hook(Failpoint::RecoverAfterHeadSelection)?;
+    pending_dir.remove_if_exists(DELEGATED_RECORD)?;
+    Ok(RecoveryOutcome::Finalized {
+        operation_id,
+        after_view,
+    })
+}
+
+fn rollback_delegated(
+    repo: &RecoveryRepository,
+    store: &RecoveryStore,
+    pending_dir: &crate::recovery::disk::Directory,
+) -> Result<RecoveryOutcome> {
+    let record =
+        DelegatedRecord::decode(&pending_dir.read(DELEGATED_RECORD, MAX_OPERATION_BYTES)?)?;
+    let current_head = store.head()?;
+    if current_head != record.parent {
+        return Err(Error::CorruptRecovery(format!(
+            "recovery HEAD {current_head} does not match delegated pending parent {}",
+            record.parent
+        )));
+    }
+    let policy = store.policy()?;
+    let before_view = store.read_view(record.before_view)?;
+    crate::restore::verify_target_view(store, &before_view, policy)?;
+
+    let git_meta = CheckedRoot::open(repo.git_dir())?;
+    ensure_no_git_lock_files(&git_meta, b"")?;
+
+    clean_git_in_progress_state(&git_meta)?;
+    restore_invalid_index_if_needed(&git_meta, store, &before_view, record.tx_id)?;
+
+    let live_repo = LocalRepository::discover(repo.workdir())?;
+    let plan = crate::restore::plan_with_store(
+        &live_repo,
+        store,
+        record.before_view,
+        BString::from("recover --rollback"),
+    )?;
+    crate::restore::ensure_no_foreign_locks(repo.git_dir(), &plan.actions)?;
+
+    let mut context = TxContext::new(repo.git_dir(), repo.workdir(), store, policy, record.tx_id)?;
+    for (idx, action) in plan.actions.iter().enumerate() {
+        match metadata_spec(store, action)? {
+            Some(spec) => rollback_locked_metadata(&context, idx, &spec)?,
+            None => apply_unlocked_action(&mut context, idx, action)?,
+        }
+    }
+    cleanup_worktree_temps(&context, &plan.actions)?;
+
+    let actual_before = live_repo.capture_and_persist_view(store)?;
+    if actual_before != record.before_view {
+        return Err(Error::CorruptRecovery(format!(
+            "rolled-back state hashes to view {actual_before}, expected {}",
+            record.before_view
+        )));
+    }
+    pending_dir.remove_if_exists(DELEGATED_RECORD)?;
+    Ok(RecoveryOutcome::RolledBack {
+        before_view: record.before_view,
+    })
+}
+
+fn ensure_no_git_lock_files(git_meta: &CheckedRoot, prefix: &[u8]) -> Result<()> {
+    let checks: [&[u8]; 3] = [b"index.lock", b"HEAD.lock", b"packed-refs.lock"];
+    if prefix.is_empty() {
+        for name in checks {
+            if git_meta.entry_kind(name)?.is_some() {
+                return Err(foreign_lock_error(name));
+            }
+        }
+        return ensure_no_git_lock_files(git_meta, b"refs");
+    }
+    for (name, kind) in git_meta.list_dir_entries(prefix)? {
+        let mut child = prefix.to_vec();
+        child.push(b'/');
+        child.extend_from_slice(name.as_slice());
+        if kind == PathEntryKind::Directory {
+            ensure_no_git_lock_files(git_meta, &child)?;
+        } else if name.ends_with(b".lock") {
+            return Err(foreign_lock_error(&child));
+        }
+    }
+    Ok(())
+}
+
+fn clean_git_in_progress_state(git_meta: &CheckedRoot) -> Result<()> {
+    for rel in TRANSIENT_GIT_FILES {
+        if git_meta.entry_kind(rel)?.is_some() {
+            git_meta.remove_entry(rel)?;
+        }
+    }
+    for rel in TRANSIENT_GIT_DIRS {
+        if let Some(kind) = git_meta.entry_kind(rel)? {
+            if kind == PathEntryKind::Directory {
+                remove_checked_dir_recursive(git_meta, rel)?;
+            } else {
+                git_meta.remove_entry(rel)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_checked_dir_recursive(root: &CheckedRoot, dir_rel: &[u8]) -> Result<()> {
+    for (name, kind) in root.list_dir_entries(dir_rel)? {
+        let mut child = dir_rel.to_vec();
+        child.push(b'/');
+        child.extend_from_slice(name.as_slice());
+        if kind == PathEntryKind::Directory {
+            remove_checked_dir_recursive(root, &child)?;
+        } else {
+            root.remove_entry(&child)?;
+        }
+    }
+    root.remove_empty_dir(dir_rel)
+}
+
+fn restore_invalid_index_if_needed(
+    git_meta: &CheckedRoot,
+    store: &RecoveryStore,
+    before_view: &crate::recovery::View,
+    tx_id: ContentId,
+) -> Result<()> {
+    let index_invalid = match git_meta.read_file_raw(b"index", MAX_CAS_BYTES as u64)? {
+        Some(bytes) => decode_index(&bytes)
+            .and_then(|state| validate_index(&state))
+            .is_err(),
+        None => false,
+    };
+    if !index_invalid {
+        return Ok(());
+    }
+    match before_view.index {
+        Some(index_id) => {
+            let bytes = store.read_content_bounded(index_id, MAX_CAS_BYTES)?;
+            let temp = worktree_temp_name(tx_id, usize::MAX);
+            git_meta.write_entry_atomic(b"index", FileKind::Regular, &bytes, &temp)?;
+        }
+        None => {
+            git_meta.remove_entry(b"index")?;
+        }
+    }
+    Ok(())
+}
+
+fn strip_reuc_extension_if_present(git_dir: &Path, tx_id: ContentId) -> Result<()> {
+    let git_meta = CheckedRoot::open(git_dir)?;
+    let Some(bytes) = git_meta.read_file_raw(b"index", MAX_CAS_BYTES as u64)? else {
+        return Ok(());
+    };
+    let mut index = decode_index(&bytes)?;
+    validate_index(&index)?;
+    if index.resolve_undo().is_none() {
+        return Ok(());
+    }
+    if git_meta.entry_kind(b"index.lock")?.is_some() {
+        return Err(foreign_lock_error(b"index.lock"));
+    }
+    let clean_bytes = crate::reset::serialize_index(&mut index)?;
+    let temp = worktree_temp_name(tx_id, usize::MAX);
+    git_meta.write_entry_atomic(b"index", FileKind::Regular, &clean_bytes, &temp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2079,5 +2612,28 @@ mod tests {
         let mut trailing_record = encoded_record;
         trailing_record.push(0);
         assert!(PendingRecord::decode(&trailing_record).is_err());
+    }
+
+    #[test]
+    fn delegated_record_round_trips_and_rejects_corruption() {
+        let delegated = DelegatedRecord {
+            tx_id: ContentId::for_bytes(b"delegated-tx"),
+            parent: ContentId::for_bytes(b"parent"),
+            before_view: ContentId::for_bytes(b"before"),
+            timestamp_seconds: 12345,
+            command: BString::from("pull --merge origin"),
+            allow_conflict_rollback: true,
+        };
+        let encoded_delegated = delegated.encode().unwrap();
+        assert_eq!(
+            DelegatedRecord::decode(&encoded_delegated).unwrap(),
+            delegated
+        );
+        for end in 0..encoded_delegated.len() {
+            assert!(DelegatedRecord::decode(&encoded_delegated[..end]).is_err());
+        }
+        let mut trailing_delegated = encoded_delegated;
+        trailing_delegated.push(0);
+        assert!(DelegatedRecord::decode(&trailing_delegated).is_err());
     }
 }

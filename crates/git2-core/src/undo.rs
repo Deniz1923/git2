@@ -138,6 +138,16 @@ fn resolve_undo_target(
                     cursor, operation.before
                 )));
             }
+            OperationKind::Git2(command)
+                if command.as_slice() == b"push" || command.starts_with(b"push ") =>
+            {
+                return Err(Error::UnsupportedRepository(format!(
+                    "latest operation {} is a remote push (`git2:{}`); commits sent to a remote cannot be undone locally (use `git2 restore --view {}` only if you want to restore local repository state)",
+                    cursor,
+                    String::from_utf8_lossy(command.as_ref()),
+                    operation.before
+                )));
+            }
             OperationKind::Git2(_) => {
                 let expected_after = store.read_view(operation.after)?;
                 if !views_semantically_equal(
