@@ -79,12 +79,12 @@ git2 implements the semantics that teach and distinguish the project, while reus
 | Recovery format and operation semantics | git2 |
 | Product-level safety/refusal policy | git2 |
 | Packed object lookup | `gix` |
-| Index decoding and future transactional index writes | `gix` |
+| Index decoding and filter/attribute evaluation | `gix` |
 | Ignore/path traversal and status plumbing | `gix` |
 | SHA-1 and SHA-256 compression/digests | focused Rust crates |
-| Future clone/fetch/push transport | installed `git` subprocess initially |
+| Clone, fetch, pull, push, and remote transport | installed `git` via strict argv |
 
-Subprocesses must use argument vectors, never shell interpolation. Networking is deferred until the local recovery contract is proven.
+Subprocesses use explicit argument vectors with `-c protocol.ext.allow=never` and `--` argument barriers—never shell interpolation. All local commands retain zero runtime dependency on an installed `git` binary.
 
 ## Data domains
 
@@ -169,6 +169,8 @@ Implemented Git mutations (`restore`, `reset`, `undo`, `add`, `commit`, and reco
 
 On startup, `git2 recover` reconciles a pending record idempotently before another mutation: aborting cleanly if `Prepared`, resuming and finalizing if `Applying`/`Finalizing`, or cleaning pending state without duplicating history if recovery `HEAD` already selected the deterministic operation ID. (`--rollback` can also revert un-selected `Prepared`/`Applying`/`Finalizing` states.)
 
+Delegated network/remote mutations (`fetch`, `pull`, `push`, `remote remove`, `remote rename`) capture and sync `before_view` first, then persist `.git/git2/pending/delegated` (`PendingPhase::Delegated = 5`) before invoking installed `git` via strict argv. If `git pull --merge` or `--rebase` stops with unresolved conflicts or a process is killed mid-flight, `pending/delegated` remains active: `git2 recover --rollback` removes transient conflict state (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge/`, `rebase-apply/`, `sequencer/`, etc.) and restores `before_view`, whereas manually resolving conflicts in Git and running `git2 recover` strips optional `REUC` index extensions and finalizes an undoable operation. `git2:push` records are explicitly refused by `git2 undo`.
+
 ## Undo semantics
 
 Undo is a new operation, not history deletion:
@@ -182,7 +184,7 @@ Restoring a view updates HEAD/refs/index/worktree as a checked transaction. It f
 
 ## Safety invariants
 
-The following invariants are already enforced:
+The following invariants are enforced in the current implementation:
 
 - Recovery IDs are recomputed and checked when records are read.
 - Existing immutable records are never silently overwritten with different bytes.
@@ -192,22 +194,19 @@ The following invariants are already enforced:
 - Recovery metadata is below `.git/git2/`, never `refs/`.
 - Paths are byte-safe on Unix and repository-relative.
 - Empty, absolute, `.`, `..`, empty-component, and `.git` path components are rejected during worktree path construction.
-- Known unsupported repository states are refused.
+- Known unsupported repository states are refused before writes.
 - Oversized eligible regular files block adoption/import.
-
-The following invariants are required before the first mutation:
-
-- A durable pending record exists before changing Git state.
-- Recovery from interruption is idempotent and tested at each write boundary.
+- A durable pending record (`pending/active` + `pending/plan`, or `pending/delegated`) exists before mutating Git or worktree state.
+- Recovery from interruption (`git2 recover [--status | --rollback]`) is idempotent and failpoint-tested across every transaction phase.
 - Restore never writes through a symlink or outside the worktree.
-- Ref and index writes use lockfile/compare-and-swap semantics.
+- Ref and index writes use staged-inode lock attribution and compare-and-swap semantics.
 - The pre-operation view remains reachable even if post-operation capture fails.
+
+Remaining `v0.3+` hardening targets (streaming CAS capture/decompression, multi-phase concurrent ordinary-`git` race detection, and power-loss fault injection) are tracked in the [roadmap](roadmap.md).
 
 ## Concurrency model
 
-The current advisory lock serializes cooperating git2 processes. Ordinary Git does not take this lock, so Git may still change repository state during a capture. Current capture errors are surfaced, but full concurrent-change detection is not yet proven.
-
-Before mutating commands ship, captures need a consistency check across HEAD, refs, index, and file metadata, with retry or refusal if another process changes them during the transaction.
+The advisory lock under `.git/git2/lock` serializes cooperating `git2` writers. Ordinary `git` does not take this lock and uses `.git/*.lock` files instead, which `git2` detects and refuses untouched via staged-inode attribution. Full multi-phase consistency/retry checks across concurrent ordinary `git` worktree/ref modifications remain a planned `v0.3` (Milestone 16) improvement.
 
 ## Error policy
 

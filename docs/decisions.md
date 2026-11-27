@@ -171,14 +171,13 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 
 ## Open decisions
 
-These must be resolved by their roadmap milestones:
+These must be resolved in upcoming roadmap milestones (`v0.2–v1.0`):
 
-- consistency/retry policy for concurrent ordinary Git activity during restore/native commands;
-- reflog requirements for v0.1 commits/resets;
-- revision syntax supported by reset/log;
-- operation abbreviation and ambiguity rules;
-- divergence policy for undoing an older/non-selected operation;
-- redo user interface;
-- machine/power-loss reliability testing under the strict sidecar sync policy;
-- explicit recovery garbage-collection UX;
-- whether macOS joins v0.1 or remains a v0.2 target after native testing.
+- consistency/retry policy for concurrent ordinary `git` activity during capture and mutation (`v0.3` M16);
+- short op/view ID prefix minimum length and collision refusal behavior (`v0.3` M14);
+- policy for non-HEAD divergence `undo` vs explicit target-view `restore` (`v0.3` M14);
+- `git2 redo` UX and `oplog` filtering/formatting (`v0.3` M14);
+- explicit `git2 gc` / `git2 storage` retention defaults (`v0.3` M15);
+- power-loss filesystem durability testing harness under strict sidecar sync rules (`v1.0` M22);
+- macOS (APFS case-insensitivity/Unicode normalization) and Windows (NTFS handles/ACLs/symlinks) recovery semantics (`v0.5` M20);
+- whether `v1.0` retains `git` subprocess delegation for wire transport or adopts native protocol libraries (`v1.0` M22).

@@ -5,7 +5,7 @@
 The project uses ordinary Git repositories as its interchange format. It adds a private, clone-local operation history under `.git/git2/` and is being developed as a learning-first, portfolio-grade implementation of Git’s local mechanics.
 
 > [!WARNING]
-> git2 is experimental (`0.1.0-alpha.1`) and **not safe for important repositories**. It implements the v0.1 local recovery command set (`adopt`, `checkpoint`, `status`, `oplog`, `restore`, `recover`, `reset`, `undo`, `add`, `commit`, and `log`); always evaluate in disposable clones and keep external backups.
+> git2 is experimental (`0.1.0-alpha.1`, `publish = false`) and **not safe for important repositories**. It completes the v0.1 command set (`adopt`, `checkpoint`, `status`, `oplog`, `restore`, `recover`, `reset`, `undo`, `add`, `commit`, `log`, `remote`, `clone`, `fetch`, `pull`, and `push`); always evaluate in disposable clones and keep external backups.
 
 ## Current status
 
@@ -21,10 +21,10 @@ The project uses ordinary Git repositories as its interchange format. It adds a 
 | Reset and undo | Implemented | `reset [--soft \| --mixed \| --hard]`, semantic-index `undo [--dry-run]` / redo + crash tests |
 | Staging | Implemented | `add [--all] [--] [<path>...]` with built-in EOL conversion, ignore rules, and atomic index lock |
 | Commits and log | Implemented | `commit -m <message>` via transactional tree/commit/ref writes (`undo`-capable) and bounded `log [-n <n>]` |
-| Release readiness & CI | Implemented | Mirror-push privacy test, `PATH=""` smoke test, `scripts/demo.sh`, `scripts/package-release.sh`, [runbook](docs/runbook.md), and [v0.1 release notes](docs/release-v0.1.md) |
+| Release readiness & CI | Implemented | Mirror-push privacy test, `PATH=""` smoke test, `scripts/demo.sh`, `scripts/package-release.sh`, [runbook](docs/runbook.md), and [verification baseline](docs/development.md#verification-baseline-010-alpha1) |
 | Networking & remotes | Implemented | `clone`, `fetch`, `pull` (`--ff-only` default + conflict-recoverable `--merge`/`--rebase`), `push`, and `remote` via strict `git` argv delegation (local commands keep zero `git` runtime dependency) |
 
-See the [full roadmap](docs/roadmap.md) for milestones and exit criteria.
+See the [full roadmap](docs/roadmap.md) (`v0.1` through `v1.0`) for completed work, upcoming milestones, and exit criteria.
 
 ## Why this project exists
 
@@ -35,7 +35,7 @@ Git already has reflogs and recoverable objects, but recovery is fragmented acro
 3. Record the before/after transition in an immutable local operation log.
 4. Let the user restore an earlier view without rewriting or deleting that history.
 
-The current build implements the full experimental v0.1 local workflow: private format-3 storage, external-change import, the 4-phase pending-transaction journal, verified `restore --view`, `recover`, `reset`, `undo`/redo, `add`, `commit -m`, and bounded `log`.
+The current build implements the full experimental v0.1 command set: private format-3 storage, external-change import, the 4-phase pending-transaction journal, verified `restore --view`, `recover`, `reset`, `undo`/redo, `add`, `commit -m`, bounded `log`, plus delegated `remote`, `clone`, `fetch`, `pull`, and `push`.
 
 ## Supported environment
 
@@ -139,16 +139,13 @@ Read the [architecture](docs/design.md) and [recovery format](docs/recovery-form
 
 ## Documentation
 
-- [Product definition](docs/product.md)
 - [Architecture and invariants](docs/design.md)
 - [Compatibility and limitations](docs/compatibility.md)
 - [CLI reference](docs/cli.md)
 - [Recovery format](docs/recovery-format.md)
 - [Operations & recovery runbook](docs/runbook.md)
-- [Experimental v0.1 release notes](docs/release-v0.1.md)
-- [Roadmap](docs/roadmap.md)
-- [Testing strategy](docs/testing.md)
-- [Development guide](docs/development.md)
+- [Roadmap (`v0.1`–`v1.0`)](docs/roadmap.md)
+- [Development, testing & verification](docs/development.md)
 - [Architecture decisions](docs/decisions.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)

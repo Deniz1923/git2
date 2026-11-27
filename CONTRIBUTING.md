@@ -6,12 +6,11 @@ git2 is an experimental learning project with a safety-sensitive goal. Contribut
 
 Read:
 
-- [Product definition](docs/product.md)
+- [README](README.md) (product scope and quickstart)
 - [Architecture and invariants](docs/design.md)
 - [Compatibility](docs/compatibility.md)
 - [Roadmap](docs/roadmap.md)
-- [Development guide](docs/development.md)
-- [Testing strategy](docs/testing.md)
+- [Development guide](docs/development.md) (including test suites, testing rules, and CI workflow)
 
 For on-disk changes, also read [Recovery format](docs/recovery-format.md) in full.
 
@@ -21,11 +20,11 @@ For on-disk changes, also read [Recovery format](docs/recovery-format.md) in ful
 - corruption and refusal coverage;
 - non-UTF-8 path fixtures;
 - documentation corrections;
-- narrowly scoped work from the active roadmap milestone;
+- narrowly scoped work from the active `v0.2+` roadmap milestone;
 - diagnostics that make a refusal safer or clearer;
 - benchmarks that expose a concrete bottleneck without weakening correctness.
 
-Large new commands, networking, repository-feature expansion, and crate splits should begin with a design discussion tied to roadmap exit criteria.
+Large new commands, repository-feature expansion, and crate splits should begin with a design discussion tied to roadmap exit criteria.
 
 ## Pull request expectations
 

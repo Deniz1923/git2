@@ -7,8 +7,8 @@ This document distinguishes what the code accepts today from what the project ma
 | Platform | Object debug commands | Repository/recovery commands | Test status |
 | --- | --- | --- | --- |
 | Linux | Available | Available | Active target |
-| macOS | Expected to compile as Unix | Experimental and unverified | Native CI required after v0.1 |
-| Windows | Object layer only | Compiled out | Planned after v0.1 |
+| macOS | Expected to compile as Unix | Experimental and unverified | Native CI planned in v0.5 |
+| Windows | Object layer only | Compiled out | Planned in v0.5 |
 
 The repository and status modules intentionally use Unix byte-path and permission APIs today.
 

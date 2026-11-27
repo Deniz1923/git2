@@ -2,7 +2,7 @@
 
 ## Project status
 
-git2 is pre-release software and is not safe for important repositories. While `adopt`, `checkpoint`, `restore --view`, `recover`, `reset`, `undo`, `add`, `commit`, and `log` are implemented, do not treat `.git/git2/` as a backup, and never test the tool first on the only copy of valuable data.
+git2 is pre-release software (`0.1.0-alpha.1`) and is not safe for important repositories. Do not treat `.git/git2/` as a backup, and never test the tool first on the only copy of valuable data.
 
 No version currently receives a production security-support guarantee.
 
@@ -11,7 +11,7 @@ No version currently receives a production security-support guarantee.
 Please treat these as security-sensitive:
 
 - writing outside the selected worktree;
-- following a malicious symlink during capture or future restore;
+- following a malicious symlink during capture or restore;
 - overwriting refs/index/worktree without a durable pre-operation view;
 - accepting corrupt recovery content as valid;
 - exposing `.git/git2/` through ordinary Git refs or networking;
@@ -39,4 +39,4 @@ If no private channel is available and public disclosure is necessary, provide a
 
 ## Dependency and Git behavior
 
-git2 parses repository-controlled data and may use `gix` behavior influenced by trusted Git configuration and attributes. Future subprocess calls must use argument vectors and must not interpolate shell input. Any feature that can execute configured Git filters requires explicit threat-model and differential tests.
+git2 parses repository-controlled data and may use `gix` behavior influenced by trusted Git configuration and attributes. Subprocess calls must use strict argument vectors (`-c protocol.ext.allow=never` and `--`) and must never interpolate shell input. Any feature that can execute configured Git filters requires explicit threat-model and differential tests.

@@ -2,7 +2,7 @@
 
 ## Status and compatibility
 
-The recovery sidecar format is currently version 3 and is experimental. Format 1 and format 2 stores are refused in place; git2 does not migrate, delete, or overwrite them. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. `git2 restore --view <id>` (with `--dry-run` preview) and `git2 recover [--status | --rollback]` execute restore and pending-journal reconciliation over format 3 stores, while `git2 reset` and `git2 undo` remain unexposed until Milestone 6+.
+The recovery sidecar format is currently version 3 and is experimental. Format 1 and format 2 stores are refused in place; git2 does not migrate, delete, or overwrite them. If you want to adopt again, first archive the entire existing `.git/git2/` directory separately while nothing is using it. All v0.1 recovery, local mutation, and delegated remote commands (`adopt`, `checkpoint`, `status`, `oplog`, `restore --view <id> [--dry-run]`, `recover [--status | --rollback]`, `reset`, `undo`, `add`, `commit`, `log`, `remote`, `clone`, `fetch`, `pull`, `push`) operate over format 3 stores.
 
 The reader also refuses unknown top-level versions. Any incompatible change must increment that version and update this document and fixtures. Format 3 keeps the format 2 binary view, operation, and policy record layouts intact and adds RFC 1950 zlib compression to on-disk `cas/` entries. git2 does not monitor ordinary Git in the background.
 
@@ -22,10 +22,11 @@ The format is private to one clone. It is stored below the Git directory and nev
   pending/
     active
     plan
+    delegated
     stage_<16hex>_<index>
 ```
 
-`pending/` holds the active transaction state (`active`, `plan`, and transient same-filesystem lock-staging files `stage_<16hex>_<index>`). While no transaction is running or awaiting reconciliation, `pending/` is empty.
+`pending/` holds either a native 4-phase transaction (`active`, `plan`, and transient same-filesystem lock-staging files `stage_<16hex>_<index>`) or a delegated Git-subprocess transaction (`delegated`). While no transaction is running or awaiting reconciliation, `pending/` is empty.
 
 ## Design goals
 
@@ -260,11 +261,11 @@ Operation kind codes:
 | --- | --- | --- |
 | `1` | Adoption baseline | None |
 | `2` | State imported from ordinary Git/external edits | None |
-| `3` | git2 command (`git2:checkpoint` today) | One length-prefixed command byte string |
+| `3` | `git2` command (`checkpoint`, `restore`, `reset`, `add`, `commit`, `undo`, `fetch`, `pull`, `push`, `remote`; rendered by `oplog` as `git2:<command>`) | One length-prefixed command byte string |
 
 Timestamps are whole seconds relative to the Unix epoch. They are descriptive, not part of ordering; parent links define order. Times before the epoch are represented as negative values.
 
-An adoption operation has no parent and currently uses the same view ID for `before` and `after`. An external import points to the previous selected operation, uses its current view as `before`, and the newly captured view as `after`. An explicit checkpoint uses kind 3 with the command byte string `checkpoint`; when the state changed it points to the previous selected operation with the current view as `before` and the new view as `after`, while an unchanged checkpoint appends no operation and reuses the current operation and view.
+An adoption operation has no parent and currently uses the same view ID for `before` and `after`. An external import points to the previous selected operation, uses its current view as `before`, and the newly captured view as `after`. An explicit checkpoint uses kind 3 with the command byte string `checkpoint`; when the state changed it points to the previous selected operation with the current view as `before` and the new view as `after`, while an unchanged checkpoint appends no operation and reuses the current operation and view. Embedded remote URL credentials (`scheme://user:secret@host`) are redacted (`https://***@host`) before persisting delegated command strings, and `git2 undo` explicitly refuses operations whose command is `push` or begins with `push `.
 
 ## Atomicity and durability
 
@@ -304,7 +305,10 @@ Future garbage collection must begin from HEAD, walk all parent operations, reta
 
 ## Pending transactions
 
-The transaction layer (`crates/git2-core/src/transaction.rs`) drives a constrained 4-phase state machine (`Prepared -> Applying -> Finalizing -> Committed`) over 11 fixed primitive checked actions before any Git or worktree state is modified.
+The transaction layer (`crates/git2-core/src/transaction.rs`) drives two pending-state formats under `.git/git2/pending/`:
+
+- a constrained 4-phase state machine (`Prepared -> Applying -> Finalizing -> Committed`) over 11 fixed primitive checked actions (`pending/active` + `pending/plan`) for local mutations;
+- a delegated subprocess journal (`PendingPhase::Delegated = 5`, `pending/delegated`) for `git`-delegated network and remote-tracking mutations (`fetch`, `pull`, `push`, `remote remove`, `remote rename`).
 
 ### `pending/active` (`b"git2-pending\0\x01"`)
 
@@ -360,13 +364,35 @@ Action tags:
 | `10` | `WritePackedRefs` | `expected_before: u8 marker + optional bytes`, `target: u8 marker + optional bytes` |
 | `11` | `WriteHead` | `expected_before: bytes`, `target: bytes` |
 
+### `pending/delegated` (`b"git2-delegated\0\x01"`)
+
+Whole record limit: 1 MiB (`MAX_OPERATION_BYTES`). Written and synced after capturing `before_view` and before spawning installed `git` for remote/network mutations. Note that in-memory `PendingPhase::Delegated = 5` is reported by `git2 recover --status` whenever `pending/delegated` is present (there is no `pending/active` or `pending/plan` file for delegated transactions).
+
+```text
+magic:                    16 bytes ("git2-delegated\0\x01")
+tx_id:                    32 bytes (SHA-256 of parent, before_view, timestamp, command, allow_conflict_rollback)
+parent_operation:         32 bytes
+before_view:              32 bytes
+timestamp_seconds:        i64
+command:                  bytes (embedded URL userinfo redacted as "***")
+allow_conflict_rollback:  u8 (0=False, 1=True)
+end of record
+```
+
+Delegated recovery and rollback behavior:
+
+- **Conflict detection:** `has_git_conflict_state` inspects `.git/` for `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge`, `rebase-apply`, `sequencer`, or unmerged stage `!= 0` (or unparseable) index entries. If conflict state is present, plain `git2 recover` refuses and instructs the user either to resolve conflicts in Git and re-run `git2 recover` or to run `git2 recover --rollback`.
+- **Clean/resolved `git2 recover`:** strips any optional `REUC` (resolve-undo) extension left in `.git/index` after manual Git conflict resolution (while refusing a foreign `index.lock`), captures `after_view`, returns `Aborted` if `after_view == before_view`, or writes and selects the `Operation` (`Git2(command)`) and removes `pending/delegated` idempotently.
+- **Conflict-safe `git2 recover --rollback`:** refuses any foreign Git lockfiles, deletes transient Git state files (`MERGE_HEAD`, `MERGE_MSG`, `MERGE_MODE`, `AUTO_MERGE`, `ORIG_HEAD`, `FETCH_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_LOG`) and directories (`rebase-merge`, `rebase-apply`, `sequencer`), restores any invalid index back to `before_view.index`, applies the verified restore plan back to `before_view`, verifies `actual_before == before_view`, and removes `pending/delegated`.
+
 ### Lock ownership, temp debris, and recovery procedure
 
-1. **Pre-write durability:** The runner acquires `.git/git2/lock`, checks for any active pending record, verifies `expected_head`, captures live state (publishing `external-git` if live state matches `before_view` and differs from `current_view`), writes `pending/plan`, and writes `pending/active` (`Prepared`) before touching any Git or worktree entry.
+1. **Pre-write durability:** The runner acquires `.git/git2/lock`, checks for any active pending record (`pending/active` or `pending/delegated`), verifies `expected_head`, captures live state (publishing `external-git` if live state matches `before_view` and differs from `current_view`), writes `pending/plan`, and writes `pending/active` (`Prepared`) before touching any Git or worktree entry.
 2. **Staged-inode Git lock attribution:** Lock-based Git metadata actions (`WriteIndex`, `RemoveIndex`, `WriteRef`, `RemoveRef`, `WritePackedRefs`, `WriteHead`) first create `pending/stage_<16hex>_<index>` (`O_CREAT | O_EXCL`), record its `(st_dev, st_ino)` in `pending/active` (`Applying`), and then hard-link (`linkat`, never replacing) to `<target>.lock`. On collision (`EEXIST`) or during recovery/rollback, git2 verifies `(st_dev, st_ino)` matches `pending/active`; any unknown lock is refused byte-for-byte untouched.
 3. **Worktree temp debris:** Checked atomic worktree entry writes create `.git2-tmp-<16hex>-<index>` in the target's validated parent directory (`O_NOFOLLOW`, `fsync` + `renameat` + parent `fsync`). Recovery and rollback unlink any leftover `.git2-tmp-*` sibling before proceeding.
 4. **Idempotent reconciliation (`recover`) and rollback (`rollback`):**
-   - No `pending/active`: clean up any orphan `pending/plan` or `stage_*` debris and return `Clean`.
+   - Neither `pending/active` nor `pending/delegated`: clean up any orphan `pending/plan` or `stage_*` debris and return `Clean`.
+   - `pending/delegated` exists: reconcile or roll back using the delegated protocol above.
    - `HEAD` already equals deterministic `operation_id`: release any verified owned lock, clean temp/pending files, and return `Finalized` without appending duplicate operations.
    - `phase == Prepared`: recompute the current live view read-only without writes and verify it matches `before_view` (refusing unexpected divergence), clean pending files, and return `Aborted` (or `RolledBack` under `rollback`).
    - `phase == Applying | Finalizing | Committed` (with `HEAD == parent`): `recover` probes outcomes per action (resuming owned locks/unfinished actions, pruning empty ancestor directories under `refs/` on `RemoveRef`, and refusing foreign locks or divergence), verifies live state matches `target_view`, writes the deterministic `Operation`, publishes `HEAD`, cleans pending state, and returns `Finalized`. Alternatively, `rollback` walks reversible actions in reverse up to `next_action` (skipping append-only `RehydrateObject`), verifies `before_view`, cleans pending state, and returns `RolledBack`.
@@ -382,7 +408,7 @@ The `restore` planner and executor implement the modeled restoration checks:
 
 Operator recovery guidance:
 
-- **Pending transaction (`pending/active` exists):** run `git2 recover --status` (read-only) or `git2 oplog` (read-only warning mode), then run `git2 recover` to finish cleanly or `git2 recover --rollback` to return to `before_view` if recovery `HEAD` has not yet moved.
+- **Pending transaction (`pending/active` or `pending/delegated` exists):** run `git2 recover --status` (read-only) or `git2 oplog` (read-only warning mode), then run `git2 recover` to finish cleanly or `git2 recover --rollback` to return to `before_view` if recovery `HEAD` has not yet moved (and abort any conflicted delegated pull).
 - **Unknown Git lock (`*.lock` mismatch):** inspect or stop any concurrent Git/editor process holding `.git/*.lock` before re-running `git2 recover`; git2 never deletes an unattributed lock.
 - **Corrupted or legacy sidecar:** do not hand-edit `.git/git2/`; preserve `.git/git2/` externally for diagnosis (format 1/2 stores are never auto-migrated or removed).
 

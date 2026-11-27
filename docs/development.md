@@ -156,7 +156,7 @@ New writes must follow the project’s durability pattern:
 - clean up temporary files after recoverable errors;
 - verify immutable destinations if another writer created them first.
 
-Never overwrite Git refs, index, or worktree state from a user-facing command outside the transaction runner planned in Milestone 4.
+Never overwrite Git refs, index, or worktree state from a local mutating `git2` command outside the 4-phase pending-transaction runner (`transaction.rs`), and run delegated Git network mutations through `pending/delegated`.
 
 ## Git compatibility rules
 
@@ -164,8 +164,8 @@ Never overwrite Git refs, index, or worktree state from a user-facing command ou
 - After object/ref/index changes, verify with ordinary Git and `git fsck`.
 - Respect lockfile and compare-and-swap behavior; do not write refs or index with plain truncating file writes.
 - Do not create `refs/git2/*` or another public recovery ref namespace.
-- Do not shell-interpolate Git subprocess arguments.
-- Keep networking out of the core local transaction until v0.2.
+- Do not shell-interpolate Git subprocess arguments; use strict argument vectors (`-c protocol.ext.allow=never` and `--`).
+- Keep local `git2` commands completely independent of an installed `git` binary at runtime.
 
 ## Recovery-format changes
 
@@ -203,9 +203,62 @@ Every claim must be labeled by reality:
 - required/design target;
 - planned/deferred.
 
-Avoid future tense that sounds like a guarantee. Commands that do not exist belong in the roadmap. Recovery docs must never imply that captured data is restorable until the restore gate passes.
+Avoid future tense that sounds like a guarantee. Unimplemented commands belong in the [roadmap](roadmap.md). Recovery docs must make clear what is verified by tests today versus what remains planned.
 
 Use relative links inside repository Markdown. Run a link/file check when adding or renaming docs.
+
+## Test suite and CI
+
+Tests exist to prove Git interoperability and recovery safety using ordinary `git` as the compatibility oracle, byte-level format checks, and child-process `std::process::abort()` crash matrices. Tests create isolated temporary repositories and require `git` on `PATH` (with `GIT_TERMINAL_PROMPT=0` for network tests; no network access or global author configuration required).
+
+### Active integration test suites
+
+- **Core (`crates/git2-core/tests/`):**
+  - `object_interop.rs`: differential canonical blob/loose/packed reads after `git gc --prune=now`.
+  - `recovery_format.rs`: format 3 binary codecs, bounds, truncation, trailing bytes, legacy format 1/2 refusal.
+  - `adoption.rs` & `retention.rs`: sidecar creation, policy bounds, ignore/refusal rules, external-change import, reachable Git object closure retention.
+  - `status_interop.rs`: differential `status` / `-z` parity across modes, symlinks, non-UTF-8/tab/newline paths, unborn/detached `HEAD`, nested/global ignores.
+  - `transaction.rs`: 4-phase pending journal, staged-inode lock attribution, foreign-lock refusal, failpoints, real child `abort()`, double crashes, and rollback.
+  - `restore.rs`: `--dry-run`, dual ignore profiles, pruned-object rehydration, file/dir & ref D/F swaps.
+  - `reset_undo.rs`: differential `--soft` / `--mixed` / `--hard`, semantic-index `undo` / redo, divergence checks.
+  - `stage.rs` & `commit_log.rs`: differential literal staging, built-in EOL conversion, canonical tree/commit construction, bounded `log`, hook/GPG/encoding refusals.
+  - `network.rs`: `remote`, `clone` auto-adoption, undoable `fetch`, `pull` (`--ff-only` / `--merge` / `--rebase` + conflict rollback & `REUC` stripping), non-undoable `push`, and credential redaction.
+- **CLI (`crates/git2-cli/tests/`):**
+  - `cli.rs`, `crash_recovery.rs`, `reset_undo_cli.rs`, `stage_cli.rs`, `commit_log_cli.rs`, `network_cli.rs`: end-to-end CLI behavior plus `GIT2_TEST_FAILPOINT` child process-kill and rollback matrices.
+  - `release_readiness.rs`: `git push --mirror` privacy verification and `PATH=""` zero-runtime-`git` smoke test across all local commands.
+
+### Testing rules
+
+- **Git as oracle:** compare durable state (`git hash-object`, `git cat-file`, `git status --porcelain=v1 -z`, `git diff --cached --raw -z`, `git ls-files --stage -z`, `git rev-parse`, `git fsck --full --strict`).
+- **Assert reopened state:** reopen repositories after mutations and verify Git integrity, index validity, worktree bytes/modes, and `git2` `HEAD`/parent/view links.
+- **Keep paths byte-safe:** cover invalid UTF-8, spaces, tabs, newlines, leading `-`, symlinks, and executables via NUL-delimited interfaces (`-z`).
+- **Test refusal before mutation:** verify unsupported states return errors with zero disk/sidecar writes.
+- **No ignored placeholders:** do not check in `#[ignore]`, `todo!()`, or `unimplemented!()` tests.
+
+### CI workflow
+
+`.github/workflows/ci.yml` runs on every push to `main` and pull request on `ubuntu-latest`:
+
+1. Logs `rustc --version`, `cargo --version`, and `git --version`;
+2. `cargo fmt --all -- --check`;
+3. `cargo clippy --workspace --all-targets -- -D warnings`;
+4. `cargo test --workspace --all-targets`;
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`;
+6. `cargo build --release --workspace`;
+7. `GIT2_BIN="$PWD/target/release/git2" bash scripts/demo.sh`.
+
+## Verification baseline (`0.1.0-alpha.1`)
+
+- **License audit (`cargo metadata --format-version 1`):** `163` resolved packages total; both workspace crates are `MIT` with `unsafe_code = "forbid"`; all transitive dependencies carry permissive or dual-permissive licenses (`MIT`, `Apache-2.0`, `BSD-3-Clause`, `0BSD`, `Unlicense`, `CC0-1.0`, `Zlib`, `Unicode-3.0`, plus one `MIT OR Apache-2.0 OR LGPL-2.1-or-later` crate usable under `MIT OR Apache-2.0`), with zero copyleft-only or unknown licenses.
+- **Baseline performance & disk footprint (`--release`, Linux, 200 tracked ~1 KiB files across 10 dirs):**
+  - `git2 adopt`: ~117.2 ms;
+  - `git2 status -z`: ~33.4 ms;
+  - `git2 add` (1 modified file): ~160.4 ms;
+  - `git2 commit -m "edit one"`: ~134.8 ms;
+  - `git2 log -n 10`: ~2.6 ms;
+  - `git2 reset --hard HEAD~1`: ~154.4 ms;
+  - `git2 undo`: ~201.7 ms;
+  - `.git/git2/` disk footprint after that full sequence: **161,611 bytes** (`16,075` bytes in `.git/objects/`). Note that `git2` currently buffers eligible files in RAM during capture; streaming CAS is tracked in `v0.3` ([roadmap](roadmap.md)).
 
 ## Review checklist
 
@@ -232,14 +285,6 @@ Use relative links inside repository Markdown. Run a link/file check when adding
 - Is the compatibility matrix updated?
 - Is a safety claim backed by an automated test?
 
-## Release process target
+## Local release packaging
 
-The first experimental release process will be finalized in Milestone 9. At minimum it must:
-
-1. run all quality and failure gates on a clean Linux runner;
-2. build in release mode;
-3. run the documented disposable demo;
-4. update version and changelog;
-5. produce a binary archive and SHA-256 checksum;
-6. publish explicit limitations and recovery-format version;
-7. retain the “experimental / not for important repositories” warning.
+`scripts/package-release.sh` produces a versioned Linux archive (`target/release-dist/git2-<version>-linux-<arch>.tar.gz` and `.sha256`, bundling `README.md`, `LICENSE-MIT`, `SECURITY.md`, and `docs/runbook.md`). Both workspace crates currently keep `publish = false`, and public release tagging or binary distribution remains gated on separate maintainer authorization and `v0.5` release engineering ([roadmap](roadmap.md)).
