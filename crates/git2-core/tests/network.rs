@@ -330,12 +330,12 @@ fn pull_ff_merge_rebase_and_conflict_rollback_or_recover_work() {
         },
     )
     .unwrap();
-    let repo = LocalRepository::discover(&clone.workdir).unwrap();
     git(&clone.workdir, &["config", "user.name", "Local"]);
     git(
         &clone.workdir,
         &["config", "user.email", "local@example.invalid"],
     );
+    let repo = LocalRepository::discover(&clone.workdir).unwrap();
 
     // 1. Upstream advances main -> default --ff-only pull succeeds & is undoable.
     git(&seed, &["checkout", "--quiet", "main"]);
@@ -417,12 +417,12 @@ fn setup_conflict_clone(root: &Path) -> (std::path::PathBuf, git2_core::object::
         },
     )
     .unwrap();
-    let repo = LocalRepository::discover(&clone.workdir).unwrap();
     git(&clone.workdir, &["config", "user.name", "Local"]);
     git(
         &clone.workdir,
         &["config", "user.email", "local@example.invalid"],
     );
+    let repo = LocalRepository::discover(&clone.workdir).unwrap();
 
     git(&seed, &["checkout", "--quiet", "main"]);
     fs::write(seed.join("app.txt"), b"upstream conflict edit\n").unwrap();
@@ -530,12 +530,12 @@ fn push_refuses_undo_refuses_private_refs_and_keeps_sidecar_and_staged_secret_pr
         },
     )
     .unwrap();
-    let repo = LocalRepository::discover(&clone.workdir).unwrap();
     git(&clone.workdir, &["config", "user.name", "Pusher"]);
     git(
         &clone.workdir,
         &["config", "user.email", "pusher@example.invalid"],
     );
+    let repo = LocalRepository::discover(&clone.workdir).unwrap();
 
     // Private refs/git2/* refspec refused before running git.
     assert!(
