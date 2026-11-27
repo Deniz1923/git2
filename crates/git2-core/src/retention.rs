@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use bstr::{BStr, BString, ByteSlice};
 
-use crate::object::{GitOid, ObjectKind, canonical_object_parts, hash_object};
+use crate::object::{GitOid, ObjectKind, RawObject, canonical_object_parts, hash_object};
 use crate::recovery::{ContentId, RecoveryStore, RetainedObject, View};
 use crate::repository::{decode_index, validate_index};
 use crate::store::ObjectStore;
@@ -40,7 +40,7 @@ pub(crate) fn retain_roots(
     objects: &ObjectStore,
     roots: impl IntoIterator<Item = Root>,
 ) -> Result<Vec<RetainedObject>> {
-    walk_objects(objects, roots, None, |bytes| store.put_content(bytes))
+    walk_objects(objects, roots, None, None, |bytes| store.put_content(bytes))
 }
 
 pub(crate) fn retain_roots_with_known(
@@ -49,7 +49,7 @@ pub(crate) fn retain_roots_with_known(
     roots: impl IntoIterator<Item = Root>,
     known_cas: &BTreeSet<ContentId>,
 ) -> Result<Vec<RetainedObject>> {
-    walk_objects(objects, roots, None, |bytes| {
+    walk_objects(objects, roots, None, None, |bytes| {
         persist_cas_with_known(store, bytes, known_cas)
     })
 }
@@ -61,7 +61,19 @@ pub(crate) fn retain_roots_with_blobs(
     staged_blobs: &BTreeMap<GitOid, ContentId>,
     known_cas: &BTreeSet<ContentId>,
 ) -> Result<Vec<RetainedObject>> {
-    walk_objects(objects, roots, Some(staged_blobs), |bytes| {
+    walk_objects(objects, roots, Some(staged_blobs), None, |bytes| {
+        persist_cas_with_known(store, bytes, known_cas)
+    })
+}
+
+pub(crate) fn retain_roots_with_objects(
+    store: &RecoveryStore,
+    objects: &ObjectStore,
+    roots: impl IntoIterator<Item = Root>,
+    pending_objects: &BTreeMap<GitOid, (RawObject, ContentId)>,
+    known_cas: &BTreeSet<ContentId>,
+) -> Result<Vec<RetainedObject>> {
+    walk_objects(objects, roots, None, Some(pending_objects), |bytes| {
         persist_cas_with_known(store, bytes, known_cas)
     })
 }
@@ -82,7 +94,7 @@ pub(crate) fn compute_roots_readonly(
     objects: &ObjectStore,
     roots: impl IntoIterator<Item = Root>,
 ) -> Result<Vec<RetainedObject>> {
-    walk_objects(objects, roots, None, |bytes| {
+    walk_objects(objects, roots, None, None, |bytes| {
         Ok(ContentId::for_bytes(bytes))
     })
 }
@@ -91,10 +103,17 @@ fn walk_objects(
     objects: &ObjectStore,
     roots: impl IntoIterator<Item = Root>,
     staged_blobs: Option<&BTreeMap<GitOid, ContentId>>,
+    pending_objects: Option<&BTreeMap<GitOid, (RawObject, ContentId)>>,
     mut persist: impl FnMut(&[u8]) -> Result<ContentId>,
 ) -> Result<Vec<RetainedObject>> {
     let mut reader = objects.bounded_reader(MAX_OBJECT_BYTES)?;
     walk(roots, |id, graph| {
+        if let Some(pending) = pending_objects
+            && let Some((raw, content)) = pending.get(&id)
+        {
+            graph.visit(id, raw.kind, &raw.data)?;
+            return Ok((raw.kind, *content));
+        }
         if let Some(blobs) = staged_blobs
             && let Some(&content) = blobs.get(&id)
         {

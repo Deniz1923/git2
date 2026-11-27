@@ -1694,7 +1694,7 @@ fn apply_unlocked_action(ctx: &mut TxContext<'_>, idx: usize, action: &Action) -
         Action::RehydrateObject { oid, content } => {
             let store = ctx.store;
             let (objects, reader) = ctx.object_store_and_reader()?;
-            match reader.read(*oid) {
+            match reader.read_physical(*oid) {
                 Ok(_) => Ok(()),
                 Err(Error::ObjectNotFound(_)) => {
                     let canonical = store.read_content_bounded(*content, MAX_OBJECT_BYTES + 32)?;

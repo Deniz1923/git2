@@ -222,6 +222,20 @@ pub(crate) struct BoundedReader {
 #[cfg(unix)]
 impl BoundedReader {
     pub(crate) fn read(&mut self, id: GitOid) -> Result<RawObject> {
+        match self.read_physical(id) {
+            Err(Error::ObjectNotFound(_))
+                if gix::hash::ObjectId::from(id.as_bytes()).is_empty_tree() =>
+            {
+                Ok(RawObject {
+                    kind: ObjectKind::Tree,
+                    data: Vec::new(),
+                })
+            }
+            other => other,
+        }
+    }
+
+    pub(crate) fn read_physical(&mut self, id: GitOid) -> Result<RawObject> {
         let hex = id.to_hex();
         let path = format!("{}/{}", &hex[..2], &hex[2..]);
         // Allow zlib framing/expansion overhead for incompressible payloads.
@@ -233,12 +247,6 @@ impl BoundedReader {
                 )));
             }
             return decode_loose(entry.bytes.as_slice(), id, Some(self.limit));
-        }
-        if gix::hash::ObjectId::from(id.as_bytes()).is_empty_tree() {
-            return Ok(RawObject {
-                kind: ObjectKind::Tree,
-                data: Vec::new(),
-            });
         }
         if self.packs.is_none() {
             self.packs = Some(packed::PackedObjects::open(&self.objects_dir, self.limit)?);

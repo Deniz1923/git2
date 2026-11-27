@@ -655,7 +655,7 @@ fn collect_rehydrate_actions(git_dir: &Path, target_view: &View) -> Result<Vec<A
     let mut reader = objects.bounded_reader(retention::MAX_OBJECT_BYTES)?;
     let mut actions = Vec::new();
     for retained in &target_view.retained_objects {
-        match reader.read(retained.oid) {
+        match reader.read_physical(retained.oid) {
             Ok(_) => {}
             Err(Error::ObjectNotFound(_)) => actions.push(Action::RehydrateObject {
                 oid: retained.oid,

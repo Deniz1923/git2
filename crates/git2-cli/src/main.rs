@@ -7,6 +7,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
+#[cfg(unix)]
+use git2_core::commit::{self, CommitOutcome};
+#[cfg(unix)]
+use git2_core::log::{self, DEFAULT_LOG_COUNT, LogOptions};
 use git2_core::object::{GitOid, ObjectKind, hash_object};
 #[cfg(unix)]
 use git2_core::recovery::{ContentId, OperationKind, RecoveryStore};
@@ -63,6 +67,22 @@ enum Command {
         /// Literal files or directories relative to the current directory (use `--` for leading `-`).
         #[arg(value_name = "PATH")]
         paths: Vec<OsString>,
+    },
+
+    /// Record staged changes as a new commit on HEAD or the current branch.
+    #[cfg(unix)]
+    Commit {
+        /// Commit message describing the staged snapshot.
+        #[arg(short = 'm', long = "message", value_name = "MESSAGE")]
+        message: String,
+    },
+
+    /// Show bounded first-parent commit history reachable from HEAD.
+    #[cfg(unix)]
+    Log {
+        /// Limit the number of commits shown (default 50, max 10000).
+        #[arg(short = 'n', long = "max-count", default_value_t = DEFAULT_LOG_COUNT)]
+        max_count: usize,
     },
 
     /// Preview or restore a previously recorded recovery view.
@@ -171,6 +191,10 @@ fn main() -> anyhow::Result<()> {
         Command::Checkpoint => run_checkpoint(),
         #[cfg(unix)]
         Command::Add { all, paths } => run_add(all, &paths),
+        #[cfg(unix)]
+        Command::Commit { message } => run_commit(&message),
+        #[cfg(unix)]
+        Command::Log { max_count } => run_log(max_count),
         #[cfg(unix)]
         Command::Restore { view, dry_run } => run_restore(view, dry_run),
         #[cfg(unix)]
@@ -332,6 +356,35 @@ fn run_add(all: bool, paths: &[OsString]) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
+fn run_commit(message: &str) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    let outcome = run_commit_apply(&repository, message).context("could not create commit")?;
+    println!(
+        "committed {} (tree {}) at view {} as operation {}",
+        outcome.commit_oid, outcome.tree_oid, outcome.after_view, outcome.operation_id
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_log(max_count: usize) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    let entries = log::walk(&repository, LogOptions { max_count })
+        .context("could not walk commit history")?;
+    let mut stdout = io::stdout().lock();
+    for entry in entries {
+        stdout
+            .write_all(&entry.format_text())
+            .context("could not write commit log to standard output")?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn run_undo(dry_run: bool) -> anyhow::Result<()> {
     ensure_no_pending()?;
     let repository =
@@ -367,6 +420,22 @@ fn run_add_apply(
     paths: &[OsString],
 ) -> git2_core::Result<AddOutcome> {
     stage::apply(repository, cwd, all, paths)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_commit_apply(
+    repository: &LocalRepository,
+    message: &str,
+) -> git2_core::Result<CommitOutcome> {
+    commit::apply_with_hook(repository, message, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_commit_apply(
+    repository: &LocalRepository,
+    message: &str,
+) -> git2_core::Result<CommitOutcome> {
+    commit::apply(repository, message)
 }
 
 #[cfg(all(unix, debug_assertions))]

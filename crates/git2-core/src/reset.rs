@@ -249,7 +249,10 @@ fn resolve_base_oid(meta: &CheckedRoot, reader: &mut BoundedReader, base: &str) 
     })
 }
 
-fn resolve_ref_chain(meta: &CheckedRoot, start_ref: &[u8]) -> Result<(BString, Option<GitOid>)> {
+pub(crate) fn resolve_ref_chain(
+    meta: &CheckedRoot,
+    start_ref: &[u8],
+) -> Result<(BString, Option<GitOid>)> {
     let mut current = BString::from(start_ref);
     for _ in 0..32 {
         checked_split(current.as_slice())?;
@@ -327,13 +330,13 @@ fn walk_first_parent(
     Ok(current)
 }
 
-struct HeadPlan {
-    head: BString,
-    refs: Vec<(BString, BString)>,
-    actions: Vec<Action>,
+pub(crate) struct HeadPlan {
+    pub(crate) head: BString,
+    pub(crate) refs: Vec<(BString, BString)>,
+    pub(crate) actions: Vec<Action>,
 }
 
-fn plan_head_update(live_view: &View, target_commit: GitOid) -> Result<HeadPlan> {
+pub(crate) fn plan_head_update(live_view: &View, target_commit: GitOid) -> Result<HeadPlan> {
     let trimmed_head = trim_newline(live_view.head.as_slice());
     let oid_line = BString::from(format!("{target_commit}\n"));
     let (packed, mut loose) = split_refs(&live_view.refs);
@@ -1096,7 +1099,7 @@ fn persist_target_view(
     store.put_view(&view)
 }
 
-fn trim_newline(mut bytes: &[u8]) -> &[u8] {
+pub(crate) fn trim_newline(mut bytes: &[u8]) -> &[u8] {
     while bytes.last().is_some_and(|&b| b == b'\n' || b == b'\r') {
         bytes = &bytes[..bytes.len() - 1];
     }
