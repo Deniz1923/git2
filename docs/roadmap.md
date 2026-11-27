@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reconciled with the implementation: 2026-11-26.
+Last reconciled with the implementation: 2026-11-27.
 
 ## How to read this roadmap
 
@@ -22,7 +22,7 @@ Planning assumptions:
 - ordinary Git is the compatibility oracle;
 - no mutating command ships before the pending-transaction foundation.
 
-At that pace, the remaining v0.1 work is roughly 22–32 focused weeks, or about 5–8 months. This is an estimate, not a release date.
+At that pace, the planned v0.1 milestones 0–9 are implemented on Linux; only explicit release tagging/publication and post-v0.1 (`v0.2+`) work remain.
 
 ## Current summary
 
@@ -36,10 +36,10 @@ At that pace, the remaining v0.1 work is roughly 22–32 focused weeks, or about
 | 5. Restore planning, apply, and recovery | Done | `restore --view [--dry-run]`, `recover [--status \| --rollback]`, pending read-only full-hex `oplog`, dual ignore profiles, pruned-object rehydration, CLI crash tests |
 | 6. Native reset and non-destructive undo proof | Done | `reset [--soft\|--mixed\|--hard]`, semantic-index `undo [--dry-run]` / redo, full core & CLI crash proof |
 | 7. Git-style staging | Done | `git2 add [--all] [--] [<path>...]`, built-in EOL conversion, external-filter & ignore refusal, differential & crash suites |
-| 8. Commit and history | Planned | Next milestone; `commit -m` and bounded first-parent `log [--max-count <n>]` |
-| 9. Status completion, docs, and experimental v0.1 release | Planned | Complete supported status matrix, Linux CI, mirror-push privacy check, demo, package, checksums |
+| 8. Commit and history | Done | Native `git2 commit -m` via the 4-phase pending journal (`undo`-capable) and bounded first-parent `git2 log [-n <n>]` |
+| 9. Status completion, docs, and experimental v0.1 release | Done | Expanded status matrix, Linux CI, mirror-push privacy check, empty-`PATH` check, demo, package script, runbook, v0.1 readiness report |
 
-Explicit `git2 checkpoint` capture, Git object retention, zlib-compressed format 3 CAS, the 4-phase pending-transaction foundation, `git2 restore --view [--dry-run]`, `git2 recover [--status | --rollback]`, native `git2 reset`, semantic-index `git2 undo` / redo, and native `git2 add` staging are implemented under Milestones 2 and 4–7. Milestone 8 (`commit -m` and bounded `log`) is the next planned milestone.
+All v0.1 milestones (0–9) are implemented and covered by the workspace test suites (`git2 adopt`, `checkpoint`, `status`, `oplog`, `restore`, `recover`, `reset`, `undo`, `add`, `commit`, and `log`). Creating an actual public release tag or publishing packages remains gated on separate maintainer authorization.
 
 ## Milestone 0 — repository rescue
 
@@ -252,48 +252,40 @@ Exit criteria met:
 
 ## Milestone 8 — commit and bounded log
 
-**Status: Planned — next milestone**
-
-Estimated effort: 2–4 focused weeks.
+**Status: Done**
 
 Commands:
 
 ```text
 git2 commit -m <message>
-git2 log [--max-count <n>]
+git2 log [-n|--max-count <n>]
 ```
 
-Deliverables:
+Delivered:
 
-- build canonical trees recursively from stage-zero index entries;
-- reject unmerged index stages, blank commit messages, empty tree changes, and active hooks/signing/unsupported config;
-- resolve author/committer identity and local time/timezone from Git env overrides and config;
-- create root and single-parent commits, preserving byte-safe commit messages internally;
-- update symbolic or detached HEAD with transactional ref compare-and-swap (leaving reflogs unchanged in v0.1);
-- wrap commit/ref updates in the mutation transaction and append `git2:commit` operations;
-- walk bounded first-parent history from `HEAD` (default 50, max 10,000), reporting missing/corrupt parents rather than silently truncating.
+- builds canonical recursive trees bottom-up from stage-zero index entries (`git2-core::commit`), sorting entries with Git's canonical directory-`/` comparison;
+- rejects blank/NUL commit messages, unchanged staged trees (`HEAD^{tree}` or empty unborn index), `INTENT_TO_ADD` (`git add -N`), `REUC` records, executable commit hooks (including custom `core.hooksPath`), `commit.gpgSign = true`, unsupported `i18n.commitEncoding`, missing/invalid author/committer identity, and pre-existing foreign locks before mutation;
+- resolves author/committer name, email, and timestamp/timezone from `GIT_AUTHOR_*` / `GIT_COMMITTER_*` env vars and Git config;
+- creates root and single-parent commits, updating detached `HEAD` or symbolic branch chains (`HEAD -> ref -> leaf`) through the 4-phase pending transaction journal, rehydrating missing trees/commits (including the canonical empty tree) into `.git/objects/` cleanly, and appending reversible `git2:commit` operations (`git2 undo` / redo tested);
+- walks bounded first-parent commit history from `HEAD` (`git2-core::log`, default 50, max 10,000), failing cleanly on unborn branches, parent cycles, or missing/corrupt parent commits rather than silently truncating.
 
-Exit criteria:
+Exit criteria met:
 
-- `git log`, `git cat-file`, and `git fsck` accept every git2 commit fixture;
-- tree IDs match Git for equivalent index state;
-- ref races fail without overwriting another writer;
-- interrupted commit/ref updates reconcile through pending state.
+- `git log`, `git cat-file`, `git rev-parse HEAD^{tree}`, and `git fsck --full --strict` accept every `git2 commit` fixture;
+- tree IDs match `git write-tree` across tricky boundary names, executables, symlinks, non-UTF-8 names, and empty-tree deletions;
+- foreign ref locks refuse before mutation;
+- interrupted commit/ref updates reconcile or roll back cleanly across every CLI failpoint boundary.
 
 ## Milestone 9 — status completion, docs, and experimental v0.1 release
 
-**Status: Planned**
+**Status: Done (awaiting separate maintainer authorization before publishing any release tag)**
 
-Estimated effort: 3–5 focused weeks.
+Delivered:
 
-Deliverables:
-
-- close remaining Milestone 3 status follow-up coverage (executable bits, symlinks, type transitions, non-UTF-8/newline `-z`, nested/global excludes, unborn/detached HEAD) with rename detection disabled;
-- reconcile all user documentation and relative links, and stop warning that snapshots are non-restorable only after Milestone 6 passes;
-- Linux CI for formatting, warning-denied clippy/docs, tests, differential fixtures, and process-kill crash suites;
-- release-mode build, smoke test with no Git on `PATH`, versioned binary archive, and SHA-256 checksum;
-- mirror-push privacy test proving `.git/git2/` and staged-only objects never transfer via `git push --mirror`;
-- reproducible demo script, limitations/recovery runbook, storage-size reporting, dependency/license review, and benchmark baselines.
+- expanded `crates/git2-core/tests/status_interop.rs` and `crates/git2-cli/tests/cli.rs` to cover executable-bit flips, symlink & file/type transitions (`T `, ` T`, `TT`), non-UTF-8 + tab + embedded-newline paths through `git2 status -z`, nested `.gitignore` negations & global `core.excludesFile`, unborn `HEAD`, and detached `HEAD` (fixing tracked-before-untracked porcelain sort parity with `git status`);
+- added `crates/git2-cli/tests/release_readiness.rs` verifying `git push --mirror` privacy (`.git/git2/`, `refs/git2/*`, and staged-only/recovery-only objects never transfer) and an end-to-end `PATH=""` smoke test proving zero runtime dependency on an installed `git` binary;
+- upgraded `.github/workflows/ci.yml` to log toolchain/Git versions, run `fmt`, `clippy`, workspace tests, warning-denied `doc`, `cargo build --release`, and `scripts/demo.sh`;
+- added reproducible `scripts/demo.sh`, `scripts/package-release.sh` (versioned Linux tarball + `.sha256` under gitignored `target/release-dist/`), [operations & recovery runbook](runbook.md), and [v0.1 release-readiness dossier](release-v0.1.md) (dependency/license audit and measured baseline timings/storage footprint), and reconciled all project documentation with zero broken relative links.
 
 Release gate:
 
@@ -301,8 +293,8 @@ Release gate:
 - no ignored, flaky, or placeholder test covers a release claim;
 - no known data-loss bug remains in supported scope;
 - the CLI refuses unsupported states before mutation;
-- a new user can follow the documented disposable demo exactly;
-- the release is labeled experimental and not recommended for important repositories; do not publish without separate authorization.
+- a new user can follow the documented disposable demo (`scripts/demo.sh`) directly;
+- the release remains explicitly labeled experimental and unsafe for important repositories, and `publish = false` remains set with no GitHub Release or tag published without separate authorization.
 
 ## Deferred v0.2 themes
 

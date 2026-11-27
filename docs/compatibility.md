@@ -53,7 +53,7 @@ Detection is conservative but not yet exhaustive. Unknown extensions or concurre
 | Tree parsing/serialization | Implemented, including non-UTF-8 names and gitlink modes |
 | Annotated tag-specific model | Not implemented; raw tag objects are readable |
 | Abbreviated object IDs | Not implemented in CLI |
-| Object writes | `git2 add` writes staged loose blobs via `.git/index.lock` transactions; `git2 restore`/`recover` rehydrate retained objects; `debug hash-object` stays read-only |
+| Object writes | `git2 add` writes staged loose blobs via `.git/index.lock`; `git2 commit` writes trees, commit objects, and refs/HEAD; `git2 restore`/`recover` rehydrate retained objects; `debug hash-object` stays read-only |
 | Retained object closure | Implemented for refs/HEAD/index roots with tag/commit/tree traversal; writes no public refs or objects |
 
 ## Captured state
@@ -126,10 +126,10 @@ An advisory lock excludes a second cooperating git2 writer. Ordinary Git does no
 
 ## Known alpha risks
 
-- Native `commit` and `log` are not implemented yet.
+- `git2 commit` refuses active commit hooks (`pre-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit`), `commit.gpgSign = true`, non-UTF-8 `i18n.commitEncoding`, and blank/unchanged commits rather than executing external hook scripts or signing binaries.
 - Captures and bounded recovery reads still use memory. This is not a streaming or large-repository backup.
 - Retention saves only the Git object closure available at capture time, and ordinary Git can still prune objects that were never captured.
-- git2 does not monitor ordinary Git in the background. Outside changes are imported only when `status`, `oplog`, `checkpoint`, `restore`, `reset`, `undo`, or `add` runs, and a checkpoint is a capture rather than a backup.
+- git2 does not monitor ordinary Git in the background. Outside changes are imported only when `status`, `oplog`, `checkpoint`, `restore`, `reset`, `undo`, `add`, or `commit` runs, and a checkpoint is a capture rather than a backup.
 - Ordinary Git can race capture despite the git2 advisory lock.
 - Recovery-store sync errors are reported and process crash failpoints are tested across every transaction phase, though hardware power-loss testing is not yet implemented.
 - Object-not-found classification in packed fallback relies partly on dependency error text and needs a typed error path.

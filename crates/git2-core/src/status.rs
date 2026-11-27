@@ -155,9 +155,17 @@ impl LocalRepository {
                 }
             }
         }
-        Ok(RepositoryStatus {
-            entries: entries.into_values().collect(),
-        })
+        let mut entries: Vec<StatusEntry> = entries.into_values().collect();
+        entries.sort_by(|left, right| {
+            let left_untracked =
+                left.staged.is_none() && left.worktree == Some(StatusCode::Untracked);
+            let right_untracked =
+                right.staged.is_none() && right.worktree == Some(StatusCode::Untracked);
+            left_untracked
+                .cmp(&right_untracked)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        Ok(RepositoryStatus { entries })
     }
 }
 

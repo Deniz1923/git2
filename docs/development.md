@@ -25,6 +25,8 @@ git --version
 │   ├── git2-core/
 │   │   ├── src/
 │   │   │   ├── lib.rs
+│   │   │   ├── commit.rs
+│   │   │   ├── log.rs
 │   │   │   ├── object.rs
 │   │   │   ├── paths.rs
 │   │   │   ├── recovery.rs
@@ -43,11 +45,16 @@ git --version
 │   └── git2-cli/
 │       ├── src/main.rs
 │       └── tests/
-└── docs/
+├── docs/
+└── scripts/
+    ├── demo.sh
+    └── package-release.sh
 ```
 
 Module responsibilities:
 
+- `commit`: native `commit -m` tree/commit/ref construction over the 4-phase pending journal;
+- `log`: bounded first-parent history traversal from `HEAD`;
 - `object`: byte-safe Git object model and codecs;
 - `paths`: descriptor-relative, no-follow worktree & metadata path operations;
 - `recovery` / `recovery::disk`: owner-private SHA-256 zlib CAS store and binary records;
@@ -86,6 +93,13 @@ Run the CLI:
 ```sh
 cargo run -p git2-cli -- --help
 cargo run -p git2-cli -- status -z
+```
+
+Demo and local release packaging:
+
+```sh
+bash scripts/demo.sh
+bash scripts/package-release.sh
 ```
 
 Generated build output can be large. `cargo clean` removes `target/`; it does not touch source or repository fixtures.

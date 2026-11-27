@@ -2,7 +2,7 @@
 
 ## Project status
 
-git2 is pre-release software and is not safe for important repositories. While `restore --view`, `recover`, `reset`, `undo`, and `add` are implemented, do not treat `.git/git2/` as a backup, and never test the tool first on the only copy of valuable data.
+git2 is pre-release software and is not safe for important repositories. While `adopt`, `checkpoint`, `restore --view`, `recover`, `reset`, `undo`, `add`, `commit`, and `log` are implemented, do not treat `.git/git2/` as a backup, and never test the tool first on the only copy of valuable data.
 
 No version currently receives a production security-support guarantee.
 

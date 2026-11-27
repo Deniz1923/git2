@@ -5,7 +5,7 @@
 The project uses ordinary Git repositories as its interchange format. It adds a private, clone-local operation history under `.git/git2/` and is being developed as a learning-first, portfolio-grade implementation of Git’s local mechanics.
 
 > [!WARNING]
-> git2 is experimental and not ready for important repositories. It implements verified baselines, checkpoints, `restore --view`, `recover`, `reset`, `undo`, and `add`, while native `commit`, `log`, and release readiness follow next.
+> git2 is experimental (`0.1.0-alpha.1`) and **not safe for important repositories**. It implements the v0.1 local recovery command set (`adopt`, `checkpoint`, `status`, `oplog`, `restore`, `recover`, `reset`, `undo`, `add`, `commit`, and `log`); always evaluate in disposable clones and keep external backups.
 
 ## Current status
 
@@ -16,12 +16,13 @@ The project uses ordinary Git repositories as its interchange format. It adds a 
 | Object retention and checkpoints | Implemented | Adoption, automatic imports, and `checkpoint` retain the current Git object closure privately |
 | Recovery storage | Implemented | Immutable SHA-256 zlib-compressed CAS (format 3), views, operations, integrity checks, and advisory lock |
 | External Git import | Implemented | `status` and `oplog` record changed state as `external-git` operations |
-| Status | Implemented | Two-column porcelain output; `-z` is byte-safe |
+| Status | Implemented | Two-column porcelain output matching Git (`git2 status -z` is byte-safe) |
 | Transaction journal & restore | Implemented | 4-phase pending journal, `restore --view [--dry-run]`, and `recover [--status \| --rollback]` |
 | Reset and undo | Implemented | `reset [--soft \| --mixed \| --hard]`, semantic-index `undo [--dry-run]` / redo + crash tests |
 | Staging | Implemented | `add [--all] [--] [<path>...]` with built-in EOL conversion, ignore rules, and atomic index lock |
-| Commits and log | Not implemented | Next milestone (`commit -m`, bounded `log`) |
-| Networking | Not implemented | Deferred until the local safety model works |
+| Commits and log | Implemented | `commit -m <message>` via transactional tree/commit/ref writes (`undo`-capable) and bounded `log [-n <n>]` |
+| Release readiness & CI | Implemented | Mirror-push privacy test, `PATH=""` smoke test, `scripts/demo.sh`, `scripts/package-release.sh`, [runbook](docs/runbook.md), and [v0.1 release notes](docs/release-v0.1.md) |
+| Networking | Deferred to v0.2 | Deferred until local recovery workflows stabilize |
 
 See the [full roadmap](docs/roadmap.md) for milestones and exit criteria.
 
@@ -34,7 +35,7 @@ Git already has reflogs and recoverable objects, but recovery is fragmented acro
 3. Record the before/after transition in an immutable local operation log.
 4. Let the user restore an earlier view without rewriting or deleting that history.
 
-The current build implements the storage, observation, pending-transaction journal, verified `restore --view`, `recover`, `reset`, `undo`/redo, and `add` staging flows; native `commit` and bounded `log` follow next.
+The current build implements the full experimental v0.1 local workflow: private format-3 storage, external-change import, the 4-phase pending-transaction journal, verified `restore --view`, `recover`, `reset`, `undo`/redo, `add`, `commit -m`, and bounded `log`.
 
 ## Supported environment
 
@@ -92,12 +93,20 @@ printf 'checked point\n' > hello.txt
 /path/to/git2 restore --view <64-hex-view-id> --dry-run
 ```
 
+Or run the reproducible disposable-repository walkthrough script directly:
+
+```sh
+bash scripts/demo.sh
+```
+
 ## Implemented commands
 
 ```text
 git2 adopt [--max-file-mib <MiB>]
 git2 checkpoint
 git2 add [--all] [--] [<path>...]
+git2 commit -m <message>
+git2 log [-n|--max-count <n>]
 git2 reset [--soft | --mixed | --hard] [<commit>]
 git2 undo [--dry-run]
 git2 restore --view <64-hex-view-id> [--dry-run]
@@ -130,6 +139,8 @@ Read the [architecture](docs/design.md) and [recovery format](docs/recovery-form
 - [Compatibility and limitations](docs/compatibility.md)
 - [CLI reference](docs/cli.md)
 - [Recovery format](docs/recovery-format.md)
+- [Operations & recovery runbook](docs/runbook.md)
+- [Experimental v0.1 release notes](docs/release-v0.1.md)
 - [Roadmap](docs/roadmap.md)
 - [Testing strategy](docs/testing.md)
 - [Development guide](docs/development.md)

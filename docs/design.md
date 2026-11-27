@@ -156,7 +156,7 @@ Status uses `gix` to compare HEAD → index and index → worktree. git2 merges 
 
 ## Implemented mutation protocol
 
-Implemented Git mutations (`restore`, `reset`, `undo`, `add`, and recovery via `recover`) run through a constrained 4-phase (`Prepared -> Applying -> Finalizing -> Committed`) state machine over a fixed vocabulary of primitive checked actions (while `commit` and `log` remain upcoming):
+Implemented Git mutations (`restore`, `reset`, `undo`, `add`, `commit`, and recovery via `recover`) run through a constrained 4-phase (`Prepared -> Applying -> Finalizing -> Committed`) state machine over a fixed vocabulary of primitive checked actions:
 
 1. Validate all repository and command preconditions.
 2. Acquire the git2 recovery lock.

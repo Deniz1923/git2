@@ -328,3 +328,35 @@ fn mismatched_git_dir_and_core_worktree_is_refused() {
         "expected .git directory ownership refusal, got: {stderr}"
     );
 }
+
+#[test]
+fn cli_status_z_handles_non_utf8_and_newline_paths_byte_safely() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    git(directory.path(), &["init", "--quiet", "-b", "main"]);
+    let newline_name = OsString::from("line1\nline2.txt");
+    let non_utf8_name = OsString::from_vec(vec![b'b', b'a', b'd', 0xfe, 0xff]);
+    std::fs::write(directory.path().join(&newline_name), b"a\n").unwrap();
+    std::fs::write(directory.path().join(&non_utf8_name), b"b\n").unwrap();
+
+    let expected = git(
+        directory.path(),
+        &[
+            "-c",
+            "diff.renames=false",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "-z",
+        ],
+    );
+    let actual = git2(directory.path(), &["status", "-z"]);
+    assert!(
+        actual.status.success(),
+        "git2 status -z failed:\n{}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(actual.stdout, expected.stdout);
+}

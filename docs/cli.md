@@ -157,6 +157,7 @@ Kinds currently include:
 - `git2:restore --view <64-hex-view-id>`, emitted by `git2 restore --view <id>`;
 - `git2:reset --<mode> <rev>`, emitted by `git2 reset`;
 - `git2:add ...`, emitted by `git2 add`;
+- `git2:commit`, emitted by `git2 commit`;
 - `git2:undo`, emitted by `git2 undo`;
 - other `git2:<command>` values in the format, reserved for future mutating commands.
 
@@ -178,6 +179,33 @@ Behavior:
 - stages new, modified, and deleted entries (including directory trees and directory deletions), or pass `-A` / `--all` across the repository;
 - applies built-in `.gitattributes` / `core.autocrlf` / `core.eol` text-to-Git conversions via `gix`, preserves executable bits and raw symlink targets without filtering;
 - refuses active external `filter=` clean/process drivers, non-UTF-8 `working-tree-encoding`, ignored explicit targets (no `--force` in v0.1), nested `.git` directories, special entries, and pre-existing foreign `.git/index.lock` files without touching Git state.
+
+## `git2 commit`
+
+```text
+git2 commit -m <message>
+```
+
+Requires an adopted repository and creates a root or single-parent commit from the stage-zero index snapshot on detached `HEAD` or the leaf branch referenced by `HEAD`, leaving reflogs unchanged.
+
+Behavior:
+
+- builds canonical trees bottom-up using Git's directory-`/` sort order and persists new trees and the commit via the 4-phase pending journal (recording a `git2:commit` operation reversible via `git2 undo`);
+- resolves author and committer identity/timestamps from `GIT_AUTHOR_*` / `GIT_COMMITTER_*` and `user.name` / `user.email`, refusing if either is absent or contains forbidden header bytes;
+- refuses blank or NUL commit messages, empty/unchanged trees (`HEAD^{tree}` or empty unborn index), `INTENT_TO_ADD` (`git add -N`) or `REUC` index entries, active executable commit hooks (`pre-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit`), `commit.gpgSign = true`, non-UTF-8 `i18n.commitEncoding`, and pre-existing foreign locks before mutation.
+
+## `git2 log`
+
+```text
+git2 log [-n|--max-count <n>]
+```
+
+Reads bounded first-parent commit history starting from `HEAD` (default `50`, maximum `10000`).
+
+Behavior:
+
+- prints commit ID, author, formatted date/offset, and indented message payload byte-safely to standard output;
+- refuses pending transactions, counts above `10000`, unborn `HEAD`, parent cycles, or missing/corrupt parent commits rather than silently truncating history.
 
 ## `git2 reset`
 
@@ -240,13 +268,6 @@ Options:
 
 Only full 40-character object IDs are accepted.
 
-## Planned commands
+## Deferred commands (`v0.2+`)
 
-The following names are roadmap commitments, not current CLI features:
-
-```text
-git2 commit
-git2 log
-```
-
-They will appear only after their transaction, interoperability, and failure-injection exit criteria pass.
+Remote/networking commands (`clone`, `fetch`, `pull`, `push`) are intentionally absent in experimental v0.1 and deferred to post-v0.1 milestones once local recovery flows stabilize.

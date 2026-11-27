@@ -62,14 +62,12 @@ Current proofs:
 
 ### Differential status tests
 
-`crates/git2-core/tests/status_interop.rs` compares git2 porcelain bytes with `git status --porcelain=v1 --untracked-files=all` for the current supported fixture.
+`crates/git2-core/tests/status_interop.rs` and `crates/git2-cli/tests/cli.rs` compare `git2` porcelain bytes with `git -c diff.renames=false status --porcelain=v1 --untracked-files=all` (and `-z`) across:
 
-The fixture combines:
-
-- a staged addition;
-- a file modified in both index and worktree;
-- an unstaged deletion;
-- an untracked file.
+- staged additions, modifications, deletions, executable-bit flips, and symlink/file type transitions (`T `, ` T`, `TT`);
+- unstaged modifications, deletions, executable-bit flips, type transitions, and untracked files;
+- tracked-before-untracked ordering parity;
+- nested `.gitignore` negations, global `core.excludesFile`, unborn `HEAD`, detached `HEAD`, and non-UTF-8 / tab / newline filenames through `git2 status -z`.
 
 ### Transaction and crash-recovery tests
 
@@ -131,6 +129,25 @@ The fixture combines:
 - `--all` on unborn repositories, detached `HEAD`, and pre-existing foreign `.git/index.lock` refusal.
 
 `crates/git2-cli/tests/stage_cli.rs` verifies `git2 add -- -dash.txt`, subdirectory invocation, `--all`, `undo`, and debug-only `GIT2_TEST_FAILPOINT` process kills and I/O rollback across `.git/index.lock` writes.
+
+### Commit and log tests
+
+`crates/git2-core/tests/commit_log.rs` tests `commit` and `log` against ordinary Git (`git write-tree`, `git cat-file -p`, `git rev-parse`, and `git fsck --full --strict`):
+
+- root commits on unborn branches, follow-up commits, multiline & normalized messages, and all-deleted empty-tree commits;
+- Git canonical tree entry sorting (`a-file` < `a/` < `a_file`), nested trees, executables, symlinks, and non-UTF-8 filenames;
+- detached `HEAD`, symbolic branch aliases (`HEAD -> refs/heads/alias -> refs/heads/main`), and packed parent resolution;
+- refusals before mutation on blank/NUL messages, empty tree deltas, `INTENT_TO_ADD`, executable commit hooks (`core.hooksPath`), `commit.gpgSign`, unsupported `i18n.commitEncoding`, and foreign ref locks;
+- `git2 undo` / redo across both normal and root commits, plus bounded `log::walk` limits and strict erroring on missing/corrupt parents.
+
+`crates/git2-cli/tests/commit_log_cli.rs` verifies end-to-end CLI `commit -m`, `log -n`, `GIT_AUTHOR_*`/`GIT_COMMITTER_*`/`GIT_*_DATE` precedence, `undo`/`oplog`, and `GIT2_TEST_FAILPOINT` process-kill & rollback recovery.
+
+### Release-readiness tests
+
+`crates/git2-cli/tests/release_readiness.rs` verifies:
+
+- `git push --mirror` to a bare remote never transfers `.git/git2/`, `refs/git2/*`, or staged-only/recovery-only objects, and the remote passes `git fsck --full --strict`;
+- executing the compiled `git2` binary with `PATH=""` across `adopt`, `status -z`, `add --all`, `commit -m`, `log -n`, `checkpoint`, `reset --hard`, `undo`, `restore --dry-run`, `oplog`, and `recover --status` succeeds with zero runtime dependency on `git`.
 
 ## Rules for new tests
 
@@ -275,19 +292,17 @@ Property-based or fuzz testing is a useful follow-up after the pending format st
 
 ## CI plan
 
-The v0.1 Linux pipeline should run:
+The active Linux CI workflow (`.github/workflows/ci.yml`) runs on every push to `main` and pull request:
 
-1. formatting check;
-2. clippy for workspace/all targets with warnings denied;
-3. all tests with a pinned Git version recorded in logs;
-4. warning-denied rustdoc;
-5. release build;
-6. disposable-repository smoke demo;
-7. failure-injection suite;
-8. `cargo metadata` and license/dependency audit;
-9. archive checksum generation for release tags.
+1. logs `rustc --version`, `cargo --version`, and `git --version`;
+2. formatting check (`cargo fmt --all -- --check`);
+3. clippy for workspace/all targets with warnings denied (`cargo clippy --workspace --all-targets -- -D warnings`);
+4. all workspace unit, differential, privacy, `PATH=""`, and process-kill tests (`cargo test --workspace --all-targets`);
+5. warning-denied rustdoc (`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`);
+6. release build (`cargo build --release --workspace`);
+7. disposable-repository smoke demo (`GIT2_BIN="$PWD/target/release/git2" bash scripts/demo.sh`).
 
-macOS and Windows jobs become required only when those platforms enter the supported matrix.
+Local dependency/license auditing (`cargo metadata`) and release tarball + SHA-256 packaging (`scripts/package-release.sh`) are documented in [Experimental v0.1 release notes](release-v0.1.md). macOS and Windows jobs become required only when those platforms enter the supported matrix.
 
 ## Test review checklist
 

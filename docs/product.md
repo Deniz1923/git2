@@ -35,7 +35,7 @@ The v0.1 claim is intentionally narrow:
 
 > In a supported Linux repository, git2 records a durable complete pre-operation view for each supported git2 mutation and can restore that view non-destructively, including HEAD, refs, index, tracked worktree content, and non-ignored untracked content.
 
-The release must not make this claim until native `commit` and `log`, full interruption testing, and release-readiness checks pass. While `adopt`, `checkpoint`, `status`, `oplog`, `restore`, `recover`, `reset`, `undo`, and `add` are now implemented, the software remains pre-release and experimental.
+The v0.1 command set (`adopt`, `checkpoint`, `status`, `oplog`, `restore`, `recover`, `reset`, `undo`, `add`, `commit`, and `log`) is implemented and verified on Linux, while the software remains pre-release and experimental.
 
 ## Scope of a complete view
 
@@ -79,7 +79,7 @@ git2 commit
 git2 log
 ```
 
-All commands above except `commit` and `log` exist today. Debug object commands are development aids and are not part of the product promise.
+All commands above are implemented in the CLI. Debug object commands are development aids and are not part of the product promise.
 
 ## Non-goals
 

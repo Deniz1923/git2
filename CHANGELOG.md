@@ -23,8 +23,10 @@ All notable project changes are recorded here. The project has not made a suppor
 - `git2 restore --view <id> [--dry-run]`, `git2 recover [--status | --rollback]`, pending-aware full-64-hex `git2 oplog`, dual current/target ignore-profile planning, pruned Git object rehydration, file/directory and ref D/F swap support, and core/CLI restore crash-recovery test suites.
 - Native `git2 reset [--soft | --mixed | --hard]` (resolving `HEAD`, local branches, full 40-hex commit IDs, and bounded `~N` up to 10,000 steps) and `git2 undo [--dry-run]` / redo with semantic index comparison across stat-cache refreshes, plus full core and CLI crash-recovery tests.
 - Native `git2 add [--all] [--] [<path>...]` literal CWD-relative staging (new/modified/deleted files, recursive directories, binary/executable/symlink fidelity, built-in `gix` text/EOL conversion, active external-filter and ignored-path refusal, transactional index lockfile updates, and differential + CLI crash tests).
+- Native `git2 commit -m <message>` (canonical bottom-up tree builder with Git directory-`/` sorting, Git identity/date resolution, active hook/`commit.gpgSign`/encoding/empty/ITA/lock refusals, root & single-parent transactional commits reversible via `git2 undo`, empty-tree physical object persistence, and process-kill crash suites) and bounded `git2 log [-n|--max-count <n>]`.
+- Expanded Milestone 3 status parity coverage (executable bits, symlink & type transitions, non-UTF-8/tab/newline `-z` paths, nested/global excludes, unborn and detached `HEAD`, tracked-before-untracked porcelain ordering), `git push --mirror` privacy test, and `PATH=""` zero-runtime-`git` smoke test.
+- Reproducible `scripts/demo.sh`, `scripts/package-release.sh` (tarball + `.sha256`), [operations & recovery runbook](docs/runbook.md), [experimental v0.1 release notes](docs/release-v0.1.md), and expanded CI workflow (`.github/workflows/ci.yml`).
 - Product, architecture, compatibility, CLI, format, roadmap, testing, development, contribution, and security documentation.
-- GitHub Actions CI workflow running formatting, clippy, workspace tests, and rustdoc checks.
 
 ### Changed
 
@@ -46,6 +48,5 @@ All notable project changes are recorded here. The project has not made a suppor
 
 ### Known limitations
 
-- No native `commit` or `log` CLI command yet.
-- No networking or cross-platform recovery support.
-- Still experimental and not recommended for important repositories.
+- No networking (`clone`, `fetch`, `pull`, `push`) or cross-platform recovery support (`v0.2+`).
+- Still experimental and not recommended for important repositories (`publish = false`, awaiting separate authorization before any public tag/release).
