@@ -61,7 +61,7 @@ pub struct ResetOutcome {
 }
 
 /// Resolve a commit revision restricted to `HEAD`, full 40-hex commit IDs,
-/// local branch names (`refs/heads/<name>`), and optional `~N` suffixes up to
+/// local branch or tag names, and optional `~N` suffixes up to
 /// [`MAX_FIRST_PARENT_STEPS`].
 ///
 /// # Errors
@@ -74,20 +74,13 @@ pub fn resolve_commit(repo: &LocalRepository, rev: &str) -> Result<GitOid> {
     resolve_commit_with_reader(repo, &mut reader, rev)
 }
 
-fn resolve_commit_with_reader(
+pub(crate) fn resolve_commit_with_reader(
     repo: &LocalRepository,
     reader: &mut BoundedReader,
     rev: &str,
 ) -> Result<GitOid> {
-    if rev.is_empty() || rev.contains('^') || rev.contains("@{") || rev.contains("..") {
-        return Err(Error::UnsupportedRepository(format!(
-            "unsupported revision syntax {rev:?}; use commit ID, HEAD, branch name, and optional ~N"
-        )));
-    }
-    let (base, steps) = parse_tilde_suffix(rev)?;
     let meta = CheckedRoot::open(repo.git_dir())?;
-    let base_oid = resolve_base_oid(&meta, reader, base)?;
-    walk_first_parent(reader, base_oid, steps)
+    crate::refs::resolve_revision_oid(&meta, reader, rev, true)
 }
 
 /// Apply `git2 reset` cleanly without failure injection.
@@ -179,7 +172,7 @@ pub fn apply_with_hook(
     })
 }
 
-fn parse_tilde_suffix(rev: &str) -> Result<(&str, usize)> {
+pub(crate) fn parse_tilde_suffix(rev: &str) -> Result<(&str, usize)> {
     let Some(tilde) = rev.find('~') else {
         return Ok((rev, 0));
     };
@@ -208,45 +201,6 @@ fn parse_tilde_suffix(rev: &str) -> Result<(&str, usize)> {
         )));
     }
     Ok((base, steps))
-}
-
-fn resolve_base_oid(meta: &CheckedRoot, reader: &mut BoundedReader, base: &str) -> Result<GitOid> {
-    if base == "HEAD" {
-        let raw_head = meta
-            .read_file_raw(b"HEAD", MAX_CAS_BYTES as u64)?
-            .ok_or_else(|| Error::UnsupportedRepository("Git HEAD is missing".to_owned()))?;
-        let trimmed = trim_newline(&raw_head);
-        if let Some(target_ref) = trimmed.strip_prefix(b"ref: ") {
-            let (leaf_ref, oid) = resolve_ref_chain(meta, target_ref)?;
-            return oid.ok_or_else(|| {
-                Error::UnsupportedRepository(format!(
-                    "cannot reset unborn branch {}",
-                    escape_path_bytes(leaf_ref.as_slice())
-                ))
-            });
-        }
-        return GitOid::from_hex(trimmed);
-    }
-
-    if base.len() == 40
-        && let Ok(oid) = GitOid::from_hex(base.as_bytes())
-    {
-        if reader.read(oid)?.kind != ObjectKind::Commit {
-            return Err(Error::UnsupportedRepository(format!(
-                "object {oid} is not a commit"
-            )));
-        }
-        return Ok(oid);
-    }
-
-    let branch_ref = format!("refs/heads/{base}");
-    gix::validate::reference::name(branch_ref.as_bytes().as_bstr()).map_err(|_| {
-        Error::UnsupportedRepository(format!("unsupported revision or branch name {base:?}"))
-    })?;
-    let (_, oid) = resolve_ref_chain(meta, branch_ref.as_bytes())?;
-    oid.ok_or_else(|| {
-        Error::UnsupportedRepository(format!("unknown revision or local branch {base:?}"))
-    })
 }
 
 pub(crate) fn resolve_ref_chain(
@@ -286,7 +240,10 @@ pub(crate) fn resolve_ref_chain(
     ))
 }
 
-fn resolve_packed_ref_oid(meta: &CheckedRoot, ref_name: &[u8]) -> Result<Option<GitOid>> {
+pub(crate) fn resolve_packed_ref_oid(
+    meta: &CheckedRoot,
+    ref_name: &[u8],
+) -> Result<Option<GitOid>> {
     let Some(packed) = meta.read_file_raw(b"packed-refs", MAX_CAS_BYTES as u64)? else {
         return Ok(None);
     };
@@ -302,32 +259,6 @@ fn resolve_packed_ref_oid(meta: &CheckedRoot, ref_name: &[u8]) -> Result<Option<
         }
     }
     Ok(None)
-}
-
-fn walk_first_parent(
-    reader: &mut BoundedReader,
-    mut current: GitOid,
-    steps: usize,
-) -> Result<GitOid> {
-    for step in 0..=steps {
-        let object = reader.read(current)?;
-        if object.kind != ObjectKind::Commit {
-            return Err(Error::UnsupportedRepository(format!(
-                "object {current} is a {}, expected commit",
-                object.kind
-            )));
-        }
-        if step == steps {
-            break;
-        }
-        let commit = Commit::parse(&object.data)?;
-        current = *commit.parents.first().ok_or_else(|| {
-            Error::UnsupportedRepository(format!(
-                "commit {current} has no first parent at step {step}"
-            ))
-        })?;
-    }
-    Ok(current)
 }
 
 pub(crate) struct HeadPlan {
@@ -392,7 +323,7 @@ pub(crate) fn plan_head_update(live_view: &View, target_commit: GitOid) -> Resul
     }
 }
 
-fn rebuild_refs(
+pub(crate) fn rebuild_refs(
     packed: Option<BString>,
     loose: BTreeMap<BString, BString>,
 ) -> Vec<(BString, BString)> {
@@ -945,7 +876,7 @@ fn append_hard_worktree_actions(
     }
 }
 
-fn flatten_tree(
+pub(crate) fn flatten_tree(
     reader: &mut BoundedReader,
     tree_oid: GitOid,
     prefix: &[u8],
@@ -1018,7 +949,9 @@ fn flatten_tree(
     Ok(())
 }
 
-fn build_index_bytes(entries: &BTreeMap<BString, (FileKind, GitOid)>) -> Result<Vec<u8>> {
+pub(crate) fn build_index_bytes(
+    entries: &BTreeMap<BString, (FileKind, GitOid)>,
+) -> Result<Vec<u8>> {
     let mut state = gix::index::State::new(gix::hash::Kind::Sha1);
     for (path, (kind, oid)) in entries {
         let mode = match kind {
@@ -1055,7 +988,7 @@ pub(crate) fn serialize_index(state: &mut gix::index::State) -> Result<Vec<u8>> 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn persist_target_view(
+pub(crate) fn persist_target_view(
     store: &RecoveryStore,
     objects: &ObjectStore,
     known_cas: &BTreeSet<ContentId>,

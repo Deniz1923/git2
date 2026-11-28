@@ -174,9 +174,9 @@ fn ensure_commit_has_changes(
     Ok(())
 }
 
-type PendingObjectMap = BTreeMap<GitOid, (RawObject, ContentId)>;
+pub(crate) type PendingObjectMap = BTreeMap<GitOid, (RawObject, ContentId)>;
 
-fn persist_pending_objects(
+pub(crate) fn persist_pending_objects(
     store: &RecoveryStore,
     reader: &mut BoundedReader,
     known_cas: &BTreeSet<ContentId>,
@@ -199,7 +199,7 @@ fn persist_pending_objects(
     Ok((pending_objects, actions))
 }
 
-fn normalize_message(message: &str) -> Result<BString> {
+pub(crate) fn normalize_message(message: &str) -> Result<BString> {
     if message.contains('\0') {
         return Err(Error::UnsupportedRepository(
             "commit message cannot contain NUL bytes".to_owned(),
@@ -218,13 +218,7 @@ fn normalize_message(message: &str) -> Result<BString> {
     Ok(BString::from(out))
 }
 
-fn check_commit_config_and_hooks(repo: &LocalRepository) -> Result<()> {
-    let config = repo.inner.config_snapshot();
-    if config.boolean("commit.gpgSign") == Some(true) {
-        return Err(Error::UnsupportedRepository(
-            "commit signing (`commit.gpgSign`) is not supported".to_owned(),
-        ));
-    }
+pub(crate) fn check_commit_encoding(config: &gix::config::Snapshot<'_>) -> Result<()> {
     if let Some(encoding) = config.string("i18n.commitEncoding")
         && !encoding.eq_ignore_ascii_case(b"utf-8")
         && !encoding.eq_ignore_ascii_case(b"utf8")
@@ -234,6 +228,17 @@ fn check_commit_config_and_hooks(repo: &LocalRepository) -> Result<()> {
             encoding.to_str_lossy()
         )));
     }
+    Ok(())
+}
+
+fn check_commit_config_and_hooks(repo: &LocalRepository) -> Result<()> {
+    let config = repo.inner.config_snapshot();
+    if config.boolean("commit.gpgSign") == Some(true) {
+        return Err(Error::UnsupportedRepository(
+            "commit signing (`commit.gpgSign`) is not supported".to_owned(),
+        ));
+    }
+    check_commit_encoding(&config)?;
 
     let hooks_dir = resolve_hooks_dir(repo, &config)?;
     let Some(hooks_dir) = hooks_dir else {
@@ -286,7 +291,7 @@ fn resolve_hooks_dir(
     Ok(Some(repo.git_dir().join("hooks")))
 }
 
-fn resolve_signature(
+pub(crate) fn resolve_signature(
     repo: &LocalRepository,
     role: &str,
     name_env: &str,
@@ -562,7 +567,7 @@ fn build_trees_from_index(index: Option<&gix::index::State>) -> Result<Vec<(GitO
 }
 
 #[allow(clippy::too_many_arguments)]
-fn persist_commit_view(
+pub(crate) fn persist_commit_view(
     store: &RecoveryStore,
     objects: &ObjectStore,
     known_cas: &BTreeSet<ContentId>,

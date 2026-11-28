@@ -24,6 +24,7 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 | D016 | Compress recovery CAS payloads with zlib in format 3 | Accepted |
 | D017 | Sequence recovery proof before native add/commit, constrain journal, and check semantic index for undo | Accepted |
 | D018 | Track delegated remote/network commands with `pending/delegated`, conflict-safe rollback, and non-undoable push | Accepted |
+| D019 | Separate `switch` for branch/HEAD checkout from `restore` without an overloaded `checkout` command | Accepted |
 
 ## D001 — ordinary Git remains the repository format
 
@@ -168,6 +169,14 @@ This is a lightweight decision log. Entries describe durable choices that shape 
 **Decision:** Persist a separate format-3 `.git/git2/pending/delegated` record before delegating mutable remote operations (`fetch`, `pull`, `push`, `remote remove`, `remote rename`). Redact embedded URL credentials (`https://user:pass@host`) before persisting command text. Clean up failed `--ff-only` pulls that leave zero conflicts cleanly (recording any fetched tracking-ref changes as `external-git`). On conflicted `pull --merge`/`--rebase` or process kills, keep `pending/delegated` so `git2 recover --rollback` removes transient Git conflict state and restores `before_view`, while `git2 recover` (stripping optional `REUC` index extensions left by manual Git conflict resolution) finalizes resolved work as an undoable `oplog` entry. Refuse `git2 undo` on `git2:push` operations explicitly.
 
 **Consequences:** Format `3\n` sidecar schemas remain backward-compatible, local commands keep zero runtime dependency on `git`, and users get conflict-safe `pull` recovery plus honest push warnings without reimplementing Git wire protocols.
+
+## D019 — dedicated `switch` instead of an overloaded `checkout` command
+
+**Context:** Git's legacy `git checkout` mixes branch switching, detaching `HEAD`, and path-level index/worktree restoration into one overloaded interface where small argument typos can silently discard uncommitted file edits. Meanwhile, `git2 restore --view <id>` already owns snapshot restoration and will expand in Milestone 12 to path-scoped `restore`.
+
+**Decision:** Implement `git2 switch` (`<branch>`, `-c`/`-C <new-branch>`, `--detach`) cleanly for branch and `HEAD` transitions with strict dirty-worktree overwrite protection, rather than adding an overloaded `checkout` command.
+
+**Consequences:** Command responsibilities stay unambiguous (`branch`/`switch`/`tag` for refs and active branch state, `restore` for snapshot and path restoration), reducing accidental user destruction while matching modern Git conventions.
 
 ## Open decisions
 

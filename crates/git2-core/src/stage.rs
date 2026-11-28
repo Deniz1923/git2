@@ -625,7 +625,7 @@ impl<'repo> RepoFilter<'repo> {
         Ok(())
     }
 
-    fn convert_to_git(
+    pub(crate) fn convert_to_git(
         &mut self,
         path: &[u8],
         raw_bytes: &[u8],

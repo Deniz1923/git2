@@ -1,9 +1,9 @@
 # Roadmap
 
-Last reconciled with `main`: 2026-11-27.
+Last reconciled with `main`: 2026-11-28.
 
 > [!WARNING]
-> `git2` is currently at `0.1.0-alpha.1` (`publish = false`, **experimental and not safe for important repositories**). **v0.1 (Milestones 0–10)** is complete on `main`; **v0.2+** is active development. The experimental warning stays in place until every **v1.0** gate passes.
+> `git2` is currently at `0.1.0-alpha.1` (`publish = false`, **experimental and not safe for important repositories**). **v0.1 (Milestones 0–10)** and **v0.2 Milestone 11** are complete on `main`; remaining **v0.2+** milestones are active development. The experimental warning stays in place until every **v1.0** gate passes.
 
 ## How to read this roadmap
 
@@ -44,19 +44,17 @@ Make `git2` practical as a daily local Git CLI without falling back to ordinary 
 
 ### Milestone 11 — Branches, Switching & Tags
 
-**Status: Planned**
+**Status: Done**
 
 - **Commands:**
-  - `git2 branch [-v] | <name> [<start-point>] | -d/-D <name> | -m <old> <new>`
-  - `git2 switch [-c|-C <new-branch>] [<branch> | --detach <commit>]` (and evaluate `checkout` ergonomics / explicit conflict-free scope)
-  - `git2 tag [-l] | <name> [<commit>] | -a <name> -m <msg> | -d <name>`
-- **Deliverables:**
-  - Safe local branch & tag ref creation, rename, and deletion inside the 4-phase pending transaction journal.
-  - Annotated tag object parsing and serialization in `git2-core::object` (matching `git mktag` / `git fsck --strict`).
-  - Dirty-worktree safety rules when switching branches (refusing to overwrite uncommitted worktree/index edits unless safe or fast-forwardable).
-- **Exit criteria:**
-  - `branch`, `switch`, and `tag` match ordinary Git on refs, index, worktree bytes, and `git fsck --full --strict`.
-  - Every mutating branch/switch/tag invocation is cleanly reversible via `git2 undo` and crash-tested at journal boundaries.
+  - `git2 branch [-v] | <name> [<start-point>] | -d/-D <name> | -m [<old>] <new>`
+  - `git2 switch [-c|-C <new-branch>] [-d|--detach] [<target>]`
+  - `git2 tag [-l] | <name> [<target>] | -a -m <msg> <name> [<target>] | -d <name>`
+- **Delivered:**
+  - Canonical annotated `Tag` object codec (`parse`/`serialize`) in `git2-core::object`, plus shared ref/revision/peeling plumbing (`git2-core::refs`, also upgrading `reset::resolve_commit` to peel tags).
+  - Local branch create, safe `-d` (multi-parent merge ancestry check), force `-D`, packed-refs handling, D/F rename (`-m`), and symbolic `HEAD` update inside the 4-phase pending journal.
+  - Lightweight tags, unsigned annotated tag object creation & retention, and loose/packed tag deletion inside the pending journal.
+  - 2-tree `git2 switch` with dirty-worktree overwrite protection (preserving untouched staged/unstaged/untracked changes while refusing staged/unstaged/untracked/ignored/D/F collisions before mutation), `ENOTDIR` D/F swap support, EOL filter handling, `git2 undo`/redo, child-process failpoint tests, and `PATH=""` zero-`git` offline verification.
 
 ### Milestone 12 — Diff, Show, Path Restore & Commit Amend
 

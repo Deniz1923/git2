@@ -51,9 +51,9 @@ Detection is conservative but not yet exhaustive. Unknown extensions or concurre
 | Packed object read | Implemented through `gix`, tested after `git gc` |
 | Commit parsing/serialization | Implemented, including byte messages and multiline extra headers |
 | Tree parsing/serialization | Implemented, including non-UTF-8 names and gitlink modes |
-| Annotated tag-specific model | Not implemented; raw tag objects are readable |
+| Annotated tag-specific model | Implemented (`Tag` parse/serialize, unsigned `git2 tag -a -m`, tag peeling) |
 | Abbreviated object IDs | Not implemented in CLI |
-| Object writes | `git2 add` writes staged loose blobs via `.git/index.lock`; `git2 commit` writes trees, commit objects, and refs/HEAD; `git2 restore`/`recover` rehydrate retained objects; `debug hash-object` stays read-only |
+| Object writes | `git2 add` writes staged loose blobs via `.git/index.lock`; `git2 commit` writes trees, commit objects, and refs/HEAD; `git2 tag -a` persists annotated tag objects; `git2 restore`/`recover` rehydrate retained objects; `debug hash-object` stays read-only |
 | Retained object closure | Implemented for refs/HEAD/index roots with tag/commit/tree traversal; writes no public refs or objects |
 
 ## Captured state

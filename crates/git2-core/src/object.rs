@@ -409,6 +409,83 @@ impl Commit {
     }
 }
 
+/// An annotated Git tag object with optional `tagger` and unknown headers retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    pub object: GitOid,
+    pub object_kind: ObjectKind,
+    pub name: BString,
+    pub tagger: Option<Signature>,
+    pub extra_headers: Vec<(BString, BString)>,
+    pub message: BString,
+}
+
+impl Tag {
+    /// Parse canonical tag object data (without the loose-object header).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CorruptObject`] if required headers are missing or any header is invalid.
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        let (header_bytes, message) =
+            if let Some(separator) = data.windows(2).position(|window| window == b"\n\n") {
+                (&data[..separator], BString::from(&data[separator + 2..]))
+            } else if let Some(stripped) = data.strip_suffix(b"\n") {
+                (stripped, BString::default())
+            } else {
+                return Err(Error::CorruptObject(
+                    "tag has no message separator".to_owned(),
+                ));
+            };
+        let headers = parse_headers(header_bytes)?;
+
+        let mut object = None;
+        let mut object_kind = None;
+        let mut name = None;
+        let mut tagger = None;
+        let mut extra_headers = Vec::new();
+
+        for (header_name, value) in headers {
+            let name_bytes: &[u8] = header_name.as_ref();
+            match name_bytes {
+                b"object" => object = Some(GitOid::from_hex(value.as_ref())?),
+                b"type" => object_kind = Some(ObjectKind::from_bytes(value.as_ref())?),
+                b"tag" => name = Some(value),
+                b"tagger" => tagger = Some(Signature::parse(value.as_ref())?),
+                _ => extra_headers.push((header_name, value)),
+            }
+        }
+
+        Ok(Self {
+            object: object.ok_or_else(|| Error::CorruptObject("tag has no object".to_owned()))?,
+            object_kind: object_kind
+                .ok_or_else(|| Error::CorruptObject("tag has no type".to_owned()))?,
+            name: name.ok_or_else(|| Error::CorruptObject("tag has no tag name".to_owned()))?,
+            tagger,
+            extra_headers,
+            message,
+        })
+    }
+
+    /// Serialize canonical tag object data.
+    #[must_use]
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_header(&mut output, b"object", self.object.to_hex().as_bytes());
+        write_header(&mut output, b"type", self.object_kind.as_bytes());
+        write_header(&mut output, b"tag", self.name.as_ref());
+        if let Some(tagger) = &self.tagger {
+            write_header(&mut output, b"tagger", &tagger.serialize());
+        }
+        for (name, value) in &self.extra_headers {
+            write_header(&mut output, name.as_ref(), value.as_ref());
+        }
+        output.push(b'\n');
+        output.extend_from_slice(self.message.as_ref());
+        output
+    }
+}
+
 fn parse_headers(data: &[u8]) -> Result<Vec<(BString, BString)>> {
     let mut headers: Vec<(BString, BString)> = Vec::new();
     for line in data.split(|byte| *byte == b'\n') {
@@ -614,5 +691,52 @@ mod tests {
             ],
         };
         assert_eq!(Tree::parse(&tree.serialize()).unwrap(), tree);
+    }
+
+    #[test]
+    fn tag_round_trips_tagger_optional_and_extra_headers() {
+        let with_tagger = concat!(
+            "object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n",
+            "type commit\n",
+            "tag v1.0\n",
+            "tagger T <t@example.com> 42 +0100\n",
+            "gpgsig line1\n",
+            " line2\n",
+            "\n"
+        )
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain([b'm', b's', b'g', 0xff, b'\n'])
+        .collect::<Vec<_>>();
+        let parsed = Tag::parse(&with_tagger).unwrap();
+        assert_eq!(parsed.object_kind, ObjectKind::Commit);
+        assert_eq!(parsed.name, BString::from("v1.0"));
+        assert!(parsed.tagger.is_some());
+        assert_eq!(
+            parsed.extra_headers,
+            vec![(BString::from("gpgsig"), BString::from("line1\nline2"))]
+        );
+        assert_eq!(parsed.serialize(), with_tagger);
+
+        let without_tagger = concat!(
+            "object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n",
+            "type blob\n",
+            "tag v0.1\n",
+            "\n",
+            "short tag\n"
+        )
+        .as_bytes();
+        let parsed_no_tagger = Tag::parse(without_tagger).unwrap();
+        assert!(parsed_no_tagger.tagger.is_none());
+        assert_eq!(parsed_no_tagger.object_kind, ObjectKind::Blob);
+        assert_eq!(parsed_no_tagger.serialize(), without_tagger);
+
+        let missing_tag_header =
+            b"object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\ntype commit\n\nhi\n";
+        assert!(matches!(
+            Tag::parse(missing_tag_header),
+            Err(Error::CorruptObject(_))
+        ));
     }
 }

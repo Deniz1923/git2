@@ -158,6 +158,7 @@ Kinds currently include:
 - `git2:reset --<mode> <rev>`, emitted by `git2 reset`;
 - `git2:add ...`, emitted by `git2 add`;
 - `git2:commit`, emitted by `git2 commit`;
+- `git2:branch ...`, `git2:switch ...`, `git2:tag ...`, emitted by branch, switch, and tag mutations (all undoable via `git2 undo`);
 - `git2:fetch ...`, `git2:pull ...`, `git2:remote remove|rename ...` (undoable via `git2 undo`), with any embedded URL credentials (`scheme://user:pass@host`) redacted as `***`;
 - `git2:push ...`, emitted when local tracking refs move during `git2 push` (explicitly refused by `git2 undo`);
 - `git2:undo`, emitted by `git2 undo`;
@@ -209,6 +210,57 @@ Behavior:
 - prints commit ID, author, formatted date/offset, and indented message payload byte-safely to standard output;
 - refuses pending transactions, counts above `10000`, unborn `HEAD`, parent cycles, or missing/corrupt parent commits rather than silently truncating history.
 
+## `git2 branch`
+
+```text
+git2 branch [-v|--verbose]
+git2 branch <name> [<start-point>]
+git2 branch (-d|--delete | -D) <branch-name>
+git2 branch (-m|--move) [<old-branch>] <new-branch>
+```
+
+Requires an adopted repository for mutating operations (listing is read-only) and runs every branch creation, rename, and deletion inside the 4-phase pending-transaction journal (`git2 undo`-capable).
+
+Behavior:
+
+- listing reads both loose `refs/heads/` and `.git/packed-refs`, marking the active branch (or `(HEAD detached at <short-id>)`) with `*`, and `-v` appends the 7-character OID and commit subject;
+- create resolves `<start-point>` (default `HEAD`, supporting branches, tags with annotated tag peeling, 40-hex commit IDs, and `~N`) and refuses invalid names, duplicates, D/F ref collisions, and foreign ref locks;
+- delete handles both loose and packed branches (refusing to delete the branch checked out at `HEAD` or targeted by another symbolic ref; `-d` verifies full ancestry reachability from `HEAD` across merge commits while `-D` deletes unmerged branches cleanly with full object rehydration on `git2 undo`);
+- rename updates loose/packed refs, D/F swaps (`a` ↔ `a/b`), and `HEAD` when renaming the current branch.
+
+## `git2 switch`
+
+```text
+git2 switch <branch>
+git2 switch (-c <new-branch> | -C <new-branch>) [<start-point>]
+git2 switch (-d|--detach) [<commit>]
+```
+
+Requires an adopted repository and switches branches or detaches `HEAD` transactionally via 2-tree checkout (`source_tree` → `target_tree`) with dirty-worktree overwrite protection.
+
+Behavior:
+
+- preserves staged changes, unstaged edits, and untracked files on paths unchanged between `HEAD` and the target commit;
+- refuses cleanly without touching `HEAD`, `.git/index`, or files if any staged modification, unstaged edit, mode change, untracked file, ignored file, or D/F shape collision would be overwritten;
+- handles executables, symlinks, non-UTF-8 paths, file↔directory swaps, `.gitignore` transitions, and built-in EOL conversions, recording `git2:switch ...` operations reversible via `git2 undo`.
+
+## `git2 tag`
+
+```text
+git2 tag [-l|--list]
+git2 tag <tag-name> [<target>]
+git2 tag -a -m <message> <tag-name> [<target>]
+git2 tag -d <tag-name>
+```
+
+Lists tags across `refs/tags/` and `packed-refs` or performs undoable lightweight/annotated tag creation and deletion.
+
+Behavior:
+
+- lightweight tags create `refs/tags/<name>` pointing directly at the resolved commit/object OID;
+- `-a -m <message>` creates an unsigned canonical Git tag object (reusing `GIT_COMMITTER_*` / `user.*` identity, refusing `tag.gpgSign`, `tag.forceSignAnnotated`, non-UTF-8 `i18n.commitEncoding`, blank messages, or foreign locks) and retains the tag object privately so `git2 undo` restores deleted tags even after Git object pruning;
+- `-d <tag-name>` removes loose or packed tags cleanly (stripping any peeled `^<oid>` line in `packed-refs`).
+
 ## `git2 reset`
 
 ```text
@@ -226,7 +278,7 @@ Modes:
 Target revisions:
 
 - defaults to `HEAD` when `<commit>` is omitted;
-- accepts `HEAD`, full 40-character SHA-1 commit IDs, local branch names (`refs/heads/<name>`), and optional `<target>~N` suffixes up to `10,000` first-parent steps;
+- accepts `HEAD`, full 40-character SHA-1 commit IDs, local branch names (`refs/heads/<name>`), tag names (`refs/tags/<name>`, peeling annotated tags to commits and refusing ambiguous branch+tag names), and optional `<target>~N` suffixes up to `10,000` first-parent steps;
 - refuses unborn targets, `^` / `@{...}` / `..` syntax, non-commit objects, and trees containing submodule gitlinks before mutating state.
 
 ## `git2 undo`

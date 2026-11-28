@@ -183,6 +183,8 @@ fn empty_path_smoke_test_proves_zero_runtime_dependency_on_git() {
     assert_eq!(fs::read(dir.path().join("v1.txt")).unwrap(), b"v1 edited\n");
     assert_eq!(fs::read(dir.path().join("v2.txt")).unwrap(), b"v2 new\n");
 
+    verify_offline_branch_switch_tag(dir.path(), &no_path);
+
     let dry_restore = git2(
         dir.path(),
         &["restore", "--view", baseline_view, "--dry-run"],
@@ -211,4 +213,48 @@ fn empty_path_smoke_test_proves_zero_runtime_dependency_on_git() {
     );
 
     git(dir.path(), &["fsck", "--full", "--strict"]);
+}
+
+fn verify_offline_branch_switch_tag(repo_dir: &Path, no_path: &[(&str, &str)]) {
+    assert!(
+        git2(repo_dir, &["branch", "topic"], no_path)
+            .status
+            .success()
+    );
+    assert!(
+        git2(repo_dir, &["switch", "topic"], no_path)
+            .status
+            .success()
+    );
+    assert!(
+        git2(
+            repo_dir,
+            &["tag", "-a", "v0.2-test", "-m", "offline tag"],
+            no_path
+        )
+        .status
+        .success()
+    );
+    assert!(
+        git2(repo_dir, &["tag", "v0.2-light"], no_path)
+            .status
+            .success()
+    );
+    let tags = git2(repo_dir, &["tag"], no_path);
+    assert!(tags.status.success());
+    assert_eq!(
+        String::from_utf8(tags.stdout).unwrap(),
+        "v0.2-light\nv0.2-test\n"
+    );
+    assert!(
+        git2(repo_dir, &["switch", "main"], no_path)
+            .status
+            .success()
+    );
+    assert!(
+        git2(repo_dir, &["branch", "-d", "topic"], no_path)
+            .status
+            .success()
+    );
+    assert!(git2(repo_dir, &["undo"], no_path).status.success());
 }

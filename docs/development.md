@@ -25,6 +25,7 @@ git --version
 │   ├── git2-core/
 │   │   ├── src/
 │   │   │   ├── lib.rs
+│   │   │   ├── branch.rs
 │   │   │   ├── commit.rs
 │   │   │   ├── log.rs
 │   │   │   ├── network.rs
@@ -32,6 +33,7 @@ git --version
 │   │   │   ├── paths.rs
 │   │   │   ├── recovery.rs
 │   │   │   ├── recovery/disk.rs
+│   │   │   ├── refs.rs
 │   │   │   ├── remote.rs
 │   │   │   ├── repository.rs
 │   │   │   ├── reset.rs
@@ -41,6 +43,8 @@ git --version
 │   │   │   ├── status.rs
 │   │   │   ├── store.rs
 │   │   │   ├── store/packed.rs
+│   │   │   ├── switch.rs
+│   │   │   ├── tag.rs
 │   │   │   ├── transaction.rs
 │   │   │   └── undo.rs
 │   │   └── tests/
@@ -55,22 +59,26 @@ git --version
 
 Module responsibilities:
 
+- `branch`: native `branch` listing, creation, merge-guarded/force deletion, and D/F-safe renaming over the pending journal;
 - `commit`: native `commit -m` tree/commit/ref construction over the 4-phase pending journal;
 - `log`: bounded first-parent history traversal from `HEAD`;
 - `network`: `clone`, `fetch`, `pull`, and `push` via strict `git` argv delegation, credential redaction, and `pending/delegated` transactions;
-- `remote`: `remote` management (`list`, `add`, `remove`, `rename`, `get-url`, `set-url`) over strict argv delegation;
-- `object`: byte-safe Git object model and codecs;
+- `object`: byte-safe Git object model and codecs (blob, tree, commit, and annotated tag);
 - `paths`: descriptor-relative, no-follow worktree & metadata path operations;
 - `recovery` / `recovery::disk`: owner-private SHA-256 zlib CAS store and binary records;
+- `refs`: shared reference validation, D/F conflict checks, packed-ref deletion, tag peeling, and ancestry/revision resolution;
+- `remote`: `remote` management (`list`, `add`, `remove`, `rename`, `get-url`, `set-url`) over strict argv delegation;
 - `repository`: discovery, refusal policy, capture, and external import;
 - `retention`: reachable Git object closure verification and retention;
 - `transaction`: 4-phase pending journal and crash recovery;
 - `restore`: verified `restore --view` planning and execution;
-- `reset`: native `reset [--soft | --mixed | --hard]` over commits and branches;
+- `reset`: native `reset [--soft | --mixed | --hard]` over commits, branches, and tags;
 - `undo`: semantic-index `undo` / redo over completed operations;
 - `stage`: native `add` literal staging with built-in EOL conversion;
 - `status`: merged HEAD/index/worktree status model;
 - `store` / `store::packed`: loose object I/O plus bounded packed-object reads;
+- `switch`: native 2-tree `switch` (`-c` / `-C` / `--detach`) with dirty-worktree overwrite protection;
+- `tag`: native lightweight and annotated `tag` listing, creation, and deletion;
 - CLI `main`: parsing, output, and orchestration only.
 
 ## Common commands
@@ -222,10 +230,11 @@ Tests exist to prove Git interoperability and recovery safety using ordinary `gi
   - `restore.rs`: `--dry-run`, dual ignore profiles, pruned-object rehydration, file/dir & ref D/F swaps.
   - `reset_undo.rs`: differential `--soft` / `--mixed` / `--hard`, semantic-index `undo` / redo, divergence checks.
   - `stage.rs` & `commit_log.rs`: differential literal staging, built-in EOL conversion, canonical tree/commit construction, bounded `log`, hook/GPG/encoding refusals.
+  - `branch_switch_tag.rs`: `branch`, `switch` (2-tree checkout, dirty-worktree preservation/refusal, D/F swaps, `.gitignore`/EOL transitions), `tag` (lightweight & annotated `Tag` codec), and `git prune` + `git2 undo` recovery.
   - `network.rs`: `remote`, `clone` auto-adoption, undoable `fetch`, `pull` (`--ff-only` / `--merge` / `--rebase` + conflict rollback & `REUC` stripping), non-undoable `push`, and credential redaction.
 - **CLI (`crates/git2-cli/tests/`):**
-  - `cli.rs`, `crash_recovery.rs`, `reset_undo_cli.rs`, `stage_cli.rs`, `commit_log_cli.rs`, `network_cli.rs`: end-to-end CLI behavior plus `GIT2_TEST_FAILPOINT` child process-kill and rollback matrices.
-  - `release_readiness.rs`: `git push --mirror` privacy verification and `PATH=""` zero-runtime-`git` smoke test across all local commands.
+  - `cli.rs`, `crash_recovery.rs`, `reset_undo_cli.rs`, `stage_cli.rs`, `commit_log_cli.rs`, `branch_switch_tag_cli.rs`, `network_cli.rs`: end-to-end CLI behavior plus `GIT2_TEST_FAILPOINT` child process-kill and rollback matrices.
+  - `release_readiness.rs`: `git push --mirror` privacy verification and `PATH=""` zero-runtime-`git` smoke test across all local commands (including `branch`, `switch`, and `tag`).
 
 ### Testing rules
 

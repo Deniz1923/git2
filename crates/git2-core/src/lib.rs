@@ -6,6 +6,8 @@
 //! building on the same verified local core.
 
 #[cfg(unix)]
+pub mod branch;
+#[cfg(unix)]
 pub mod commit;
 #[cfg(unix)]
 pub mod log;
@@ -16,6 +18,8 @@ pub mod object;
 pub mod paths;
 #[cfg(unix)]
 pub mod recovery;
+#[cfg(unix)]
+pub(crate) mod refs;
 #[cfg(unix)]
 pub mod remote;
 #[cfg(unix)]
@@ -31,6 +35,10 @@ pub mod stage;
 #[cfg(unix)]
 pub mod status;
 pub mod store;
+#[cfg(unix)]
+pub mod switch;
+#[cfg(unix)]
+pub mod tag;
 #[cfg(unix)]
 pub mod transaction;
 #[cfg(unix)]

@@ -5,13 +5,13 @@
 The project uses ordinary Git repositories as its interchange format. It adds a private, clone-local operation history under `.git/git2/` and is being developed as a learning-first, portfolio-grade implementation of Git’s local mechanics.
 
 > [!WARNING]
-> git2 is experimental (`0.1.0-alpha.1`, `publish = false`) and **not safe for important repositories**. It completes the v0.1 command set (`adopt`, `checkpoint`, `status`, `oplog`, `restore`, `recover`, `reset`, `undo`, `add`, `commit`, `log`, `remote`, `clone`, `fetch`, `pull`, and `push`); always evaluate in disposable clones and keep external backups.
+> git2 is experimental (`0.1.0-alpha.1`, `publish = false`) and **not safe for important repositories**. It completes `v0.1` plus Milestone 11 (`v0.2` in progress: `adopt`, `checkpoint`, `status`, `oplog`, `restore`, `recover`, `reset`, `undo`, `add`, `commit`, `log`, `branch`, `switch`, `tag`, `remote`, `clone`, `fetch`, `pull`, and `push`); always evaluate in disposable clones and keep external backups.
 
 ## Current status
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Git object interoperability | Implemented | Byte-safe SHA-1 IDs, loose reads/writes, packed reads, commits, and trees |
+| Git object interoperability | Implemented | Byte-safe SHA-1 IDs, loose reads/writes, packed reads, commits, trees, and annotated tags |
 | Repository adoption | Implemented | Captures HEAD, refs, index, tracked files, and non-ignored untracked files |
 | Object retention and checkpoints | Implemented | Adoption, automatic imports, and `checkpoint` retain the current Git object closure privately |
 | Recovery storage | Implemented | Immutable SHA-256 zlib-compressed CAS (format 3), views, operations, integrity checks, and advisory lock |
@@ -21,6 +21,7 @@ The project uses ordinary Git repositories as its interchange format. It adds a 
 | Reset and undo | Implemented | `reset [--soft \| --mixed \| --hard]`, semantic-index `undo [--dry-run]` / redo + crash tests |
 | Staging | Implemented | `add [--all] [--] [<path>...]` with built-in EOL conversion, ignore rules, and atomic index lock |
 | Commits and log | Implemented | `commit -m <message>` via transactional tree/commit/ref writes (`undo`-capable) and bounded `log [-n <n>]` |
+| Branches, switching, and tags | Implemented | `branch [-v \| -d \| -D \| -m]`, `switch [-c \| -C \| --detach]` with dirty-worktree overwrite protection, and `tag [-l \| -a -m \| -d]` (`undo`-capable) |
 | Release readiness & CI | Implemented | Mirror-push privacy test, `PATH=""` smoke test, `scripts/demo.sh`, `scripts/package-release.sh`, [runbook](docs/runbook.md), and [verification baseline](docs/development.md#verification-baseline-010-alpha1) |
 | Networking & remotes | Implemented | `clone`, `fetch`, `pull` (`--ff-only` default + conflict-recoverable `--merge`/`--rebase`), `push`, and `remote` via strict `git` argv delegation (local commands keep zero `git` runtime dependency) |
 
@@ -35,7 +36,7 @@ Git already has reflogs and recoverable objects, but recovery is fragmented acro
 3. Record the before/after transition in an immutable local operation log.
 4. Let the user restore an earlier view without rewriting or deleting that history.
 
-The current build implements the full experimental v0.1 command set: private format-3 storage, external-change import, the 4-phase pending-transaction journal, verified `restore --view`, `recover`, `reset`, `undo`/redo, `add`, `commit -m`, bounded `log`, plus delegated `remote`, `clone`, `fetch`, `pull`, and `push`.
+The current build implements all of `v0.1` plus `v0.2` Milestone 11: private format-3 storage, external-change import, the 4-phase pending-transaction journal, verified `restore --view`, `recover`, `reset`, `undo`/redo, `add`, `commit -m`, bounded `log`, `branch`, `switch`, `tag`, plus delegated `remote`, `clone`, `fetch`, `pull`, and `push`.
 
 ## Supported environment
 
@@ -107,6 +108,9 @@ git2 checkpoint
 git2 add [--all] [--] [<path>...]
 git2 commit -m <message>
 git2 log [-n|--max-count <n>]
+git2 branch [-v] | <name> [<start-point>] | -d|-D <name> | -m [<old>] <new>
+git2 switch [-c|-C <new-branch>] [-d|--detach] [<target>]
+git2 tag [-l] | <name> [<target>] | -a -m <message> <name> [<target>] | -d <name>
 git2 reset [--soft | --mixed | --hard] [<commit>]
 git2 undo [--dry-run]
 git2 restore --view <64-hex-view-id> [--dry-run]

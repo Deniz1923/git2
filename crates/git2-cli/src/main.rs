@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 #[cfg(unix)]
+use git2_core::branch::{self, BranchOutcome};
+#[cfg(unix)]
 use git2_core::commit::{self, CommitOutcome};
 #[cfg(unix)]
 use git2_core::log::{self, DEFAULT_LOG_COUNT, LogOptions};
@@ -30,6 +32,10 @@ use git2_core::restore;
 #[cfg(unix)]
 use git2_core::stage::{self, AddOutcome};
 use git2_core::store::ObjectStore;
+#[cfg(unix)]
+use git2_core::switch::{self, SwitchOutcome, SwitchTarget};
+#[cfg(unix)]
+use git2_core::tag::{self, TagOutcome};
 #[cfg(unix)]
 use git2_core::transaction::{
     self, Change, PendingPhase, RecoveryOutcome, RecoveryRepository, format_change_line,
@@ -91,6 +97,18 @@ enum Command {
         #[arg(short = 'n', long = "max-count", default_value_t = DEFAULT_LOG_COUNT)]
         max_count: usize,
     },
+
+    /// List, create, rename, or delete local branches.
+    #[cfg(unix)]
+    Branch(BranchArgs),
+
+    /// Switch branches or detach HEAD safely with dirty-worktree overwrite protection.
+    #[cfg(unix)]
+    Switch(SwitchArgs),
+
+    /// List, create (lightweight or annotated), or delete tags.
+    #[cfg(unix)]
+    Tag(TagArgs),
 
     /// Preview or restore a previously recorded recovery view.
     #[cfg(unix)]
@@ -222,6 +240,80 @@ enum Command {
 
     /// Inspect the object layer while the user-facing commands are built.
     Debug(DebugArgs),
+}
+
+#[cfg(unix)]
+#[derive(Args)]
+#[allow(clippy::struct_excessive_bools)]
+struct BranchArgs {
+    /// Show commit hash and subject alongside each branch.
+    #[arg(short = 'v', long, conflicts_with_all = ["delete", "force_delete", "move_branch"])]
+    verbose: bool,
+
+    /// Delete a fully merged branch.
+    #[arg(short = 'd', long, conflicts_with_all = ["force_delete", "move_branch"])]
+    delete: bool,
+
+    /// Force-delete a branch regardless of merge status.
+    #[arg(short = 'D', conflicts_with_all = ["delete", "move_branch"])]
+    force_delete: bool,
+
+    /// Rename a branch (`[<old>] <new>`).
+    #[arg(short = 'm', long = "move", conflicts_with_all = ["delete", "force_delete"])]
+    move_branch: bool,
+
+    /// Branch name(s) or start point.
+    #[arg(value_name = "ARG")]
+    args: Vec<String>,
+}
+
+#[cfg(unix)]
+#[derive(Args)]
+struct SwitchArgs {
+    /// Create a new branch at `<start-point>` (or `HEAD`) and switch to it.
+    #[arg(short = 'c', long, value_name = "NEW_BRANCH", conflicts_with_all = ["force_create", "detach"])]
+    create: Option<String>,
+
+    /// Create or reset `<NEW_BRANCH>` to `<start-point>` (or `HEAD`) and switch to it.
+    #[arg(short = 'C', long, value_name = "NEW_BRANCH", conflicts_with_all = ["create", "detach"])]
+    force_create: Option<String>,
+
+    /// Detach `HEAD` at a commit, branch, or tag instead of switching to a branch.
+    #[arg(short = 'd', long, conflicts_with_all = ["create", "force_create"])]
+    detach: bool,
+
+    /// Target branch or commit/tag revision.
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
+}
+
+#[cfg(unix)]
+#[derive(Args)]
+struct TagArgs {
+    /// List tags.
+    #[arg(short = 'l', long, conflicts_with_all = ["annotate", "message", "delete"])]
+    list: bool,
+
+    /// Create an unsigned annotated tag object (requires `-m`).
+    #[arg(short = 'a', long, conflicts_with = "delete")]
+    annotate: bool,
+
+    /// Tag message for an annotated tag.
+    #[arg(
+        short = 'm',
+        long = "message",
+        value_name = "MESSAGE",
+        conflicts_with = "delete"
+    )]
+    message: Option<String>,
+
+    /// Delete a tag.
+    #[arg(short = 'd', long, conflicts_with_all = ["annotate", "message", "list"])]
+    delete: bool,
+
+    /// Tag name and optional target commit/object.
+    #[arg(value_name = "ARG")]
+    args: Vec<String>,
 }
 
 #[cfg(unix)]
@@ -370,6 +462,12 @@ fn main() -> anyhow::Result<()> {
         Command::Commit { message } => run_commit(&message),
         #[cfg(unix)]
         Command::Log { max_count } => run_log(max_count),
+        #[cfg(unix)]
+        Command::Branch(args) => run_branch(&args),
+        #[cfg(unix)]
+        Command::Switch(args) => run_switch(args),
+        #[cfg(unix)]
+        Command::Tag(args) => run_tag(&args),
         #[cfg(unix)]
         Command::Restore { view, dry_run } => run_restore(view, dry_run),
         #[cfg(unix)]
@@ -598,6 +696,321 @@ fn run_undo(dry_run: bool) -> anyhow::Result<()> {
         outcome.restored_view, outcome.operation_id
     );
     Ok(())
+}
+
+#[cfg(unix)]
+fn run_branch(args: &BranchArgs) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    if args.delete || args.force_delete {
+        let [name] = args.args.as_slice() else {
+            bail!("usage: git2 branch (-d | -D) <branch-name>");
+        };
+        let force = args.force_delete;
+        let outcome =
+            run_branch_delete(&repository, name, force).context("could not delete branch")?;
+        let short_oid = &outcome.target_commit.to_hex()[..7];
+        println!(
+            "deleted branch {name} (was {short_oid}) at view {} as operation {}",
+            outcome.after_view, outcome.operation_id
+        );
+        return Ok(());
+    }
+    if args.move_branch {
+        let (old_name, new_name) = match args.args.as_slice() {
+            [new_name] => (None, new_name.as_str()),
+            [old_name, new_name] => (Some(old_name.as_str()), new_name.as_str()),
+            _ => bail!("usage: git2 branch -m [<old-branch>] <new-branch>"),
+        };
+        let outcome = run_branch_rename(&repository, old_name, new_name)
+            .context("could not rename branch")?;
+        if outcome.changed {
+            println!(
+                "renamed branch to {new_name} at view {} as operation {}",
+                outcome.after_view, outcome.operation_id
+            );
+        } else {
+            println!("branch {new_name} already has that name");
+        }
+        return Ok(());
+    }
+    if args.args.is_empty() {
+        let listing = branch::list(&repository).context("could not list branches")?;
+        let mut stdout = io::stdout().lock();
+        if let Some((oid, subject)) = &listing.detached_head {
+            let short = &oid.to_hex()[..7];
+            if args.verbose {
+                write!(stdout, "* (HEAD detached at {short}) ")?;
+                stdout.write_all(subject.as_slice())?;
+                writeln!(stdout)?;
+            } else {
+                writeln!(stdout, "* (HEAD detached at {short})")?;
+            }
+        }
+        for entry in &listing.branches {
+            let marker = if entry.is_current { '*' } else { ' ' };
+            write!(stdout, "{marker} ")?;
+            stdout.write_all(entry.name.as_slice())?;
+            if args.verbose {
+                let short = &entry.oid.to_hex()[..7];
+                write!(stdout, " {short} ")?;
+                stdout.write_all(entry.subject.as_slice())?;
+            }
+            writeln!(stdout)?;
+        }
+        return Ok(());
+    }
+    if args.verbose {
+        bail!("--verbose cannot be combined with branch creation");
+    }
+    let (name, start_point) = match args.args.as_slice() {
+        [name] => (name.as_str(), None),
+        [name, start_point] => (name.as_str(), Some(start_point.as_str())),
+        _ => bail!("usage: git2 branch <name> [<start-point>]"),
+    };
+    let outcome =
+        run_branch_create(&repository, name, start_point).context("could not create branch")?;
+    let short_oid = &outcome.target_commit.to_hex()[..7];
+    println!(
+        "created branch {name} at {short_oid} (view {} as operation {})",
+        outcome.after_view, outcome.operation_id
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_switch(args: SwitchArgs) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let target = if let Some(name) = args.create {
+        SwitchTarget::Create {
+            name,
+            start_point: args.target,
+            force: false,
+        }
+    } else if let Some(name) = args.force_create {
+        SwitchTarget::Create {
+            name,
+            start_point: args.target,
+            force: true,
+        }
+    } else if args.detach {
+        SwitchTarget::Detach {
+            commit: args.target,
+        }
+    } else {
+        let Some(name) = args.target else {
+            bail!(
+                "usage: git2 switch (<branch> | -c <new-branch> | -C <new-branch> | --detach [<commit>])"
+            );
+        };
+        SwitchTarget::Branch(name)
+    };
+
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    let outcome = run_switch_apply(&repository, &target).context("could not switch")?;
+    let short_oid = &outcome.target_commit.to_hex()[..7];
+    if !outcome.changed {
+        if let Some(branch) = &outcome.branch {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(b"Already on '")?;
+            stdout.write_all(branch.as_slice())?;
+            writeln!(stdout, "'")?;
+        } else {
+            println!("HEAD is already at {short_oid}");
+        }
+        return Ok(());
+    }
+    if outcome.detached {
+        println!(
+            "HEAD is now at {short_oid} (view {} as operation {})",
+            outcome.after_view, outcome.operation_id
+        );
+    } else if let Some(branch) = &outcome.branch {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(b"Switched to branch '")?;
+        stdout.write_all(branch.as_slice())?;
+        writeln!(
+            stdout,
+            "' (view {} as operation {})",
+            outcome.after_view, outcome.operation_id
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_tag(args: &TagArgs) -> anyhow::Result<()> {
+    ensure_no_pending()?;
+    let repository =
+        LocalRepository::discover(".").context("could not open this supported Git repository")?;
+    if args.delete {
+        let [name] = args.args.as_slice() else {
+            bail!("usage: git2 tag -d <tag-name>");
+        };
+        let outcome = run_tag_delete(&repository, name).context("could not delete tag")?;
+        println!(
+            "deleted tag {name} (was {}) at view {} as operation {}",
+            outcome.tag_oid, outcome.after_view, outcome.operation_id
+        );
+        return Ok(());
+    }
+    if args.list || (args.args.is_empty() && !args.annotate && args.message.is_none()) {
+        if !args.args.is_empty() {
+            bail!("`git2 tag -l` does not accept pattern filters yet");
+        }
+        let tags = tag::list(&repository).context("could not list tags")?;
+        let mut stdout = io::stdout().lock();
+        for entry in tags {
+            stdout.write_all(entry.name.as_slice())?;
+            writeln!(stdout)?;
+        }
+        return Ok(());
+    }
+
+    let (name, target) = match args.args.as_slice() {
+        [name] => (name.as_str(), None),
+        [name, target] => (name.as_str(), Some(target.as_str())),
+        _ => bail!("usage: git2 tag [-a -m <message>] <tag-name> [<commit>]"),
+    };
+    if args.annotate || args.message.is_some() {
+        let Some(message) = args.message.as_deref() else {
+            bail!("annotated tag requires `-m <message>`");
+        };
+        let outcome = run_tag_create_annotated(&repository, name, message, target)
+            .context("could not create annotated tag")?;
+        println!(
+            "created annotated tag {name} ({}) at view {} as operation {}",
+            outcome.tag_oid, outcome.after_view, outcome.operation_id
+        );
+        return Ok(());
+    }
+    let outcome =
+        run_tag_create_lightweight(&repository, name, target).context("could not create tag")?;
+    println!(
+        "created tag {name} ({}) at view {} as operation {}",
+        outcome.tag_oid, outcome.after_view, outcome.operation_id
+    );
+    Ok(())
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_branch_create(
+    repository: &LocalRepository,
+    name: &str,
+    start_point: Option<&str>,
+) -> git2_core::Result<BranchOutcome> {
+    branch::create_with_hook(repository, name, start_point, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_branch_create(
+    repository: &LocalRepository,
+    name: &str,
+    start_point: Option<&str>,
+) -> git2_core::Result<BranchOutcome> {
+    branch::create(repository, name, start_point)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_branch_delete(
+    repository: &LocalRepository,
+    name: &str,
+    force: bool,
+) -> git2_core::Result<BranchOutcome> {
+    branch::delete_with_hook(repository, name, force, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_branch_delete(
+    repository: &LocalRepository,
+    name: &str,
+    force: bool,
+) -> git2_core::Result<BranchOutcome> {
+    branch::delete(repository, name, force)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_branch_rename(
+    repository: &LocalRepository,
+    old_name: Option<&str>,
+    new_name: &str,
+) -> git2_core::Result<BranchOutcome> {
+    branch::rename_with_hook(repository, old_name, new_name, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_branch_rename(
+    repository: &LocalRepository,
+    old_name: Option<&str>,
+    new_name: &str,
+) -> git2_core::Result<BranchOutcome> {
+    branch::rename(repository, old_name, new_name)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_switch_apply(
+    repository: &LocalRepository,
+    target: &SwitchTarget,
+) -> git2_core::Result<SwitchOutcome> {
+    switch::apply_with_hook(repository, target, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_switch_apply(
+    repository: &LocalRepository,
+    target: &SwitchTarget,
+) -> git2_core::Result<SwitchOutcome> {
+    switch::apply(repository, target)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_tag_create_lightweight(
+    repository: &LocalRepository,
+    name: &str,
+    target: Option<&str>,
+) -> git2_core::Result<TagOutcome> {
+    tag::create_lightweight_with_hook(repository, name, target, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_tag_create_lightweight(
+    repository: &LocalRepository,
+    name: &str,
+    target: Option<&str>,
+) -> git2_core::Result<TagOutcome> {
+    tag::create_lightweight(repository, name, target)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_tag_create_annotated(
+    repository: &LocalRepository,
+    name: &str,
+    message: &str,
+    target: Option<&str>,
+) -> git2_core::Result<TagOutcome> {
+    tag::create_annotated_with_hook(repository, name, message, target, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_tag_create_annotated(
+    repository: &LocalRepository,
+    name: &str,
+    message: &str,
+    target: Option<&str>,
+) -> git2_core::Result<TagOutcome> {
+    tag::create_annotated(repository, name, message, target)
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn run_tag_delete(repository: &LocalRepository, name: &str) -> git2_core::Result<TagOutcome> {
+    tag::delete_with_hook(repository, name, test_failpoint_hook())
+}
+
+#[cfg(all(unix, not(debug_assertions)))]
+fn run_tag_delete(repository: &LocalRepository, name: &str) -> git2_core::Result<TagOutcome> {
+    tag::delete(repository, name)
 }
 
 #[cfg(all(unix, debug_assertions))]
